@@ -1,0 +1,11 @@
+{
+    "title": "SSL 自动部署",
+    "name": "sslbt",
+    "ps": "SSL 证书自动部署与续签管理插件",
+    "versions": "0.0.0",
+    "checks": "/www/server/panel",
+    "author": "",
+    "home": "",
+    "type": 0,
+    "min_panel": "7.0.0"
+}

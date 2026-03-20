@@ -1,0 +1,14 @@
+dist/
+build/release.conf
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+.env
+*.log
+.DS_Store
+*.swp
+*.swo
+*~

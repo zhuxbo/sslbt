@@ -1,0 +1,61 @@
+services:
+  mock-api:
+    build:
+      context: ../../sslctl/docker/test/mock-api
+    ports:
+      - "18080:8080"
+    networks:
+      - test-net
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  baota-nginx:
+    build:
+      context: ./baota
+      args:
+        BT_IMAGE: btpanel/baota:lnmp
+    ports:
+      - "8888:8888"
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ../src:/plugin-src:ro
+      - ./reports:/reports
+    environment:
+      - MOCK_API_URL=http://mock-api:8080
+      - TEST_DOMAIN=test.example.com
+    depends_on:
+      mock-api:
+        condition: service_healthy
+    networks:
+      - test-net
+    privileged: true
+
+  baota-apache:
+    build:
+      context: ./baota
+      args:
+        BT_IMAGE: btpanel/baota:lamp
+    ports:
+      - "8889:8888"
+      - "8080:80"
+      - "8443:443"
+    volumes:
+      - ../src:/plugin-src:ro
+      - ./reports:/reports
+    environment:
+      - MOCK_API_URL=http://mock-api:8080
+      - TEST_DOMAIN=test.example.com
+    depends_on:
+      mock-api:
+        condition: service_healthy
+    networks:
+      - test-net
+    privileged: true
+
+networks:
+  test-net:
+    driver: bridge
