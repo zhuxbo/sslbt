@@ -23,7 +23,7 @@ curl -fsSL https://release.cnssl.com/sslbt/install.sh | bash -s -- release.cnssl
 安装指定版本：
 
 ```bash
-curl -fsSL https://release.cnssl.com/sslbt/install.sh | bash -s -- release.cnssl.com --version 0.0.1-beta
+curl -fsSL https://release.cnssl.com/sslbt/install.sh | bash -s -- release.cnssl.com --version 0.0.2
 ```
 
 安装测试版：
@@ -32,7 +32,7 @@ curl -fsSL https://release.cnssl.com/sslbt/install.sh | bash -s -- release.cnssl
 curl -fsSL https://release.cnssl.com/sslbt/install.sh | bash -s -- release.cnssl.com --dev
 ```
 
-升级：重新运行安装命令即可，已有配置和证书数据不会被覆盖。
+升级：重新运行安装命令即可，已有配置和证书数据不会被覆盖。安装完成后会提示是否重启面板。
 
 ### 手动安装
 
@@ -66,10 +66,12 @@ make docker-test
 
 ## 续签模式
 
-| 模式 | 说明 | 提前天数 |
-|------|------|----------|
-| pull | 自动签发（默认）：API 签发后拉取证书 | 13 天 |
-| local | 本机提交：本地生成 CSR 提交签发 | 15 天 |
+| 模式 | 说明 |
+|------|------|
+| pull | 自动签发（默认）：API 签发后拉取证书 |
+| local | 本机提交：本地生成 CSR 提交签发 |
+
+提前续签天数在设置页面配置，最大 13 天，两种模式共用。
 
 ## 目录结构
 

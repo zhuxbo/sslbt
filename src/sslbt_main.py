@@ -48,13 +48,13 @@ class sslbt_main:
     """SSL 自动部署插件"""
 
     _setup_done = False
+    _pending_tokens = {}  # 类变量，跨实例保持 session
 
     def __init__(self):
         os.makedirs(DATA_DIR, exist_ok=True)
         self._config = ConfigManager(DATA_DIR)
         self._logger = Logger(os.path.join(DATA_DIR, 'logs'))
         self._site_mgr = SiteManager(self._logger)
-        self._pending_tokens = {}  # session_id -> {api_url, api_token, created_at}
 
     def _get_api_for_cert(self, cert_entry):
         """获取证书级别的 API 客户端"""
@@ -119,7 +119,7 @@ class sslbt_main:
             if interval:
                 cfg['check_interval_hours'] = max(1, int(interval))
             if renew_days:
-                cfg['renew_before_days'] = max(1, int(renew_days))
+                cfg['renew_before_days'] = min(13, max(1, int(renew_days)))
             if renew_mode in ('pull', 'local'):
                 cfg['renew_mode'] = renew_mode
 
@@ -215,7 +215,18 @@ class sslbt_main:
             updates = {}
             site_names_str = _get_param(args, 'site_names', '')
             if site_names_str is not None and site_names_str != '':
-                updates['site_name'] = [s.strip() for s in site_names_str.split(',') if s.strip()]
+                requested = [s.strip() for s in site_names_str.split(',') if s.strip()]
+                # 排除已被其他证书绑定的站点
+                bound = set()
+                for c in self._config.get_certs():
+                    if c.get('order_id') != order_id:
+                        for s in c.get('site_name', []):
+                            if s:
+                                bound.add(s)
+                conflict = [s for s in requested if s in bound]
+                if conflict:
+                    return _err('站点已被其他证书绑定: %s' % ', '.join(conflict))
+                updates['site_name'] = requested
 
             renew_mode = _get_param(args, 'renew_mode', '')
             if renew_mode in ('pull', 'local', ''):
@@ -317,26 +328,26 @@ class sslbt_main:
             return _err('部署失败: %s' % str(e))
 
     def deploy_all(self, args=None):
-        """部署所有证书"""
+        """部署证书，支持 order_ids 过滤"""
         try:
             certs = self._config.get_certs()
+            # 支持选中部署
+            order_ids_str = _get_param(args, 'order_ids', '')
+            filter_ids = set(int(x) for x in order_ids_str.split(',') if x.strip()) if order_ids_str else None
+
             results = []
             for cert in certs:
                 if not cert.get('enabled', True):
                     continue
-                # site_name 为列表，检查是否有绑定站点
+                if filter_ids and cert['order_id'] not in filter_ids:
+                    continue
                 site_name = cert.get('site_name', [])
                 if isinstance(site_name, str):
                     site_name = [site_name] if site_name else []
                 if not site_name:
                     continue
 
-                class FakeArgs:
-                    pass
-
-                fa = FakeArgs()
-                fa.order_id = str(cert['order_id'])
-                result = self.deploy_cert(fa)
+                result = self.deploy_cert({'order_id': str(cert['order_id'])})
                 results.append({
                     'order_id': cert['order_id'],
                     'result': result,
@@ -429,12 +440,14 @@ class sslbt_main:
             else:
                 certs = []
 
-            # 自动匹配站点
+            # 自动匹配站点（排除已绑定的站点）
             sites = self._site_mgr.get_sites()
+            bound_sites = self._config.get_bound_sites()
+            available_sites = [s for s in sites if s['name'] not in bound_sites]
             for c in certs:
                 domains = self._parse_cert_domains(c)
                 c['_domains'] = domains
-                c['_matches'] = SiteManager.match_sites_for_cert(domains, sites)
+                c['_matches'] = SiteManager.match_sites_for_cert(domains, available_sites)
 
             # 暂存 token，前端仅持有 session_id
             self._cleanup_sessions()
@@ -534,9 +547,8 @@ class sslbt_main:
         """设置计划任务"""
         try:
             cfg = self._config.get_config()
-            interval = int(_get_param(args, 'interval_hours', '') or cfg.get('check_interval_hours', 6))
             cron_mgr = CronManager(DATA_DIR, self._logger)
-            res = cron_mgr.setup(interval)
+            res = cron_mgr.setup()
             if res.get('status'):
                 return _ok(msg=res.get('message', '计划任务已创建'))
             return _err(res.get('message', '创建失败'))
@@ -551,6 +563,14 @@ class sslbt_main:
             return _ok(msg='计划任务已删除')
         except Exception as e:
             return _err('删除失败: %s' % str(e))
+
+    def get_cron_status(self, args=None):
+        """获取计划任务状态"""
+        try:
+            cron_mgr = CronManager(DATA_DIR, self._logger)
+            return _ok(cron_mgr.get_status())
+        except Exception as e:
+            return _err('查询失败: %s' % str(e))
 
     # ==================== 日志 ====================
 
@@ -604,3 +624,10 @@ class sslbt_main:
         except Exception as e:
             self._logger.error("更新失败: %s", str(e))
             return _err('更新失败: %s' % str(e))
+
+    def restart_panel(self, args=None):
+        """重启宝塔面板"""
+        self._logger.info("用户触发面板重启")
+        import subprocess
+        subprocess.Popen(['bt', 'restart'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return _ok(msg='正在重启')

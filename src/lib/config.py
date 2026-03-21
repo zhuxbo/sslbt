@@ -76,16 +76,22 @@ class ConfigManager:
 
     # --- 全局配置 ---
 
+    # 废弃字段，读取时自动清除
+    _DEPRECATED_KEYS = {'api_url', 'api_token', 'version'}
+
     def get_config(self):
-        """返回全局配置的深拷贝。旧 config.json 可能包含已废弃的字段（如 api_url），
-        merge 后会出现在返回值中但不被使用，不影响功能。"""
+        """返回全局配置，自动清除废弃字段"""
         cfg = self._read_json(self._config_path, DEFAULT_CONFIG)
         merged = copy.deepcopy(DEFAULT_CONFIG)
-        merged.update(cfg)
+        for k, v in cfg.items():
+            if k not in self._DEPRECATED_KEYS:
+                merged[k] = v
         return merged
 
     def save_config(self, cfg):
-        self._write_json(self._config_path, cfg)
+        # 写入前清除废弃字段
+        clean = {k: v for k, v in cfg.items() if k not in self._DEPRECATED_KEYS}
+        self._write_json(self._config_path, clean)
 
     # --- 证书列表 ---
 
@@ -110,19 +116,38 @@ class ConfigManager:
                 return cert
         return None
 
+    def get_bound_sites(self):
+        """获取所有已绑定站点的集合"""
+        bound = set()
+        for cert in self.get_certs():
+            for s in cert.get('site_name', []):
+                if s:
+                    bound.add(s)
+        return bound
+
     def add_cert(self, order_id, cert_name, domains, site_name='', renew_mode='',
                  api_url='', api_token='', site_names=None):
-        """添加证书条目"""
+        """添加证书条目，自动排除已被其他证书绑定的站点"""
         order_id = int(order_id)
         certs = self.get_certs()
         for c in certs:
             if c.get('order_id') == order_id:
                 raise ValueError("订单 %d 已存在" % order_id)
+
+        # 过滤已绑定站点
+        requested = site_names if site_names is not None else ([site_name] if site_name else [])
+        bound = set()
+        for c in certs:
+            for s in c.get('site_name', []):
+                if s:
+                    bound.add(s)
+        available = [s for s in requested if s not in bound]
+
         entry = copy.deepcopy(DEFAULT_CERT_ENTRY)
         entry['order_id'] = order_id
         entry['cert_name'] = cert_name or ('order-%d' % order_id)
         entry['domains'] = domains if isinstance(domains, list) else [domains]
-        entry['site_name'] = site_names if site_names is not None else ([site_name] if site_name else [])
+        entry['site_name'] = available
         entry['renew_mode'] = renew_mode
         entry['api_url'] = api_url
         entry['api_token'] = api_token

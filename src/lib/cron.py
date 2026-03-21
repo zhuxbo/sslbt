@@ -1,7 +1,54 @@
 """宝塔计划任务集成模块"""
 
+import os
+import random
+import sqlite3
+
 CRON_NAME = 'SSL 证书自动续签'
 PLUGIN_DIR = '/www/server/panel/plugin/sslbt'
+
+# 宝塔计划任务数据库路径
+_CRON_DB_NEW = '/www/server/panel/data/db/crontab.db'
+_CRON_DB_OLD = '/www/server/panel/data/default.db'
+
+
+class _BtParams(dict):
+    """兼容宝塔 API 的参数对象"""
+    def __init__(self, **kw):
+        super().__init__(**kw)
+
+    def __getattr__(self, key):
+        try:
+            return self[key]
+        except KeyError:
+            raise AttributeError(key)
+
+    def __setattr__(self, key, value):
+        self[key] = value
+
+
+def _cron_db_path():
+    if os.path.exists(_CRON_DB_NEW):
+        return _CRON_DB_NEW
+    return _CRON_DB_OLD
+
+
+def _find_cron_ids():
+    """直接查数据库找到所有同名计划任务 ID"""
+    db_path = _cron_db_path()
+    if not os.path.exists(db_path):
+        return []
+    try:
+        conn = sqlite3.connect(db_path)
+        try:
+            rows = conn.execute(
+                'SELECT id FROM crontab WHERE name = ?', (CRON_NAME,)
+            ).fetchall()
+            return [r[0] for r in rows]
+        finally:
+            conn.close()
+    except Exception:
+        return []
 
 
 class CronManager:
@@ -11,37 +58,36 @@ class CronManager:
         self._data_dir = data_dir
         self._logger = logger
 
-    def setup(self, interval_hours=6):
-        """创建或更新计划任务"""
-        # 先移除已有任务
+    def setup(self):
+        """创建计划任务，每天随机时间执行一次"""
         self.remove()
 
         script = self._build_script()
+        run_hour = random.randint(0, 23)
+        run_minute = random.randint(0, 59)
 
         try:
             import crontab
             cron_obj = crontab.crontab()
 
-            class Params:
-                pass
-
-            params = Params()
-            params.name = CRON_NAME
-            params.type = 'minute-n'
-            params.where1 = str(interval_hours * 60)  # 每 N 分钟
-            params.hour = ''
-            params.minute = ''
-            params.week = ''
-            params.sType = 'toShell'
-            params.sBody = script
-            params.sName = ''
-            params.backupTo = ''
-            params.save = ''
-            params.urladdress = ''
+            params = _BtParams(
+                name=CRON_NAME,
+                type='day',
+                where1='',
+                hour=str(run_hour),
+                minute=str(run_minute),
+                week='',
+                sType='toShell',
+                sBody=script,
+                sName='',
+                backupTo='',
+                save='',
+                urladdress='',
+            )
 
             cron_obj.AddCrontab(params)
             if self._logger:
-                self._logger.info("计划任务创建成功: 每 %d 小时", interval_hours)
+                self._logger.info("计划任务创建成功: 每天 %d:%02d", run_hour, run_minute)
             return {'status': True, 'message': '计划任务已创建'}
         except Exception as e:
             if self._logger:
@@ -49,66 +95,49 @@ class CronManager:
             return {'status': False, 'message': '创建失败: %s' % str(e)}
 
     def remove(self):
-        """移除计划任务"""
+        """移除所有同名计划任务"""
+        ids = _find_cron_ids()
+        if not ids:
+            return
         try:
             import crontab
             cron_obj = crontab.crontab()
-
-            # 获取所有计划任务
-            class Params:
-                p = 1
-                limit = 1000
-                tojs = ''
-                table = 'crontab'
-                search = ''
-                order = 'id desc'
-
-            result = cron_obj.GetCrontab(Params())
-            if not isinstance(result, dict):
-                return
-
-            for item in result.get('data', []):
-                if item.get('name') == CRON_NAME:
-                    class DelParams:
-                        id = item['id']
-
-                    cron_obj.DelCrontab(DelParams())
-                    if self._logger:
-                        self._logger.info("计划任务已删除: id=%s", item['id'])
+            for cron_id in ids:
+                cron_obj.DelCrontab(_BtParams(id=cron_id))
+                if self._logger:
+                    self._logger.info("计划任务已删除: id=%s", cron_id)
         except Exception as e:
             if self._logger:
                 self._logger.error("删除计划任务失败: %s", str(e))
 
     def get_status(self):
         """查询计划任务状态"""
+        db_path = _cron_db_path()
+        if not os.path.exists(db_path):
+            return {'exists': False}
         try:
-            import crontab
-            cron_obj = crontab.crontab()
-
-            class Params:
-                p = 1
-                limit = 1000
-                tojs = ''
-                table = 'crontab'
-                search = ''
-                order = 'id desc'
-
-            result = cron_obj.GetCrontab(Params())
-            if not isinstance(result, dict):
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.row_factory = sqlite3.Row
+                row = conn.execute(
+                    'SELECT id, status, type, where1, where_hour, where_minute, addtime'
+                    ' FROM crontab WHERE name = ? LIMIT 1',
+                    (CRON_NAME,),
+                ).fetchone()
+            finally:
+                conn.close()
+            if not row:
                 return {'exists': False}
-
-            for item in result.get('data', []):
-                if item.get('name') == CRON_NAME:
-                    return {
-                        'exists': True,
-                        'id': item.get('id'),
-                        'status': '运行中' if item.get('status') == 1 else '已暂停',
-                        'cycle': item.get('cycle', ''),
-                        'last_run': item.get('addtime', ''),
-                    }
+            cycle = '每天 %s:%02d' % (row['where_hour'] or '0', int(row['where_minute'] or 0))
+            return {
+                'exists': True,
+                'id': row['id'],
+                'status': '运行中' if row['status'] == 1 else '已暂停',
+                'cycle': cycle,
+                'last_run': row['addtime'] or '',
+            }
         except Exception:
-            pass
-        return {'exists': False}
+            return {'exists': False}
 
     def _build_script(self):
         """构建续签检查脚本"""

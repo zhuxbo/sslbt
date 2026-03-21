@@ -12,15 +12,31 @@ description: Use when developing sslbt baota panel plugin - modifying API client
 ```
 sslbt_main.py  ← 插件入口（控制器），宝塔面板调用
   ├─ api_client.py   ← 部署 API 客户端（Bearer Token + 重试）
-  ├─ deployer.py     ← 证书部署（SetSSL + 回调）
+  ├─ deployer.py     ← 证书部署（_BtParams + SetSSL + 回调）
   ├─ renew.py        ← 续签引擎（Pull/Local 两种模式）
-  ├─ config.py       ← 配置读写（文件锁，证书级 API 配置）
+  ├─ config.py       ← 配置读写（文件锁，证书级 API 配置，废弃字段过滤）
   ├─ cert_utils.py   ← 证书验证 + CSR 生成
-  ├─ site_manager.py ← 宝塔站点管理 + 域名匹配
-  ├─ cron.py         ← 宝塔计划任务
+  ├─ site_manager.py ← 宝塔站点管理 + 域名匹配（兼容新旧数据库分片）
+  ├─ cron.py         ← 宝塔计划任务（_BtParams + 直接查库 + 每天随机时间）
   └─ logger.py       ← 日志（敏感信息过滤）
 index.html           ← 前端 UI（纯 JS，3 Tab: 证书管理/设置/日志）
 ```
+
+## 宝塔兼容
+
+### _BtParams
+宝塔 API 方法（SetSSL、AddCrontab 等）对参数对象混用属性访问（`get.name`）和字典访问（`get['name']`、`'key' in get`）。`_BtParams(dict)` 同时支持两种方式，在 deployer.py 和 cron.py 中各有定义。
+
+### 数据库分片
+新版宝塔将表迁移到 `data/db/` 子目录：
+- `sites`/`domain` 表 → `data/db/site.db`（site_manager.py）
+- `crontab` 表 → `data/db/crontab.db`（cron.py）
+- 旧版仍在 `data/default.db`
+
+代码优先检查新路径，回退旧路径。
+
+### session 持久化
+`_pending_tokens` 为类变量（非实例变量），宝塔每次请求创建新实例但模块保持加载，类变量跨请求保持。
 
 ## 部署 API 接口
 
@@ -89,13 +105,20 @@ Bearer Token 认证，部署链接格式：`https://domain/api/deploy?token=xxx&
 
 ## 配置层级
 
-每个证书必须自带 `api_url`/`api_token`，无全局 API 配置。全局配置仅保留运行参数（check_interval_hours、renew_before_days、renew_mode、release_url、update_channel）。
+每个证书必须自带 `api_url`/`api_token`，无全局 API 配置。全局配置仅保留运行参数（renew_before_days、renew_mode、release_url、update_channel）。
+
+- `renew_before_days`：提前续签天数，全局生效，上限 13
+- 废弃字段（`api_url`、`api_token`、`version`）读写时自动过滤
+- 站点唯一绑定：一个站点只能绑定一个证书，add_cert / update_cert_config 均校验
 
 ## 前端约定
 
 - `sslbt_main.py` 方法名 = 前端 `P._call('method_name', params, callback)` 的 method_name
-- 证书编辑用 `update_cert_config`（原子更新 site_name/renew_mode，不触碰 api_token）
+- 证书编辑用 `update_cert_config`（原子更新 site_name/renew_mode，站点唯一绑定校验）
 - `_parse_cert_domains` 只解析 `domains` 字段（逗号分隔字符串）
+- 证书列表支持 checkbox 多选，顶部按钮（部署/删除）操作选中证书
+- 状态标签：未绑定 → 待部署 → 正常 → 即将过期 → 已过期
+- 在线升级后弹窗确认重启面板（`restart_panel` → `bt restart`）
 
 ## 命令
 
