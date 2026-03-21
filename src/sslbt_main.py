@@ -546,7 +546,6 @@ class sslbt_main:
     def setup_cron(self, args=None):
         """设置计划任务"""
         try:
-            cfg = self._config.get_config()
             cron_mgr = CronManager(DATA_DIR, self._logger)
             res = cron_mgr.setup()
             if res.get('status'):
