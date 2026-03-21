@@ -4,7 +4,9 @@ import os
 import sqlite3
 
 
-DB_PATH = '/www/server/panel/data/default.db'
+# 新版宝塔将 sites/domain 表迁移到 data/db/site.db
+DB_PATH_NEW = '/www/server/panel/data/db/site.db'
+DB_PATH_OLD = '/www/server/panel/data/default.db'
 
 
 class SiteManager:
@@ -13,15 +15,26 @@ class SiteManager:
     def __init__(self, logger=None):
         self._logger = logger
 
+    @staticmethod
+    def _get_db_path():
+        """获取站点数据库路径，优先新版分片路径"""
+        if os.path.exists(DB_PATH_NEW):
+            return DB_PATH_NEW
+        return DB_PATH_OLD
+
     def get_sites(self):
         """获取所有站点列表，返回 [{name, path, status, domains, ssl}]"""
         try:
-            if not os.path.exists(DB_PATH):
+            db_path = self._get_db_path()
+            if not os.path.exists(db_path):
+                if self._logger:
+                    self._logger.error("宝塔数据库不存在: %s", db_path)
                 return []
 
-            conn = sqlite3.connect(DB_PATH)
+            conn = sqlite3.connect(db_path)
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
+
             cursor.execute('SELECT id, name, path, status FROM sites ORDER BY id DESC')
             rows = cursor.fetchall()
 

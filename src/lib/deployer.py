@@ -5,6 +5,21 @@ from datetime import datetime, timezone
 from . import cert_utils
 
 
+class _BtParams(dict):
+    """兼容宝塔 API 的参数对象，支持属性和字典两种访问方式"""
+    def __init__(self, **kw):
+        super().__init__(**kw)
+
+    def __getattr__(self, key):
+        try:
+            return self[key]
+        except KeyError:
+            raise AttributeError(key)
+
+    def __setattr__(self, key, value):
+        self[key] = value
+
+
 class DeployError(Exception):
     """部署错误"""
     def __init__(self, message, phase='deploy', retryable=False):
@@ -166,14 +181,12 @@ class Deployer:
         """调用宝塔 panelSite.SetSSL()"""
         import panelSite
 
-        class Params:
-            pass
-
-        params = Params()
-        params.type = '1'
-        params.siteName = site_name
-        params.key = key_pem
-        params.csr = cert_pem  # 宝塔的 csr 参数实际是证书
+        params = _BtParams(
+            type='1',
+            siteName=site_name,
+            key=key_pem,
+            csr=cert_pem,  # 宝塔的 csr 参数实际是证书
+        )
 
         site_obj = panelSite.panelSite()
         result = site_obj.SetSSL(params)

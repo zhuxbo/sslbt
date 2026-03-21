@@ -41,11 +41,14 @@ class TestGetConfig:
 
 class TestSaveConfig:
     def test_save_interval_and_renew_days(self, plugin):
-        result = plugin.save_config({'check_interval_hours': '12', 'renew_before_days': '15'})
+        result = plugin.save_config({'check_interval_hours': '12', 'renew_before_days': '10'})
         assert result['status'] is True
         cfg = plugin._config.get_config()
         assert cfg['check_interval_hours'] == 12
-        assert cfg['renew_before_days'] == 15
+        assert cfg['renew_before_days'] == 10
+        # 超过 13 的值被截断
+        plugin.save_config({'renew_before_days': '20'})
+        assert plugin._config.get_config()['renew_before_days'] == 13
 
     def test_save_config_no_api_fields(self, plugin):
         """save_config 不处理 api_url/api_token"""
