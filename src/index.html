@@ -829,6 +829,15 @@
       var done = 0;
       var results = [];
 
+      var deployPending = 0;
+      var finishAll = function () {
+        closeLoading();
+        var okCount = 0;
+        for (var k = 0; k < results.length; k++) if (results[k].status) okCount++;
+        layer.msg('添加完成: ' + okCount + ' 成功 / ' + (total - okCount) + ' 失败', { icon: okCount > 0 ? 1 : 2 });
+        P._certCache = {};
+        P.loadCerts();
+      };
       for (var i = 0; i < certs.length; i++) {
         (function (idx) {
           var c = certs[idx];
@@ -841,17 +850,14 @@
           }, function (r) {
             results.push({ order_id: c.order_id, status: r.status, msg: r.msg });
             if (r.status && sites.length) {
-              P._call('deploy_cert', { order_id: c.order_id }, function () {});
+              deployPending++;
+              P._call('deploy_cert', { order_id: c.order_id }, function () {
+                deployPending--;
+                if (done === total && deployPending === 0) finishAll();
+              });
             }
             done++;
-            if (done === total) {
-              closeLoading();
-              var okCount = 0;
-              for (var k = 0; k < results.length; k++) if (results[k].status) okCount++;
-              layer.msg('添加完成: ' + okCount + ' 成功 / ' + (total - okCount) + ' 失败', { icon: okCount > 0 ? 1 : 2 });
-              P._certCache = {};
-              P.loadCerts();
-            }
+            if (done === total && deployPending === 0) finishAll();
           });
         })(i);
       }
