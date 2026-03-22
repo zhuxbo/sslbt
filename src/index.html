@@ -494,11 +494,13 @@
     _statusTag: function (cert) {
       var m = cert.metadata || {};
       var exp = m.cert_expires_at || '';
+      var deployed = m.last_deploy_at || '';
       var sites = cert.site_name || [];
       if (typeof sites === 'string') sites = sites ? [sites] : [];
       if (!exp) {
         if (!sites.length) return '<span class="ssl-tag ssl-tag-info">未绑定</span>';
-        return '<span class="ssl-tag ssl-tag-primary">待部署</span>';
+        if (!deployed) return '<span class="ssl-tag ssl-tag-primary">待部署</span>';
+        return '<span class="ssl-tag ssl-tag-success">已部署</span>';
       }
       try {
         var d = new Date(exp.replace(' ', 'T').replace(/Z$/, '+00:00'));
@@ -827,6 +829,15 @@
       var done = 0;
       var results = [];
 
+      var deployPending = 0;
+      var finishAll = function () {
+        closeLoading();
+        var okCount = 0;
+        for (var k = 0; k < results.length; k++) if (results[k].status) okCount++;
+        layer.msg('添加完成: ' + okCount + ' 成功 / ' + (total - okCount) + ' 失败', { icon: okCount > 0 ? 1 : 2 });
+        P._certCache = {};
+        P.loadCerts();
+      };
       for (var i = 0; i < certs.length; i++) {
         (function (idx) {
           var c = certs[idx];
@@ -839,17 +850,14 @@
           }, function (r) {
             results.push({ order_id: c.order_id, status: r.status, msg: r.msg });
             if (r.status && sites.length) {
-              P._call('deploy_cert', { order_id: c.order_id }, function () {});
+              deployPending++;
+              P._call('deploy_cert', { order_id: c.order_id }, function () {
+                deployPending--;
+                if (done === total && deployPending === 0) finishAll();
+              });
             }
             done++;
-            if (done === total) {
-              closeLoading();
-              var okCount = 0;
-              for (var k = 0; k < results.length; k++) if (results[k].status) okCount++;
-              layer.msg('添加完成: ' + okCount + ' 成功 / ' + (total - okCount) + ' 失败', { icon: okCount > 0 ? 1 : 2 });
-              P._certCache = {};
-              P.loadCerts();
-            }
+            if (done === total && deployPending === 0) finishAll();
           });
         })(i);
       }
@@ -1131,7 +1139,6 @@
           var d = r.data;
           if (d.has_update) {
             sp.innerHTML = '<span style="color:#67c23a">发现新版本: <b>' + P._e(d.latest_version) + '</b></span>' +
-              (d.notes ? ' — ' + P._e(d.notes) : '') +
               ' <button class="ssl-btn ssl-btn-success ssl-btn-sm" onclick="sslbt.doUpdate()">立即更新</button>';
             P._ui = d;
           } else if (d.error) {

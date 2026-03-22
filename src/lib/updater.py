@@ -84,11 +84,9 @@ class Updater:
             latest = 'v' + latest
 
         has_update = compare_versions(current, latest) < 0
-        notes = ''
         download_path = ''
         for v_entry in ch.get('versions', []):
             if v_entry.get('version') == latest:
-                notes = v_entry.get('notes', '')
                 download_path = v_entry.get('path', '')
                 break
 
@@ -99,7 +97,6 @@ class Updater:
             'has_update': has_update,
             'current_version': current,
             'latest_version': latest,
-            'notes': notes,
             'download_path': download_path,
             'checksum': checksum,
         }

@@ -102,18 +102,17 @@ compute_checksum() {
 }
 
 update_releases_json_remote() {
-    local server_str="$1" version="$2" channel="$3" notes="$4" checksum="$5"
+    local server_str="$1" version="$2" channel="$3" checksum="$4"
     parse_server "$server_str"
     log_info "更新 releases.json..."
 
-    ssh_cmd "$SERVER_HOST" "$SERVER_PORT" "RELEASES_FILE='$SERVER_DIR/releases.json' VERSION='$version' CHANNEL='$channel' NOTES='$notes' CHECKSUM='$checksum' python3 << 'PYEOF'
+    ssh_cmd "$SERVER_HOST" "$SERVER_PORT" "RELEASES_FILE='$SERVER_DIR/releases.json' VERSION='$version' CHANNEL='$channel' CHECKSUM='$checksum' python3 << 'PYEOF'
 import json, os
 from datetime import datetime
 
 releases_file = os.environ['RELEASES_FILE']
 version = os.environ['VERSION']
 channel = os.environ['CHANNEL']
-notes = os.environ.get('NOTES', '')
 checksum = os.environ.get('CHECKSUM', '')
 
 v_version = version if version.startswith('v') else f'v{version}'
@@ -137,7 +136,6 @@ versions = data['channels'][channel].get('versions', [])
 version_entry = {
     'version': v_version,
     'date': datetime.now().strftime('%Y-%m-%d'),
-    'notes': notes,
     'path': f'{channel}/{v_version}',
 }
 
@@ -210,7 +208,7 @@ PYEOF"
 }
 
 upload_to_server() {
-    local server_str="$1" version="$2" channel="$3" notes="$4"
+    local server_str="$1" version="$2" channel="$3"
     parse_server "$server_str"
     log_step "部署到 $SERVER_NAME ($SERVER_HOST)..."
 
@@ -223,7 +221,7 @@ upload_to_server() {
     log_info "上传 install.sh..."
     rsync_cmd "$PROJECT_ROOT/deploy/install.sh" "$SERVER_HOST" "$SERVER_PORT" "$SERVER_DIR/install.sh"
 
-    update_releases_json_remote "$server_str" "$version" "$channel" "$notes" "$CHECKSUM_VALUE"
+    update_releases_json_remote "$server_str" "$version" "$channel" "$CHECKSUM_VALUE"
 
     ssh_cmd "$SERVER_HOST" "$SERVER_PORT" "chmod 644 \"$SERVER_DIR/releases.json\" \"$SERVER_DIR/install.sh\" 2>/dev/null; chmod 644 \"$remote_version_dir/sslbt.zip\" 2>/dev/null"
 
@@ -289,15 +287,6 @@ main() {
     log_info "发布通道: $channel"
     log_info "目标服务器: ${target_server:-全部}"
 
-    # 读取更新说明
-    local notes=""
-    if [ -n "${CHANGELOG:-}" ]; then
-        notes="$CHANGELOG"
-    else
-        echo -n "请输入更新说明（可为空）: "
-        read -r notes
-    fi
-
     if ! test_all_connections; then
         log_error "请先解决连接问题"; exit 1
     fi
@@ -317,7 +306,7 @@ main() {
     for server in "${SERVERS[@]}"; do
         parse_server "$server"
         if [ -n "$target_server" ] && [ "$SERVER_NAME" != "$target_server" ]; then continue; fi
-        if upload_to_server "$server" "$version" "$channel" "$notes"; then
+        if upload_to_server "$server" "$version" "$channel"; then
             success=$((success + 1))
         else
             failed=$((failed + 1))

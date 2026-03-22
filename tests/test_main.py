@@ -107,6 +107,102 @@ class TestAddCert:
         assert cert['api_token'] == TOKEN
 
 
+class TestParseCertDomains:
+    def test_fallback_to_api_domains(self, plugin):
+        """无证书 PEM 时回退到 API 域名"""
+        from sslbt_main import sslbt_main
+        result = sslbt_main._parse_cert_domains({'domains': 'a.com,b.com'})
+        assert result == ['a.com', 'b.com']
+
+    def test_empty_cert_uses_api(self, plugin):
+        """certificate 为空时使用 API 域名"""
+        from sslbt_main import sslbt_main
+        result = sslbt_main._parse_cert_domains({'certificate': '', 'domains': 'a.com'})
+        assert result == ['a.com']
+
+    @patch('sslbt_main.parse_cert_info')
+    def test_cert_pem_overrides_api(self, mock_parse, plugin):
+        """有证书 PEM 时完全以证书域名为准"""
+        from sslbt_main import sslbt_main
+        mock_parse.return_value = {'domains': ['a.com', 'www.a.com', '*.a.com']}
+        result = sslbt_main._parse_cert_domains({
+            'certificate': '---CERT---',
+            'domains': 'a.com',  # API 只返回 a.com
+        })
+        # 应从证书提取，包含 www 和通配符
+        assert result == ['a.com', 'www.a.com', '*.a.com']
+
+    @patch('sslbt_main.parse_cert_info')
+    def test_cert_parse_fail_fallback(self, mock_parse, plugin):
+        """证书解析失败时回退到 API 域名"""
+        from sslbt_main import sslbt_main
+        mock_parse.return_value = None
+        result = sslbt_main._parse_cert_domains({
+            'certificate': '---BAD-CERT---',
+            'domains': 'a.com,b.com',
+        })
+        assert result == ['a.com', 'b.com']
+
+
+class TestAutoCreateCron:
+    @patch('sslbt_main.CronManager')
+    @patch('sslbt_main.APIClient')
+    def test_auto_create_cron_when_not_exists(self, mock_api_cls, mock_cron_cls, plugin):
+        """添加证书时自动创建计划任务"""
+        mock_api = MagicMock()
+        mock_api.query_order.return_value = {'status': 'active', 'domains': 'a.com'}
+        mock_api_cls.return_value = mock_api
+
+        mock_cron = MagicMock()
+        mock_cron.get_status.return_value = {'exists': False}
+        mock_cron_cls.return_value = mock_cron
+
+        plugin.add_cert({
+            'order_id': '700',
+            'api_url': 'https://api.example.com',
+            'api_token': TOKEN,
+        })
+        mock_cron.setup.assert_called_once()
+
+    @patch('sslbt_main.CronManager')
+    @patch('sslbt_main.APIClient')
+    def test_no_create_cron_when_exists(self, mock_api_cls, mock_cron_cls, plugin):
+        """计划任务已存在时不重复创建"""
+        mock_api = MagicMock()
+        mock_api.query_order.return_value = {'status': 'active', 'domains': 'a.com'}
+        mock_api_cls.return_value = mock_api
+
+        mock_cron = MagicMock()
+        mock_cron.get_status.return_value = {'exists': True}
+        mock_cron_cls.return_value = mock_cron
+
+        plugin.add_cert({
+            'order_id': '701',
+            'api_url': 'https://api.example.com',
+            'api_token': TOKEN,
+        })
+        mock_cron.setup.assert_not_called()
+
+    @patch('sslbt_main.CronManager')
+    @patch('sslbt_main.APIClient')
+    def test_cron_fail_does_not_block_add(self, mock_api_cls, mock_cron_cls, plugin):
+        """cron 创建失败不影响证书添加"""
+        mock_api = MagicMock()
+        mock_api.query_order.return_value = {'status': 'active', 'domains': 'a.com'}
+        mock_api_cls.return_value = mock_api
+
+        mock_cron = MagicMock()
+        mock_cron.get_status.side_effect = RuntimeError('db error')
+        mock_cron_cls.return_value = mock_cron
+
+        result = plugin.add_cert({
+            'order_id': '702',
+            'api_url': 'https://api.example.com',
+            'api_token': TOKEN,
+        })
+        assert result['status'] is True
+
+
 class TestCertList:
     def test_masks_token(self, plugin):
         """列表中 token 被脱敏"""

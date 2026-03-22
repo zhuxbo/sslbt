@@ -20,7 +20,7 @@ _FILTERS = [
      lambda m: '%s=***REDACTED***' % m.group(1)),
 ]
 
-MAX_LOG_FILES = 30
+MAX_LOG_FILES = 90
 
 
 def sanitize(text):
@@ -50,6 +50,9 @@ class Logger:
         self._name = name
         self._logger = logging.getLogger(name)
         self._logger.setLevel(logging.DEBUG)
+        # 清除已有 handler/filter，防止多次实例化导致重复日志
+        self._logger.handlers.clear()
+        self._logger.filters.clear()
         self._logger.addFilter(SensitiveFilter())
         self._current_date = None
         self._handler = None

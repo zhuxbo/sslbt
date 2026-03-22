@@ -141,14 +141,20 @@ class CronManager:
 
     def _build_script(self):
         """构建续签检查脚本"""
+        log_file = '%s/logs/cron.log' % self._data_dir
         return '''#!/bin/bash
-cd %s
+# cron.log 轮转：超过 1000 行保留最后 500 行
+LOG_FILE="%s"
+if [ -f "$LOG_FILE" ] && [ "$(wc -l < "$LOG_FILE")" -gt 1000 ]; then
+    tail -500 "$LOG_FILE" > "$LOG_FILE.tmp" && mv "$LOG_FILE.tmp" "$LOG_FILE"
+fi
+cd "%s"
 python3 -c "
 import sys
 sys.path.insert(0, '/www/server/panel/class/')
 sys.path.insert(0, '%s')
 from sslbt_main import sslbt_main
 plugin = sslbt_main()
-plugin.run_renew(None)
-" >> %s/logs/cron.log 2>&1
-''' % (PLUGIN_DIR, PLUGIN_DIR, self._data_dir)
+plugin.run_renew_cron(None)
+" >> "$LOG_FILE" 2>&1
+''' % (log_file, PLUGIN_DIR, PLUGIN_DIR)

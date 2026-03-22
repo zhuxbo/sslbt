@@ -70,7 +70,7 @@ class APIClient:
         last_err = None
         for attempt in range(MAX_RETRIES):
             if attempt > 0:
-                time.sleep(attempt)  # 线性退避: 1s, 2s
+                time.sleep(2 ** (attempt - 1))  # 指数退避: 1s, 2s, 4s
                 if self._logger:
                     self._logger.info("API 重试 %d/%d: %s", attempt + 1, MAX_RETRIES, url)
             try:

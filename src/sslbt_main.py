@@ -16,7 +16,7 @@ sys.path.insert(0, PLUGIN_DIR)
 from lib.config import ConfigManager  # noqa: E402
 from lib.logger import Logger  # noqa: E402
 from lib.api_client import APIClient, APIError  # noqa: E402
-from lib.cert_utils import build_fullchain  # noqa: E402
+from lib.cert_utils import build_fullchain, parse_cert_info  # noqa: E402
 from lib.site_manager import SiteManager  # noqa: E402
 from lib.deployer import Deployer, DeployError  # noqa: E402
 from lib.renew import RenewEngine  # noqa: E402
@@ -52,8 +52,8 @@ class sslbt_main:
 
     def __init__(self):
         os.makedirs(DATA_DIR, exist_ok=True)
-        self._config = ConfigManager(DATA_DIR)
         self._logger = Logger(os.path.join(DATA_DIR, 'logs'))
+        self._config = ConfigManager(DATA_DIR, logger=self._logger)
         self._site_mgr = SiteManager(self._logger)
 
     def _get_api_for_cert(self, cert_entry):
@@ -183,6 +183,15 @@ class sslbt_main:
             )
 
             self._logger.info("添加证书: order_id=%s, domains=%s", order_id, ','.join(domains))
+
+            # 自动创建计划任务（如果尚未设置）
+            try:
+                cron_mgr = CronManager(DATA_DIR, self._logger)
+                if not cron_mgr.get_status().get('exists'):
+                    cron_mgr.setup()
+            except Exception as e:
+                self._logger.warn("自动创建计划任务失败: %s", str(e))
+
             return _ok(entry, msg='证书添加成功')
         except ValueError as e:
             return _err(str(e))
@@ -194,7 +203,14 @@ class sslbt_main:
 
     @staticmethod
     def _parse_cert_domains(cert_data):
-        """从 API 响应中解析域名列表"""
+        """从证书 PEM 提取域名（SAN + CN），证书未签发时回退到 API 域名"""
+        # 从证书 PEM 提取（SAN 是权威来源）
+        certificate = cert_data.get('certificate', '')
+        if certificate:
+            cert_info = parse_cert_info(certificate)
+            if cert_info and cert_info.get('domains'):
+                return list(cert_info['domains'])
+        # 证书未签发，回退到 API 返回的域名
         domains = []
         domains_str = cert_data.get('domains', '')
         if domains_str:
@@ -303,13 +319,19 @@ class sslbt_main:
                 return _err('证书内容为空')
 
             fullchain = build_fullchain(certificate, ca_certificate)
+
+            # 从证书提取域名并更新配置
+            domains = self._parse_cert_domains(cert_data)
+            if domains and domains != cert_entry.get('domains', []):
+                self._config.update_cert(order_id, {'domains': domains})
+
             deployer = self._get_deployer()
             results = deployer.deploy_multi(
                 site_names=site_name,
                 fullchain_pem=fullchain,
                 key_pem=private_key,
                 order_id=order_id,
-                domains=cert_entry.get('domains', []),
+                domains=domains,
                 api_client=api,
             )
 
@@ -541,12 +563,22 @@ class sslbt_main:
             self._logger.error("续签检查失败: %s", str(e))
             return _err('续签检查失败: %s' % str(e))
 
+    def run_renew_cron(self, args=None):
+        """计划任务调用的续签检查（分散执行）"""
+        try:
+            deployer = self._get_deployer()
+            engine = RenewEngine(self._config, self._get_api_for_cert, deployer, self._logger)
+            results = engine.check_and_renew_all(spread=True)
+            return _ok(results, msg='续签检查完成')
+        except Exception as e:
+            self._logger.error("续签检查失败: %s", str(e))
+            return _err('续签检查失败: %s' % str(e))
+
     # ==================== 计划任务 ====================
 
     def setup_cron(self, args=None):
         """设置计划任务"""
         try:
-            cfg = self._config.get_config()
             cron_mgr = CronManager(DATA_DIR, self._logger)
             res = cron_mgr.setup()
             if res.get('status'):

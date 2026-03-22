@@ -75,3 +75,30 @@ class TestRegex:
     def test_key_regex_generic(self):
         pem = "-----BEGIN PRIVATE KEY-----\nMIIBtest\n-----END PRIVATE KEY-----"
         assert PEM_KEY_RE.search(pem) is not None
+
+
+class TestSanParsing:
+    def test_multiline_san_extraction(self):
+        """SAN 跨多行输出时也能正确提取"""
+        import re
+        # 模拟 openssl 输出中的多行 SAN
+        output = """subject=CN = example.com
+notBefore=Jan  1 00:00:00 2026 GMT
+notAfter=Apr  1 00:00:00 2026 GMT
+serial=ABC123
+issuer=CN = Test CA
+            DNS:example.com, DNS:www.example.com,
+            DNS:mail.example.com, DNS:*.example.com"""
+        san_entries = re.findall(r'DNS:([^\s,]+)', output)
+        assert len(san_entries) == 4
+        assert 'example.com' in san_entries
+        assert 'www.example.com' in san_entries
+        assert 'mail.example.com' in san_entries
+        assert '*.example.com' in san_entries
+
+    def test_single_line_san(self):
+        """单行 SAN 正常工作"""
+        import re
+        output = "DNS:a.com, DNS:b.com, DNS:c.com"
+        san_entries = re.findall(r'DNS:([^\s,]+)', output)
+        assert san_entries == ['a.com', 'b.com', 'c.com']

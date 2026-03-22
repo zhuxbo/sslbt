@@ -80,15 +80,13 @@ def parse_cert_info(pem_text):
         issuer_match = re.search(r'issuer=(.+)', output)
         info['issuer'] = issuer_match.group(1).strip() if issuer_match else ''
 
-        # SAN domains
+        # SAN domains（支持多行输出）
         domains = [info['common_name']] if info.get('common_name') else []
-        san_match = re.search(r'DNS:([^\n]+)', output)
-        if san_match:
-            san_domains = [d.strip().lstrip('DNS:') for d in san_match.group(0).split(',')]
-            for d in san_domains:
-                d = d.strip().lstrip('DNS:').strip()
-                if d and d not in domains:
-                    domains.append(d)
+        san_entries = re.findall(r'DNS:([^\s,]+)', output)
+        for d in san_entries:
+            d = d.strip()
+            if d and d not in domains:
+                domains.append(d)
         info['domains'] = domains
 
         # 过期天数

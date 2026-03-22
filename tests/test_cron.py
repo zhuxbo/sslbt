@@ -20,7 +20,7 @@ class TestCronManager:
         script = cron_mgr._build_script()
         assert PLUGIN_DIR in script
         assert 'sslbt_main' in script
-        assert 'run_renew' in script
+        assert 'run_renew_cron' in script
 
     def test_setup_success(self, cron_mgr):
         """创建计划任务（mock crontab 模块）"""
@@ -86,3 +86,10 @@ class TestCronManager:
         with patch.dict(sys.modules, {'crontab': None}):
             result = cron_mgr.setup()
         assert result['status'] is False
+
+    def test_build_script_has_log_rotation(self, cron_mgr):
+        """脚本包含 cron.log 轮转逻辑"""
+        script = cron_mgr._build_script()
+        assert 'LOG_FILE=' in script
+        assert 'tail -500' in script
+        assert 'cron.log' in script
