@@ -9,8 +9,9 @@ from unittest.mock import MagicMock, patch
 from lib.config import ConfigManager
 from lib.renew import (
     RenewEngine, needs_renewal,
-    PULL_RENEW_DEFAULT_DAY, LOCAL_RENEW_DEFAULT_DAY,
-    SERVER_AUTO_RENEW_DAYS, MAX_ISSUE_RETRY_COUNT,
+    RENEW_DEFAULT_DAYS, MAX_ISSUE_RETRY_COUNT,
+    RENEW_SLEEP_MIN, RENEW_SLEEP_MAX, SPREAD_TOTAL_MAX,
+    MAX_RENEW_BATCH,
 )
 
 
@@ -34,43 +35,31 @@ def _make_cert_entry(days_remaining, renew_mode='pull', issue_state='', retry_co
 
 
 class TestNeedsRenewal:
-    def test_pull_needs_renewal(self):
+    def test_needs_renewal(self):
         cert = _make_cert_entry(days_remaining=10)
-        assert needs_renewal(cert, PULL_RENEW_DEFAULT_DAY, 'pull') is True
+        assert needs_renewal(cert, RENEW_DEFAULT_DAYS) is True
 
-    def test_pull_no_renewal(self):
+    def test_no_renewal(self):
         cert = _make_cert_entry(days_remaining=30)
-        assert needs_renewal(cert, PULL_RENEW_DEFAULT_DAY, 'pull') is False
+        assert needs_renewal(cert, RENEW_DEFAULT_DAYS) is False
 
-    def test_pull_boundary(self):
+    def test_boundary(self):
         cert = _make_cert_entry(days_remaining=13)
-        assert needs_renewal(cert, PULL_RENEW_DEFAULT_DAY, 'pull') is True
-
-    def test_local_needs_renewal(self):
-        """Local 模式：14 < days <= 15"""
-        now = datetime.now(timezone.utc)
-        expires = now + timedelta(days=15, hours=1)
-        cert = _make_cert_entry(days_remaining=15)
-        cert['metadata']['cert_expires_at'] = expires.strftime('%Y-%m-%dT%H:%M:%SZ')
-        assert needs_renewal(cert, LOCAL_RENEW_DEFAULT_DAY, 'local') is True
-
-    def test_local_too_close(self):
-        """Local 模式：<= 14 天不触发（服务端自动续签范围）"""
-        cert = _make_cert_entry(days_remaining=10)
-        assert needs_renewal(cert, LOCAL_RENEW_DEFAULT_DAY, 'local') is False
-
-    def test_local_not_expired_enough(self):
-        cert = _make_cert_entry(days_remaining=30)
-        assert needs_renewal(cert, LOCAL_RENEW_DEFAULT_DAY, 'local') is False
-
-    def test_local_processing_state(self):
-        """Local 模式，processing 状态，只需 <= renew_before_days"""
-        cert = _make_cert_entry(days_remaining=10, issue_state='processing')
-        assert needs_renewal(cert, LOCAL_RENEW_DEFAULT_DAY, 'local') is True
+        assert needs_renewal(cert, RENEW_DEFAULT_DAYS) is True
 
     def test_no_expires_at(self):
         cert = {'metadata': {}}
-        assert needs_renewal(cert, 13, 'pull') is False
+        assert needs_renewal(cert, 13) is False
+
+    def test_expired_cert_no_renewal(self):
+        """已过期证书不再续签"""
+        cert = _make_cert_entry(days_remaining=-5)
+        assert needs_renewal(cert, RENEW_DEFAULT_DAYS) is False
+
+    def test_expired_long_no_renewal(self):
+        """过期很久的证书不再续签"""
+        cert = _make_cert_entry(days_remaining=-30)
+        assert needs_renewal(cert, RENEW_DEFAULT_DAYS) is False
 
 
 class TestRenewEngine:
@@ -140,7 +129,7 @@ class TestRenewEngine:
         assert results == []
 
     def test_retry_count_limit(self, engine):
-        cert = _make_cert_entry(15, renew_mode='local', retry_count=MAX_ISSUE_RETRY_COUNT)
+        cert = _make_cert_entry(10, renew_mode='local', retry_count=MAX_ISSUE_RETRY_COUNT)
         with pytest.raises(RuntimeError, match='上限'):
             engine._renew_local(cert, engine._mock_api)
 
@@ -151,7 +140,7 @@ class TestRenewEngine:
         engine._mock_api.submit_csr.return_value = {
             'status': 'processing',
         }
-        cert = _make_cert_entry(15, renew_mode='local')
+        cert = _make_cert_entry(10, renew_mode='local')
         # 先添加证书到 config
         engine._config.add_cert(
             order_id=cert['order_id'],
@@ -171,7 +160,7 @@ class TestRenewEngine:
         """残留的 pending key 不会导致 O_EXCL 失败"""
         mock_csr.return_value = ('CSR-PEM', 'NEW-KEY', 'hash456')
         engine._mock_api.submit_csr.return_value = {'status': 'processing'}
-        cert = _make_cert_entry(15, renew_mode='local')
+        cert = _make_cert_entry(10, renew_mode='local')
         engine._config.add_cert(
             order_id=cert['order_id'],
             cert_name=cert['cert_name'],
@@ -192,7 +181,7 @@ class TestRenewEngine:
 
     def test_local_handle_processing_active(self, engine, tmp_data_dir):
         """Local 模式：processing → active → 部署"""
-        cert = _make_cert_entry(15, renew_mode='local', issue_state='processing')
+        cert = _make_cert_entry(10, renew_mode='local', issue_state='processing')
         now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
         cert['metadata']['csr_submitted_at'] = now
 
@@ -221,7 +210,7 @@ class TestRenewEngine:
 
     def test_local_handle_processing_timeout(self, engine, tmp_data_dir):
         """CSR pending 超时 → 清除状态"""
-        cert = _make_cert_entry(15, renew_mode='local', issue_state='processing')
+        cert = _make_cert_entry(10, renew_mode='local', issue_state='processing')
         # 超时：25 小时前提交
         old_time = (datetime.now(timezone.utc) - timedelta(hours=25)).strftime('%Y-%m-%dT%H:%M:%SZ')
         cert['metadata']['csr_submitted_at'] = old_time
@@ -239,7 +228,7 @@ class TestRenewEngine:
 
     def test_retry_count_reset(self, engine, tmp_data_dir):
         """超过 7 天自动重置重试计数"""
-        cert = _make_cert_entry(15, renew_mode='local', retry_count=5)
+        cert = _make_cert_entry(10, renew_mode='local', retry_count=5)
         old_time = (datetime.now(timezone.utc) - timedelta(days=8)).strftime('%Y-%m-%dT%H:%M:%SZ')
         cert['metadata']['csr_submitted_at'] = old_time
 
@@ -374,3 +363,94 @@ class TestRenewEngine:
         assert results[0]['order_id'] == 1002
         assert results[0]['status'] == 'success'
         logger.warn.assert_called_once()
+
+    def test_expired_cert_skipped(self, tmp_data_dir):
+        """已过期证书不触发续签"""
+        config = ConfigManager(tmp_data_dir)
+        mock_api = MagicMock()
+        api_factory = MagicMock(return_value=mock_api)
+        deployer = MagicMock()
+        logger = MagicMock()
+        engine = RenewEngine(config, api_factory, deployer, logger)
+
+        cert = _make_cert_entry(-5, order_id=4001)
+        config.add_cert(order_id=4001, cert_name='expired', domains=cert['domains'],
+                        site_names=['a.com'])
+        config.update_metadata(4001, cert['metadata'])
+
+        results = engine.check_and_renew_all()
+        assert results == []
+        mock_api.query_order.assert_not_called()
+
+    @patch('lib.renew.os.remove', side_effect=OSError('permission denied'))
+    @patch('lib.renew.os.path.isfile', return_value=True)
+    def test_cleanup_pending_key_failure_logs_error(self, mock_isfile, mock_remove, engine):
+        """cleanup 失败记录 error 日志"""
+        cert = _make_cert_entry(10)
+        engine._cleanup_pending_key(cert)
+        engine._logger.error.assert_called()
+        assert 'pending key' in str(engine._logger.error.call_args).lower()
+
+    @patch('lib.renew.time.sleep')
+    def test_batch_limit(self, mock_sleep, tmp_data_dir):
+        """超过 MAX_RENEW_BATCH 时截断处理"""
+        config = ConfigManager(tmp_data_dir)
+        mock_api = MagicMock()
+        mock_api.query_order.return_value = {
+            'status': 'active',
+            'certificate': '---CERT---',
+            'ca_certificate': '---CA---',
+            'private_key': '---KEY---',
+        }
+        api_factory = MagicMock(return_value=mock_api)
+        deployer = MagicMock()
+        deployer.deploy_multi.return_value = [{'site_name': 'a.com', 'status': True, 'message': 'ok'}]
+        logger = MagicMock()
+        engine = RenewEngine(config, api_factory, deployer, logger)
+
+        total = MAX_RENEW_BATCH + 5
+        for oid in range(5001, 5001 + total):
+            cert = _make_cert_entry(10, order_id=oid)
+            config.add_cert(order_id=oid, cert_name='c%d' % oid, domains=cert['domains'],
+                            site_names=['a.com'])
+            config.update_metadata(oid, cert['metadata'])
+
+        results = engine.check_and_renew_all(spread=False)
+        assert len(results) == MAX_RENEW_BATCH
+        # 应记录截断警告
+        warn_calls = [str(c) for c in logger.warn.call_args_list]
+        assert any('截断' in s or '上限' in s for s in warn_calls)
+
+
+class TestCalcSpreadDelay:
+    """动态分散延迟计算"""
+
+    def test_single_cert(self):
+        s_min, s_max = RenewEngine._calc_spread_delay(1)
+        assert s_min == RENEW_SLEEP_MIN
+        assert s_max == RENEW_SLEEP_MAX
+
+    def test_few_certs(self):
+        """5 个证书，间隔仍在默认范围"""
+        s_min, s_max = RenewEngine._calc_spread_delay(5)
+        assert s_min >= RENEW_SLEEP_MIN
+        assert s_max <= RENEW_SLEEP_MAX
+
+    def test_many_certs_shrinks_delay(self):
+        """50 个证书，间隔应缩短以控制总时长"""
+        s_min, s_max = RenewEngine._calc_spread_delay(50)
+        assert s_max < RENEW_SLEEP_MAX
+        # 总延迟上限: 49 gaps * s_max <= SPREAD_TOTAL_MAX
+        assert (50 - 1) * s_max <= SPREAD_TOTAL_MAX
+
+    def test_100_certs(self):
+        """100 个证书"""
+        s_min, s_max = RenewEngine._calc_spread_delay(100)
+        assert s_min >= RENEW_SLEEP_MIN
+        assert s_max >= RENEW_SLEEP_MIN
+        assert (100 - 1) * s_max <= SPREAD_TOTAL_MAX
+
+    def test_zero_certs(self):
+        s_min, s_max = RenewEngine._calc_spread_delay(0)
+        assert s_min == RENEW_SLEEP_MIN
+        assert s_max == RENEW_SLEEP_MAX

@@ -9,18 +9,18 @@ from . import cert_utils
 from .api_client import APIError
 
 # 常量，对标 sslctl
-PULL_RENEW_DEFAULT_DAY = 13
-LOCAL_RENEW_DEFAULT_DAY = 15
-SERVER_AUTO_RENEW_DAYS = 14
+RENEW_DEFAULT_DAYS = 13
 MAX_ISSUE_RETRY_COUNT = 10
 CSR_PENDING_TIMEOUT_HOURS = 24
 RETRY_RESET_DAYS = 7
-RENEW_SLEEP_MIN = 30
+RENEW_SLEEP_MIN = 5
 RENEW_SLEEP_MAX = 120
+SPREAD_TOTAL_MAX = 600  # 分散延迟总量上限（秒）
+MAX_RENEW_BATCH = 100   # 单次续签证书数量上限
 
 
-def needs_renewal(cert_entry, renew_before_days, renew_mode):
-    """判断证书是否需要续签"""
+def needs_renewal(cert_entry, renew_before_days):
+    """判断证书是否需要续签。已过期证书不再续签。"""
     expires_at = cert_entry.get('metadata', {}).get('cert_expires_at', '')
     if not expires_at:
         return False
@@ -33,13 +33,11 @@ def needs_renewal(cert_entry, renew_before_days, renew_mode):
     now = datetime.now(timezone.utc)
     days_remaining = (exp_dt - now).days
 
-    if renew_mode == 'local':
-        last_state = cert_entry.get('metadata', {}).get('last_issue_state', '')
-        if last_state == 'processing':
-            return days_remaining <= renew_before_days
-        return SERVER_AUTO_RENEW_DAYS < days_remaining <= renew_before_days
-    else:
-        return days_remaining <= renew_before_days
+    # 已过期，停止续签
+    if days_remaining < 0:
+        return False
+
+    return days_remaining <= renew_before_days
 
 
 class RenewEngine:
@@ -59,30 +57,41 @@ class RenewEngine:
             spread: 是否在续签间加随机延迟，避免集中请求 API（cron 调用时为 True）
         """
         certs = self._config.get_certs()
-        results = []
 
+        # 阶段 1: 收集需续签的证书和对应 API 客户端
+        pending_list = []
         for cert in certs:
             if not cert.get('enabled', True):
                 continue
             order_id = cert.get('order_id')
             if not order_id:
                 continue
-
             renew_mode = self._config.get_renew_mode(cert)
             renew_days = self._config.get_renew_before_days(cert)
-
-            if not needs_renewal(cert, renew_days, renew_mode):
+            if not needs_renewal(cert, renew_days):
                 continue
-
             api = self._api_factory(cert)
             if not api:
                 if self._logger:
                     self._logger.warn("证书 order_id=%s 缺少 API 配置，跳过续签", order_id)
                 continue
+            pending_list.append((cert, api, renew_mode))
 
-            # 分散续签：非首个证书前加随机延迟
+        # 阶段 2: 截断并计算延迟
+        if len(pending_list) > MAX_RENEW_BATCH:
+            if self._logger:
+                self._logger.warn("需续签证书 %d 个，超过单次上限 %d，截断处理",
+                                  len(pending_list), MAX_RENEW_BATCH)
+            pending_list = pending_list[:MAX_RENEW_BATCH]
+        sleep_min, sleep_max = self._calc_spread_delay(len(pending_list))
+
+        # 阶段 3: 逐个续签
+        results = []
+        for cert, api, renew_mode in pending_list:
+            order_id = cert['order_id']
+
             if spread and results:
-                delay = random.randint(RENEW_SLEEP_MIN, RENEW_SLEEP_MAX)
+                delay = random.randint(sleep_min, sleep_max)
                 if self._logger:
                     self._logger.info("等待 %d 秒后处理下一个证书", delay)
                 time.sleep(delay)
@@ -122,6 +131,21 @@ class RenewEngine:
                 self._logger.info("续签检查完成: 无需续签")
 
         return results
+
+    @staticmethod
+    def _calc_spread_delay(count):
+        """根据需续签证书数量动态计算延迟区间
+
+        保证总延迟不超过 SPREAD_TOTAL_MAX（默认 600 秒），
+        证书少时用较大间隔（30-120s），证书多时自动缩短。
+        """
+        if count <= 1:
+            return RENEW_SLEEP_MIN, RENEW_SLEEP_MAX
+        gaps = count - 1
+        avg_max = SPREAD_TOTAL_MAX // gaps
+        sleep_max = max(RENEW_SLEEP_MIN, min(avg_max, RENEW_SLEEP_MAX))
+        sleep_min = max(RENEW_SLEEP_MIN, sleep_max // 3)
+        return sleep_min, sleep_max
 
     def _check_deploy_results(self, results, order_id):
         """检查 deploy_multi 结果：全部失败视为部署失败，部分失败记录警告但仍视为成功"""
@@ -404,5 +428,6 @@ class RenewEngine:
             dir_path = os.path.dirname(path)
             if os.path.isdir(dir_path) and not os.listdir(dir_path):
                 os.rmdir(dir_path)
-        except OSError:
-            pass
+        except OSError as e:
+            if self._logger:
+                self._logger.error("清理 pending key 失败: %s, error=%s", path, str(e))

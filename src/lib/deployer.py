@@ -142,12 +142,12 @@ class Deployer:
                 if self._logger:
                     self._logger.warn("站点部署失败: site=%s, error=%s", site_name, str(e))
 
-        # 解析证书信息
-        cert_info = cert_utils.parse_cert_info(fullchain_pem)
+        success_count = sum(1 for r in results if r.get('status'))
         now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
 
-        # 更新配置中的 metadata
-        if order_id:
+        # 仅在至少一个站点成功时更新 metadata（全部失败保留重试状态）
+        if order_id and success_count > 0:
+            cert_info = cert_utils.parse_cert_info(fullchain_pem)
             meta = {
                 'last_deploy_at': now,
             }

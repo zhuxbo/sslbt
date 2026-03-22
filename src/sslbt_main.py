@@ -52,8 +52,8 @@ class sslbt_main:
 
     def __init__(self):
         os.makedirs(DATA_DIR, exist_ok=True)
-        self._config = ConfigManager(DATA_DIR)
         self._logger = Logger(os.path.join(DATA_DIR, 'logs'))
+        self._config = ConfigManager(DATA_DIR, logger=self._logger)
         self._site_mgr = SiteManager(self._logger)
 
     def _get_api_for_cert(self, cert_entry):

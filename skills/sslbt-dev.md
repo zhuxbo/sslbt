@@ -104,17 +104,30 @@ Bearer Token 认证，部署链接格式：`https://domain/api/deploy?token=xxx&
 - Local 模式：生成 CSR → 提交 → processing 状态轮询 → active 后部署
 - `_check_deploy_results()`：全部失败抛异常，部分失败记警告
 - callback：全部站点成功=success，任一失败=failure
-- 分散续签：`check_and_renew_all(spread=True)` 在每个证书续签间加随机延迟（30~120s），仅 cron 调用（`run_renew_cron`）启用，手动触发（`run_renew`）不延迟
+- 分散续签：`check_and_renew_all(spread=True)` 在证书间加动态延迟，根据需续签数量自动缩短间隔（总延迟上限 600s），仅 cron 调用启用
 - 汇总日志：续签完成后记录成功/等待/失败数量
-- 常量：PULL_RENEW_DEFAULT_DAY=13, LOCAL_RENEW_DEFAULT_DAY=15, SERVER_AUTO_RENEW_DAYS=14, MAX_ISSUE_RETRY_COUNT=10, RENEW_SLEEP_MIN=30, RENEW_SLEEP_MAX=120
+- 常量：RENEW_DEFAULT_DAYS=13, MAX_ISSUE_RETRY_COUNT=10, RENEW_SLEEP_MIN=5, RENEW_SLEEP_MAX=120, SPREAD_TOTAL_MAX=600
+- 已过期证书（days_remaining < 0）不再触发续签
+- deploy_multi 全部站点失败时不更新 metadata（保留重试状态）
+- 单次续签上限 MAX_RENEW_BATCH=100，超出按配置文件顺序截断，剩余下次 cron 处理；紧急证书由用户手动触发
+
+## 已知局限（无需处理，仅记录）
+
+- 批次截断按添加顺序，不按过期紧急度排序（紧急证书用户自行手动续签）
+- `_update_json` 内部 JSON 损坏的日志/备份路径无单独测试（逻辑与 `_read_json` 相同，风险低）
+- `_calc_spread_delay` 的 `sleep_min` 计算值无精确断言（仅验证上限约束）
+- API 指数退避（1s→2s→4s）无直接测试（API 调用全部 mock，退避逻辑简单）
+- `.lock` 锁文件不主动清理（Linux 常规做法，删除反而引入竞态）
 
 ## 配置层级
 
 每个证书必须自带 `api_url`/`api_token`，无全局 API 配置。全局配置仅保留运行参数（renew_before_days、renew_mode、release_url、update_channel）。
 
-- `renew_before_days`：提前续签天数，全局生效，上限 13
+- `renew_before_days`：提前续签天数，全局生效，默认 13
 - 废弃字段（`api_url`、`api_token`、`version`）读写时自动过滤
-- 站点唯一绑定：一个站点只能绑定一个证书，add_cert / update_cert_config 均校验
+- 站点唯一绑定：一个站点只能绑定一个证书，add_cert / update_cert / update_cert_config 均校验
+- ConfigManager 支持可选 `logger` 参数，JSON 损坏时记录 error 并创建 .bak 备份
+- `add_cert` / `update_cert` / `remove_cert` 使用 `_update_json` 原子读-改-写（独立锁文件防止竞态）
 
 ## 前端约定
 

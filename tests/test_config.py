@@ -74,8 +74,8 @@ class TestConfigManager:
 
     def test_update_cert(self, config_manager):
         config_manager.add_cert(12345, 'test', ['a.com'])
-        updated = config_manager.update_cert(12345, {'site_name': 'new-site'})
-        assert updated['site_name'] == 'new-site'
+        updated = config_manager.update_cert(12345, {'site_name': ['new-site']})
+        assert updated['site_name'] == ['new-site']
 
     def test_update_metadata(self, config_manager):
         config_manager.add_cert(12345, 'test', ['a.com'])
@@ -107,8 +107,8 @@ class TestConfigManager:
         days = config_manager.get_renew_before_days(cert)
         assert days == 13  # 全局默认 renew_before_days=13
 
-    def test_get_renew_before_days_local_override(self, config_manager):
-        """全局 renew_before_days=0 时，local 模式回退到 15"""
+    def test_get_renew_before_days_fallback(self, config_manager):
+        """全局 renew_before_days=0 时，统一回退到 13"""
         config_manager.save_config({
             **config_manager.get_config(),
             'renew_before_days': 0,
@@ -116,7 +116,7 @@ class TestConfigManager:
         config_manager.add_cert(12345, 'test', ['a.com'], renew_mode='local')
         cert = config_manager.get_cert(12345)
         days = config_manager.get_renew_before_days(cert)
-        assert days == 15  # LOCAL_RENEW_DEFAULT_DAY
+        assert days == 13  # RENEW_DEFAULT_DAYS
 
     def test_default_config_has_release_url(self, config_manager):
         cfg = config_manager.get_config()
@@ -189,3 +189,72 @@ class TestConfigManager:
         assert entry['site_name'] == []
         cert = config_manager.get_cert(88887)
         assert cert['site_name'] == []
+
+    def test_corrupted_config_returns_default(self, config_manager):
+        """损坏的 JSON 返回默认值"""
+        with open(config_manager._config_path, 'w') as f:
+            f.write('{invalid json!!!')
+        cfg = config_manager.get_config()
+        assert cfg['renew_before_days'] == 13
+
+    def test_corrupted_config_creates_backup(self, config_manager):
+        """损坏的 JSON 创建 .bak 备份"""
+        with open(config_manager._config_path, 'w') as f:
+            f.write('{bad}')
+        config_manager.get_config()
+        assert os.path.isfile(config_manager._config_path + '.bak')
+
+    def test_corrupted_config_logs_error(self, tmp_data_dir):
+        """损坏的 JSON 记录 error 日志"""
+        from unittest.mock import MagicMock
+        logger = MagicMock()
+        config_manager = ConfigManager(tmp_data_dir, logger=logger)
+        with open(config_manager._config_path, 'w') as f:
+            f.write('{broken')
+        config_manager.get_config()
+        logger.error.assert_called_once()
+        assert 'JSON' in str(logger.error.call_args)
+
+    def test_update_cert_filters_bound_sites(self, config_manager):
+        """update_cert 时排除已被其他证书绑定的站点"""
+        config_manager.add_cert(11111, 'cert1', ['a.com'], site_names=['site-a.com'])
+        config_manager.add_cert(22222, 'cert2', ['b.com'], site_names=['site-b.com'])
+        # 尝试把 site-a.com（已被 cert1 绑定）分配给 cert2
+        updated = config_manager.update_cert(22222, {'site_name': ['site-a.com', 'site-c.com']})
+        assert 'site-a.com' not in updated['site_name']
+        assert 'site-c.com' in updated['site_name']
+
+    def test_concurrent_update_metadata(self, tmp_data_dir):
+        """两个线程同时 update_metadata 不丢数据"""
+        import threading
+        config = ConfigManager(tmp_data_dir)
+        config.add_cert(10001, 'test', ['a.com'])
+
+        errors = []
+
+        def update_field(field, value):
+            try:
+                config.update_metadata(10001, {field: value})
+            except Exception as e:
+                errors.append(e)
+
+        t1 = threading.Thread(target=update_field, args=('last_deploy_at', '2026-01-01T00:00:00Z'))
+        t2 = threading.Thread(target=update_field, args=('cert_serial', 'ABC123'))
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
+        assert not errors
+        cert = config.get_cert(10001)
+        # 两个字段都应该被更新（原子操作保证不互相覆盖）
+        assert cert['metadata']['last_deploy_at'] == '2026-01-01T00:00:00Z'
+        assert cert['metadata']['cert_serial'] == 'ABC123'
+
+    def test_config_manager_with_logger(self, tmp_data_dir):
+        """ConfigManager 接受 logger 参数"""
+        from unittest.mock import MagicMock
+        logger = MagicMock()
+        cm = ConfigManager(tmp_data_dir, logger=logger)
+        cfg = cm.get_config()
+        assert cfg['renew_before_days'] == 13
