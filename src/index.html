@@ -494,11 +494,13 @@
     _statusTag: function (cert) {
       var m = cert.metadata || {};
       var exp = m.cert_expires_at || '';
+      var deployed = m.last_deploy_at || '';
       var sites = cert.site_name || [];
       if (typeof sites === 'string') sites = sites ? [sites] : [];
       if (!exp) {
         if (!sites.length) return '<span class="ssl-tag ssl-tag-info">未绑定</span>';
-        return '<span class="ssl-tag ssl-tag-primary">待部署</span>';
+        if (!deployed) return '<span class="ssl-tag ssl-tag-primary">待部署</span>';
+        return '<span class="ssl-tag ssl-tag-success">已部署</span>';
       }
       try {
         var d = new Date(exp.replace(' ', 'T').replace(/Z$/, '+00:00'));
@@ -1131,7 +1133,6 @@
           var d = r.data;
           if (d.has_update) {
             sp.innerHTML = '<span style="color:#67c23a">发现新版本: <b>' + P._e(d.latest_version) + '</b></span>' +
-              (d.notes ? ' — ' + P._e(d.notes) : '') +
               ' <button class="ssl-btn ssl-btn-success ssl-btn-sm" onclick="sslbt.doUpdate()">立即更新</button>';
             P._ui = d;
           } else if (d.error) {

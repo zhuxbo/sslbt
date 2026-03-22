@@ -238,7 +238,7 @@ echo ""
 echo_info "安装完成！$VERSION"
 echo ""
 echo "插件位置: $PLUGIN_DIR"
-echo "打开宝塔面板 → 软件商店 → 已安装 → sslbt 证书管理"
+echo "打开宝塔面板 → 软件商店 → 第三方应用 → sslbt 证书管理"
 echo ""
 read -p "$(echo -e "${GREEN}[INFO]${NC} 需要重启面板以加载新代码，是否立即重启？[Y/n] ")" confirm < /dev/tty
 confirm=${confirm:-Y}

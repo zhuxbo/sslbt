@@ -183,6 +183,15 @@ class sslbt_main:
             )
 
             self._logger.info("添加证书: order_id=%s, domains=%s", order_id, ','.join(domains))
+
+            # 自动创建计划任务（如果尚未设置）
+            try:
+                cron_mgr = CronManager(DATA_DIR, self._logger)
+                if not cron_mgr.get_status().get('exists'):
+                    cron_mgr.setup()
+            except Exception as e:
+                self._logger.warn("自动创建计划任务失败: %s", str(e))
+
             return _ok(entry, msg='证书添加成功')
         except ValueError as e:
             return _err(str(e))
@@ -536,6 +545,17 @@ class sslbt_main:
             deployer = self._get_deployer()
             engine = RenewEngine(self._config, self._get_api_for_cert, deployer, self._logger)
             results = engine.check_and_renew_all()
+            return _ok(results, msg='续签检查完成')
+        except Exception as e:
+            self._logger.error("续签检查失败: %s", str(e))
+            return _err('续签检查失败: %s' % str(e))
+
+    def run_renew_cron(self, args=None):
+        """计划任务调用的续签检查（分散执行）"""
+        try:
+            deployer = self._get_deployer()
+            engine = RenewEngine(self._config, self._get_api_for_cert, deployer, self._logger)
+            results = engine.check_and_renew_all(spread=True)
             return _ok(results, msg='续签检查完成')
         except Exception as e:
             self._logger.error("续签检查失败: %s", str(e))

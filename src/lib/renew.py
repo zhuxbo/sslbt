@@ -1,6 +1,8 @@
 """续签引擎。对标 sslctl pkg/certops/renew.go 状态机"""
 
 import os
+import time
+import random
 from datetime import datetime, timezone, timedelta
 
 from . import cert_utils
@@ -13,6 +15,8 @@ SERVER_AUTO_RENEW_DAYS = 14
 MAX_ISSUE_RETRY_COUNT = 10
 CSR_PENDING_TIMEOUT_HOURS = 24
 RETRY_RESET_DAYS = 7
+RENEW_SLEEP_MIN = 30
+RENEW_SLEEP_MAX = 120
 
 
 def needs_renewal(cert_entry, renew_before_days, renew_mode):
@@ -48,8 +52,12 @@ class RenewEngine:
         self._logger = logger
         self._data_dir = config_manager._data_dir
 
-    def check_and_renew_all(self):
-        """检查并续签所有证书"""
+    def check_and_renew_all(self, spread=False):
+        """检查并续签所有证书
+
+        Args:
+            spread: 是否在续签间加随机延迟，避免集中请求 API（cron 调用时为 True）
+        """
         certs = self._config.get_certs()
         results = []
 
@@ -72,6 +80,13 @@ class RenewEngine:
                     self._logger.warn("证书 order_id=%s 缺少 API 配置，跳过续签", order_id)
                 continue
 
+            # 分散续签：非首个证书前加随机延迟
+            if spread and results:
+                delay = random.randint(RENEW_SLEEP_MIN, RENEW_SLEEP_MAX)
+                if self._logger:
+                    self._logger.info("等待 %d 秒后处理下一个证书", delay)
+                time.sleep(delay)
+
             if self._logger:
                 self._logger.info("证书需要续签: order_id=%s, mode=%s", order_id, renew_mode)
 
@@ -93,6 +108,18 @@ class RenewEngine:
                     'status': 'failure',
                     'message': str(e),
                 })
+
+        # 汇总日志
+        if self._logger:
+            total = len(results)
+            if total:
+                success = sum(1 for r in results if r['status'] == 'success')
+                pending = sum(1 for r in results if r['status'] == 'pending')
+                failed = sum(1 for r in results if r['status'] == 'failure')
+                self._logger.info("续签检查完成: %d 个证书, 成功=%d, 等待=%d, 失败=%d",
+                                  total, success, pending, failed)
+            else:
+                self._logger.info("续签检查完成: 无需续签")
 
         return results
 

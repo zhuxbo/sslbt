@@ -40,7 +40,6 @@ SAMPLE_RELEASES = {
             'versions': [{
                 'version': 'v2.0.0',
                 'date': '2026-03-18',
-                'notes': '新功能更新',
                 'path': 'main/v2.0.0',
             }],
         },
@@ -49,7 +48,6 @@ SAMPLE_RELEASES = {
             'versions': [{
                 'version': 'v2.1.0-beta',
                 'date': '2026-03-18',
-                'notes': '测试版',
                 'path': 'dev/v2.1.0-beta',
             }],
         },
@@ -68,7 +66,7 @@ class TestParseReleasesJson:
         result = u._parse_releases(SAMPLE_RELEASES, 'main')
         assert result['has_update'] is True
         assert result['latest_version'] == 'v2.0.0'
-        assert result['notes'] == '新功能更新'
+        assert 'notes' not in result
 
     def test_no_update_same_version(self, updater_env):
         from lib.updater import Updater
