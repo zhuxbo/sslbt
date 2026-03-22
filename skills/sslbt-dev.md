@@ -17,8 +17,8 @@ sslbt_main.py  ← 插件入口（控制器），宝塔面板调用
   ├─ config.py       ← 配置读写（文件锁，证书级 API 配置，废弃字段过滤）
   ├─ cert_utils.py   ← 证书验证 + CSR 生成
   ├─ site_manager.py ← 宝塔站点管理 + 域名匹配（兼容新旧数据库分片）
-  ├─ cron.py         ← 宝塔计划任务（_BtParams + 直接查库 + 每天随机时间）
-  └─ logger.py       ← 日志（敏感信息过滤）
+  ├─ cron.py         ← 宝塔计划任务（_BtParams + 直接查库 + 每天随机时间 + cron.log 轮转）
+  └─ logger.py       ← 日志（敏感信息过滤，MAX_LOG_FILES=90 自动清理）
 index.html           ← 前端 UI（纯 JS，3 Tab: 证书管理/设置/日志）
 ```
 
@@ -37,6 +37,9 @@ index.html           ← 前端 UI（纯 JS，3 Tab: 证书管理/设置/日志�
 
 ### session 持久化
 `_pending_tokens` 为类变量（非实例变量），宝塔每次请求创建新实例但模块保持加载，类变量跨请求保持。
+
+### Logger 单例陷阱
+`logging.getLogger(name)` 对同名返回全局单例，宝塔每次请求 new 插件实例都会 new Logger。Logger.__init__ 先 `handlers.clear()` + `filters.clear()` 再添加，防止 handler 累积导致重复日志。
 
 ## 部署 API 接口
 
@@ -101,7 +104,9 @@ Bearer Token 认证，部署链接格式：`https://domain/api/deploy?token=xxx&
 - Local 模式：生成 CSR → 提交 → processing 状态轮询 → active 后部署
 - `_check_deploy_results()`：全部失败抛异常，部分失败记警告
 - callback：全部站点成功=success，任一失败=failure
-- 常量：PULL_RENEW_DEFAULT_DAY=13, LOCAL_RENEW_DEFAULT_DAY=15, SERVER_AUTO_RENEW_DAYS=14, MAX_ISSUE_RETRY_COUNT=10
+- 分散续签：`check_and_renew_all(spread=True)` 在每个证书续签间加随机延迟（30~120s），仅 cron 调用（`run_renew_cron`）启用，手动触发（`run_renew`）不延迟
+- 汇总日志：续签完成后记录成功/等待/失败数量
+- 常量：PULL_RENEW_DEFAULT_DAY=13, LOCAL_RENEW_DEFAULT_DAY=15, SERVER_AUTO_RENEW_DAYS=14, MAX_ISSUE_RETRY_COUNT=10, RENEW_SLEEP_MIN=30, RENEW_SLEEP_MAX=120
 
 ## 配置层级
 
@@ -117,7 +122,8 @@ Bearer Token 认证，部署链接格式：`https://domain/api/deploy?token=xxx&
 - 证书编辑用 `update_cert_config`（原子更新 site_name/renew_mode，站点唯一绑定校验）
 - `_parse_cert_domains` 只解析 `domains` 字段（逗号分隔字符串）
 - 证书列表支持 checkbox 多选，顶部按钮（部署/删除）操作选中证书
-- 状态标签：未绑定 → 待部署 → 正常 → 即将过期 → 已过期
+- 状态标签：未绑定 → 待部署 → 已部署（有 last_deploy_at 但无 cert_expires_at）→ 正常 → 即将过期 → 已过期
+- 添加证书后自动创建计划任务（如果尚未设置），失败不阻塞添加流程
 - 在线升级后弹窗确认重启面板（`restart_panel` → `bt restart`）
 
 ## 命令

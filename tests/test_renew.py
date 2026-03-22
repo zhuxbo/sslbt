@@ -275,6 +275,75 @@ class TestRenewEngine:
         logger.warn.assert_called_once()
         assert 'API' in str(logger.warn.call_args) or 'api' in str(logger.warn.call_args).lower()
 
+    @patch('lib.renew.time.sleep')
+    def test_spread_adds_delay(self, mock_sleep, tmp_data_dir):
+        """spread=True 时多证书间加随机延迟"""
+        config = ConfigManager(tmp_data_dir)
+        mock_api = MagicMock()
+        mock_api.query_order.return_value = {
+            'status': 'active',
+            'certificate': '---CERT---',
+            'ca_certificate': '---CA---',
+            'private_key': '---KEY---',
+        }
+        api_factory = MagicMock(return_value=mock_api)
+        deployer = MagicMock()
+        deployer.deploy_multi.return_value = [{'site_name': 'a.com', 'status': True, 'message': 'ok'}]
+        logger = MagicMock()
+        engine = RenewEngine(config, api_factory, deployer, logger)
+
+        for oid in (2001, 2002, 2003):
+            cert = _make_cert_entry(10, order_id=oid)
+            config.add_cert(order_id=oid, cert_name='c%d' % oid, domains=cert['domains'],
+                            site_names=['a.com'])
+            config.update_metadata(oid, cert['metadata'])
+
+        results = engine.check_and_renew_all(spread=True)
+        assert len(results) == 3
+        # 第一个不 sleep，后面两个各 sleep 一次
+        assert mock_sleep.call_count == 2
+
+    @patch('lib.renew.time.sleep')
+    def test_no_spread_no_delay(self, mock_sleep, tmp_data_dir):
+        """spread=False 时不加延迟"""
+        config = ConfigManager(tmp_data_dir)
+        mock_api = MagicMock()
+        mock_api.query_order.return_value = {
+            'status': 'active',
+            'certificate': '---CERT---',
+            'ca_certificate': '---CA---',
+            'private_key': '---KEY---',
+        }
+        api_factory = MagicMock(return_value=mock_api)
+        deployer = MagicMock()
+        deployer.deploy_multi.return_value = [{'site_name': 'a.com', 'status': True, 'message': 'ok'}]
+        logger = MagicMock()
+        engine = RenewEngine(config, api_factory, deployer, logger)
+
+        for oid in (3001, 3002):
+            cert = _make_cert_entry(10, order_id=oid)
+            config.add_cert(order_id=oid, cert_name='c%d' % oid, domains=cert['domains'],
+                            site_names=['a.com'])
+            config.update_metadata(oid, cert['metadata'])
+
+        results = engine.check_and_renew_all(spread=False)
+        assert len(results) == 2
+        mock_sleep.assert_not_called()
+
+    def test_summary_log(self, tmp_data_dir):
+        """续签完成后输出汇总日志"""
+        config = ConfigManager(tmp_data_dir)
+        api_factory = MagicMock(return_value=None)
+        deployer = MagicMock()
+        logger = MagicMock()
+        engine = RenewEngine(config, api_factory, deployer, logger)
+
+        # 无证书需要续签
+        engine.check_and_renew_all()
+        logger.info.assert_called()
+        last_call = logger.info.call_args_list[-1]
+        assert '无需续签' in str(last_call)
+
     def test_check_and_renew_all_mixed(self, tmp_data_dir):
         """两个证书：一个 api=None 被跳过，另一个正常续签"""
         config = ConfigManager(tmp_data_dir)

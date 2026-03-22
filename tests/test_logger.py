@@ -3,6 +3,7 @@
 import os
 import time
 import glob
+import logging
 import pytest
 from unittest.mock import patch
 
@@ -117,3 +118,14 @@ class TestLogger:
         content = logger.get_logs(lines=3)
         lines = content.strip().split('\n')
         assert len(lines) == 3
+
+    def test_no_duplicate_handlers(self, tmp_data_dir):
+        """多次实例化不会累积 handler"""
+        log_dir = os.path.join(tmp_data_dir, 'logs')
+        name = 'test_dup_%s' % id(self)
+        Logger(log_dir, name=name)
+        Logger(log_dir, name=name)
+        Logger(log_dir, name=name)
+        py_logger = logging.getLogger(name)
+        assert len(py_logger.handlers) == 1
+        assert len(py_logger.filters) == 1
