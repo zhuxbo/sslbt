@@ -13,6 +13,14 @@ DATA_DIR = os.path.join(PLUGIN_DIR, 'data')
 # 添加 lib 到路径
 sys.path.insert(0, PLUGIN_DIR)
 
+# 热更新：宝塔面板每次请求调用 reload(sslbt_main)，但不会递归 reload 子模块，
+# 导致升级后 lib/ 下的模块仍是旧版本。检测到 reload 时清除缓存，重新 import 即可。
+# 判断方式：首次 import 时 sslbt_main 类尚未定义，reload 时已存在。
+# 副作用：reload 会重置类变量（如 _pending_tokens），升级瞬间进行中的操作需重试。
+if hasattr(sys.modules.get('sslbt_main'), 'sslbt_main'):
+    for _mod in [k for k in sys.modules if k == 'lib' or k.startswith('lib.')]:
+        del sys.modules[_mod]
+
 from lib.config import ConfigManager  # noqa: E402
 from lib.logger import Logger  # noqa: E402
 from lib.api_client import APIClient, APIError  # noqa: E402
@@ -673,14 +681,7 @@ class sslbt_main:
                 download_path=download_path,
                 checksum=checksum,
             )
-            return _ok(msg='更新完成，请刷新页面')
+            return _ok(msg='更新完成')
         except Exception as e:
             self._logger.error("更新失败: %s", str(e))
             return _err('更新失败: %s' % str(e))
-
-    def restart_panel(self, args=None):
-        """重启宝塔面板"""
-        self._logger.info("用户触发面板重启")
-        import subprocess
-        subprocess.Popen(['bt', 'restart'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return _ok(msg='正在重启')

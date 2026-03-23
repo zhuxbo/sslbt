@@ -239,12 +239,4 @@ echo_info "安装完成！$VERSION"
 echo ""
 echo "插件位置: $PLUGIN_DIR"
 echo "打开宝塔面板 → 软件商店 → 第三方应用 → sslbt 证书管理"
-echo ""
-read -p "$(echo -e "${GREEN}[INFO]${NC} 需要重启面板以加载新代码，是否立即重启？[Y/n] ")" confirm < /dev/tty
-confirm=${confirm:-Y}
-if [[ "$confirm" =~ ^[Yy]$ ]]; then
-    echo_info "正在重启面板..."
-    bt restart
-else
-    echo_warn "请稍后手动执行: bt restart"
-fi
+echo "刷新面板页面即可使用，无需重启面板。"

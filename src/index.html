@@ -1162,15 +1162,8 @@
         checksum: P._ui.checksum || ''
       }, function (r) {
         if (r.status) {
-          sp.innerHTML = '';
-          layer.confirm('更新成功！需要重启面板以加载新代码，是否立即重启？', { offset: 'auto', btn: ['重启', '稍后'] }, function (idx) {
-            layer.close(idx);
-            sp.innerHTML = '<span style="color:#e6a23c">正在重启面板...</span>';
-            P._call('restart_panel', null, function () {});
-            setTimeout(function () { location.reload(); }, 5000);
-          }, function () {
-            sp.innerHTML = '<span style="color:#67c23a">更新成功，请手动执行 bt restart</span>';
-          });
+          sp.innerHTML = '<span style="color:#67c23a">更新成功，正在刷新...</span>';
+          setTimeout(function () { location.reload(); }, 1500);
         } else {
           sp.innerHTML = '<span style="color:#f56c6c">更新失败: ' + P._e(r.msg || '未知错误') + '</span>';
         }

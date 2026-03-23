@@ -150,7 +150,7 @@ Bearer Token 认证，部署链接格式：`https://domain/api/deploy?token=xxx&
 - 证书列表支持 checkbox 多选，顶部按钮（部署/删除）操作选中证书
 - 状态标签：未绑定 → 待部署 → 已部署（有 last_deploy_at 但无 cert_expires_at）→ 正常 → 即将过期 → 已过期
 - 添加证书后自动创建计划任务（如果尚未设置），失败不阻塞添加流程
-- 在线升级后弹窗确认重启面板（`restart_panel` → `bt restart`）
+- 在线升级后自动刷新页面即可，无需重启面板（`sslbt_main.py` 顶部热更新机制自动清除 lib 子模块缓存）
 
 ## 命令
 

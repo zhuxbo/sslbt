@@ -34,7 +34,7 @@ curl -fsSL https://release.cnssl.com/sslbt/install.sh | bash -s -- release.cnssl
 curl -fsSL https://release.cnssl.com/sslbt/install.sh | bash -s -- release.cnssl.com --dev
 ```
 
-升级：重新运行安装命令即可，已有配置和证书数据不会被覆盖。安装完成后会提示是否重启面板。
+升级：重新运行安装命令即可，已有配置和证书数据不会被覆盖。升级后刷新页面即可生效，无需重启面板。
 
 ### 手动安装
 
