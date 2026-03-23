@@ -102,3 +102,34 @@ issuer=CN = Test CA
         output = "DNS:a.com, DNS:b.com, DNS:c.com"
         san_entries = re.findall(r'DNS:([^\s,]+)', output)
         assert san_entries == ['a.com', 'b.com', 'c.com']
+
+    def test_ip_san_extraction(self):
+        """IP Address SAN 提取"""
+        import re
+        output = "DNS:example.com, IP Address:192.168.1.1, IP Address:10.0.0.1"
+        dns_entries = re.findall(r'DNS:([^\s,]+)', output)
+        ip_entries = re.findall(r'IP Address:([^\s,]+)', output)
+        assert dns_entries == ['example.com']
+        assert ip_entries == ['192.168.1.1', '10.0.0.1']
+
+    def test_mixed_dns_ip_san(self):
+        """DNS 和 IP 混合 SAN 多行输出"""
+        import re
+        output = """subject=CN = example.com
+            DNS:example.com, DNS:www.example.com,
+            IP Address:192.168.1.1, IP Address:2001:db8::1"""
+        dns_entries = re.findall(r'DNS:([^\s,]+)', output)
+        ip_entries = re.findall(r'IP Address:([^\s,]+)', output)
+        assert len(dns_entries) == 2
+        assert len(ip_entries) == 2
+        assert '192.168.1.1' in ip_entries
+        assert '2001:db8::1' in ip_entries
+
+    def test_pure_ip_san(self):
+        """纯 IP 证书（无 DNS SAN）"""
+        import re
+        output = "subject=CN = 192.168.1.1\nIP Address:192.168.1.1"
+        dns_entries = re.findall(r'DNS:([^\s,]+)', output)
+        ip_entries = re.findall(r'IP Address:([^\s,]+)', output)
+        assert dns_entries == []
+        assert ip_entries == ['192.168.1.1']

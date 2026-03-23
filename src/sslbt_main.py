@@ -20,6 +20,7 @@ from lib.cert_utils import build_fullchain, parse_cert_info  # noqa: E402
 from lib.site_manager import SiteManager  # noqa: E402
 from lib.deployer import Deployer, DeployError  # noqa: E402
 from lib.renew import RenewEngine  # noqa: E402
+from lib.file_verifier import FileVerifier  # noqa: E402
 from lib.cron import CronManager  # noqa: E402
 from lib.updater import Updater  # noqa: E402
 
@@ -156,6 +157,7 @@ class sslbt_main:
             site_names_str = _get_param(args, 'site_names', '')
             site_names = [s.strip() for s in site_names_str.split(',') if s.strip()] if site_names_str else []
             renew_mode = _get_param(args, 'renew_mode', '')
+            validation_method = _get_param(args, 'validation_method', '')
 
             if not order_id:
                 return _err('请提供订单 ID')
@@ -180,6 +182,7 @@ class sslbt_main:
                 renew_mode=renew_mode,
                 api_url=api_url,
                 api_token=api_token,
+                validation_method=validation_method,
             )
 
             self._logger.info("添加证书: order_id=%s, domains=%s", order_id, ','.join(domains))
@@ -308,6 +311,22 @@ class sslbt_main:
             # 查询证书
             cert_data = api.query_order(order_id)
             status = cert_data.get('status', '')
+
+            if status == 'processing':
+                file_info = cert_data.get('file')
+                if file_info:
+                    verifier = FileVerifier(self._site_mgr, self._logger)
+                    placed = verifier.place_file(file_info, site_name)
+                    if placed:
+                        self._config.update_metadata(order_id, {
+                            'pending_file_verify': file_info,
+                            'pending_verify_paths': placed,
+                            'last_issue_state': 'processing',
+                        })
+                        return _ok(msg='验证文件已放置，等待 CA 验证后签发')
+                    return _err('验证文件放置失败')
+                return _err('证书处理中，请稍后再试')
+
             if status != 'active':
                 return _err('证书状态为 %s，无法部署' % status)
 
@@ -556,7 +575,8 @@ class sslbt_main:
         """手动执行续签检查"""
         try:
             deployer = self._get_deployer()
-            engine = RenewEngine(self._config, self._get_api_for_cert, deployer, self._logger)
+            file_verifier = FileVerifier(self._site_mgr, self._logger)
+            engine = RenewEngine(self._config, self._get_api_for_cert, deployer, self._logger, file_verifier)
             results = engine.check_and_renew_all()
             return _ok(results, msg='续签检查完成')
         except Exception as e:
@@ -567,7 +587,8 @@ class sslbt_main:
         """计划任务调用的续签检查（分散执行）"""
         try:
             deployer = self._get_deployer()
-            engine = RenewEngine(self._config, self._get_api_for_cert, deployer, self._logger)
+            file_verifier = FileVerifier(self._site_mgr, self._logger)
+            engine = RenewEngine(self._config, self._get_api_for_cert, deployer, self._logger, file_verifier)
             results = engine.check_and_renew_all(spread=True)
             return _ok(results, msg='续签检查完成')
         except Exception as e:

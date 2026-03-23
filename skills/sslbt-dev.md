@@ -11,15 +11,16 @@ description: Use when developing sslbt baota panel plugin - modifying API client
 
 ```
 sslbt_main.py  ← 插件入口（控制器），宝塔面板调用
-  ├─ api_client.py   ← 部署 API 客户端（Bearer Token + 重试）
-  ├─ deployer.py     ← 证书部署（_BtParams + SetSSL + 回调）
-  ├─ renew.py        ← 续签引擎（Pull/Local 两种模式）
-  ├─ config.py       ← 配置读写（文件锁，证书级 API 配置，废弃字段过滤）
-  ├─ cert_utils.py   ← 证书验证 + CSR 生成
-  ├─ site_manager.py ← 宝塔站点管理 + 域名匹配（兼容新旧数据库分片）
-  ├─ cron.py         ← 宝塔计划任务（_BtParams + 直接查库 + 每天随机时间 + cron.log 轮转）
-  └─ logger.py       ← 日志（敏感信息过滤，MAX_LOG_FILES=90 自动清理）
-index.html           ← 前端 UI（纯 JS，3 Tab: 证书管理/设置/日志）
+  ├─ api_client.py      ← 部署 API 客户端（Bearer Token + 重试）
+  ├─ deployer.py        ← 证书部署（_BtParams + SetSSL + 回调）
+  ├─ renew.py           ← 续签引擎（Pull/Local 两种模式 + 文件验证集成）
+  ├─ file_verifier.py   ← 文件验证（ACME 验证文件放置/清理）
+  ├─ config.py          ← 配置读写（文件锁，证书级 API 配置，废弃字段过滤）
+  ├─ cert_utils.py      ← 证书验证 + CSR 生成（支持 DNS/IP SAN）
+  ├─ site_manager.py    ← 宝塔站点管理 + 域名匹配（兼容新旧数据库分片）
+  ├─ cron.py            ← 宝塔计划任务（_BtParams + 直接查库 + 每天随机时间 + cron.log 轮转）
+  └─ logger.py          ← 日志（敏感信息过滤，MAX_LOG_FILES=90 自动清理）
+index.html              ← 前端 UI（纯 JS，3 Tab: 证书管理/设置/日志）
 ```
 
 ## 宝塔兼容
@@ -88,20 +89,31 @@ Bearer Token 认证，部署链接格式：`https://domain/api/deploy?token=xxx&
 
 ```
 添加证书（用户粘贴部署链接）
-  fetch_deploy_url → 提取 token/order → GET ?order=xxx → 解析 domains → 匹配站点 → add_cert
+  fetch_deploy_url → 提取 token/order → GET ?order=xxx → 解析 domains（DNS+IP SAN） → 匹配站点 → add_cert
 
 部署证书
-  query_order → 取 cert/key/ca → 校验匹配 → panelSite.SetSSL() → callback
+  query_order → active: 取 cert/key/ca → 校验匹配 → panelSite.SetSSL() → callback
+             → processing + file: FileVerifier.place_file() → 等待 CA 验证
 
 自动续签（定时任务）
   Pull: query_order → active 则部署
-  Local: generate_csr → submit_csr → 等待 → query_order active → 部署
+  Local: generate_csr → submit_csr(validation_method) → processing + file → 放置验证文件 → 等待 → active → 部署 + 清理验证文件
 ```
+
+## 文件验证流程
+
+- `FileVerifier.place_file(file_info, site_names)`：将 ACME 验证文件写入绑定站点的根目录
+- `FileVerifier.cleanup_files(placed_paths)`：证书签发后清理验证文件
+- 路径安全校验：必须以 `.well-known/` 开头，不含 `..`
+- 触发场景：Local 模式续签（`_submit_new_csr`/`_handle_processing`）和手动部署（`deploy_cert`）
+- metadata 存储：`pending_file_verify`（文件信息）、`pending_verify_paths`（已放置路径列表）
+- 清理时机：证书签发成功、CSR 超时、状态异常
 
 ## 续签引擎关键逻辑
 
 - Pull 模式：查询订单，active 且证书完整则直接部署
-- Local 模式：生成 CSR → 提交 → processing 状态轮询 → active 后部署
+- Local 模式：生成 CSR → 提交（含 validation_method） → processing 状态轮询 → active 后部署
+- 文件验证：CSR 提交返回 file 字段时自动放置，签发/超时/异常时自动清理
 - `_check_deploy_results()`：全部失败抛异常，部分失败记警告
 - callback：全部站点成功=success，任一失败=failure
 - 分散续签：`check_and_renew_all(spread=True)` 在证书间加动态延迟，根据需续签数量自动缩短间隔（总延迟上限 600s），仅 cron 调用启用
@@ -125,6 +137,7 @@ Bearer Token 认证，部署链接格式：`https://domain/api/deploy?token=xxx&
 
 - `renew_before_days`：提前续签天数，全局生效，默认 13
 - 废弃字段（`api_url`、`api_token`、`version`）读写时自动过滤
+- `validation_method`：证书级验证方式（`delegation` 或 `file`），空值默认服务端决定
 - 站点唯一绑定：一个站点只能绑定一个证书，add_cert / update_cert / update_cert_config 均校验
 - ConfigManager 支持可选 `logger` 参数，JSON 损坏时记录 error 并创建 .bak 备份
 - `add_cert` / `update_cert` / `remove_cert` 使用 `_update_json` 原子读-改-写（独立锁文件防止竞态）
@@ -133,7 +146,7 @@ Bearer Token 认证，部署链接格式：`https://domain/api/deploy?token=xxx&
 
 - `sslbt_main.py` 方法名 = 前端 `P._call('method_name', params, callback)` 的 method_name
 - 证书编辑用 `update_cert_config`（原子更新 site_name/renew_mode，站点唯一绑定校验）
-- `_parse_cert_domains` 只解析 `domains` 字段（逗号分隔字符串）
+- `_parse_cert_domains` 优先从证书 PEM 提取域名（DNS + IP SAN），未签发时回退 API 域名
 - 证书列表支持 checkbox 多选，顶部按钮（部署/删除）操作选中证书
 - 状态标签：未绑定 → 待部署 → 已部署（有 last_deploy_at 但无 cert_expires_at）→ 正常 → 即将过期 → 已过期
 - 添加证书后自动创建计划任务（如果尚未设置），失败不阻塞添加流程

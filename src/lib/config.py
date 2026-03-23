@@ -20,6 +20,7 @@ DEFAULT_CERT_ENTRY = {
     'domains': [],
     'enabled': True,
     'renew_mode': '',
+    'validation_method': '',
     'api_url': '',
     'api_token': '',
     'site_name': [],
@@ -192,7 +193,7 @@ class ConfigManager:
         return bound
 
     def add_cert(self, order_id, cert_name, domains, site_name='', renew_mode='',
-                 api_url='', api_token='', site_names=None):
+                 api_url='', api_token='', site_names=None, validation_method=''):
         """添加证书条目，自动排除已被其他证书绑定的站点"""
         order_id = int(order_id)
         requested = site_names if site_names is not None else ([site_name] if site_name else [])
@@ -210,6 +211,7 @@ class ConfigManager:
             entry['domains'] = domains if isinstance(domains, list) else [domains]
             entry['site_name'] = available
             entry['renew_mode'] = renew_mode
+            entry['validation_method'] = validation_method
             entry['api_url'] = api_url
             entry['api_token'] = api_token
             certs.append(entry)

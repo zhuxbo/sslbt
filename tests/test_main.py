@@ -256,6 +256,76 @@ class TestDeployCert:
         assert 'API' in result['msg']
 
 
+    @patch('sslbt_main.APIClient')
+    def test_deploy_processing_with_file(self, mock_api_cls, plugin):
+        """processing + file 状态放置验证文件"""
+        plugin._config.add_cert(
+            order_id=302,
+            cert_name='test',
+            domains=['a.com'],
+            site_names=['a.com'],
+            api_url='https://api.example.com',
+            api_token=TOKEN,
+        )
+        mock_api = MagicMock()
+        mock_api.query_order.return_value = {
+            'status': 'processing',
+            'file': {'path': '.well-known/acme-challenge/token123', 'content': 'verify'},
+        }
+        mock_api_cls.return_value = mock_api
+
+        plugin._site_mgr.get_site.return_value = {
+            'name': 'a.com',
+            'path': '/tmp/test-webroot',
+        }
+        result = plugin.deploy_cert({'order_id': '302'})
+        assert result['status'] is True
+        assert '验证文件' in result['msg']
+
+    @patch('sslbt_main.APIClient')
+    def test_deploy_processing_no_file(self, mock_api_cls, plugin):
+        """processing 无 file 字段返回提示"""
+        plugin._config.add_cert(
+            order_id=303,
+            cert_name='test',
+            domains=['a.com'],
+            site_names=['a.com'],
+            api_url='https://api.example.com',
+            api_token=TOKEN,
+        )
+        mock_api = MagicMock()
+        mock_api.query_order.return_value = {'status': 'processing'}
+        mock_api_cls.return_value = mock_api
+
+        result = plugin.deploy_cert({'order_id': '303'})
+        assert result['status'] is False
+        assert '处理中' in result['msg']
+
+    @patch('sslbt_main.APIClient')
+    def test_deploy_processing_file_place_fails(self, mock_api_cls, plugin):
+        """验证文件放置全部失败时返回错误"""
+        plugin._config.add_cert(
+            order_id=304,
+            cert_name='test',
+            domains=['a.com'],
+            site_names=['a.com'],
+            api_url='https://api.example.com',
+            api_token=TOKEN,
+        )
+        mock_api = MagicMock()
+        mock_api.query_order.return_value = {
+            'status': 'processing',
+            'file': {'path': '.well-known/acme-challenge/token123', 'content': 'verify'},
+        }
+        mock_api_cls.return_value = mock_api
+
+        # get_site 返回 None，导致 place_file 返回空列表
+        plugin._site_mgr.get_site.return_value = None
+        result = plugin.deploy_cert({'order_id': '304'})
+        assert result['status'] is False
+        assert '失败' in result['msg']
+
+
 class TestCheckCert:
     def test_no_cert(self, plugin):
         """不存在的订单"""

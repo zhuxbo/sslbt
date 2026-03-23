@@ -155,3 +155,30 @@ class TestAPIClient:
         ok, msg = client.test_connection()
         assert ok is False
         assert '认证失败' in msg
+
+    @patch('lib.api_client.urlopen')
+    def test_submit_csr_without_validation_method(self, mock_urlopen, client):
+        """submit_csr 不传 validation_method 时不包含该字段"""
+        resp_data = json.dumps({'code': 1, 'data': {'status': 'processing'}}).encode()
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = resp_data
+        mock_urlopen.return_value = mock_resp
+
+        client.submit_csr(123, 'csr-pem', ['a.com'])
+        call_args = mock_urlopen.call_args
+        body = json.loads(call_args[0][0].data.decode('utf-8'))
+        assert 'validation_method' not in body
+        assert body['order_id'] == 123
+
+    @patch('lib.api_client.urlopen')
+    def test_submit_csr_with_validation_method(self, mock_urlopen, client):
+        """submit_csr 传入 validation_method 时包含该字段"""
+        resp_data = json.dumps({'code': 1, 'data': {'status': 'processing'}}).encode()
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = resp_data
+        mock_urlopen.return_value = mock_resp
+
+        client.submit_csr(123, 'csr-pem', ['a.com'], validation_method='file')
+        call_args = mock_urlopen.call_args
+        body = json.loads(call_args[0][0].data.decode('utf-8'))
+        assert body['validation_method'] == 'file'
