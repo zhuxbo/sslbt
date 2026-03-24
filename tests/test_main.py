@@ -388,6 +388,64 @@ class TestUpdateCertConfig:
         assert result['status'] is False
 
 
+class TestGetSiteMatches:
+    def test_missing_order_id(self, plugin):
+        result = plugin.get_site_matches({})
+        assert result['status'] is False
+
+    def test_order_not_found(self, plugin):
+        result = plugin.get_site_matches({'order_id': '999'})
+        assert result['status'] is False
+
+    def test_returns_all_sites_with_match_info(self, plugin):
+        plugin._config.add_cert(order_id=700, cert_name='test',
+                                domains=['a.example.com', 'b.example.com'],
+                                api_url='https://api.example.com', api_token=TOKEN,
+                                site_names=['site-a.example.com'])
+        plugin._site_mgr.get_sites.return_value = [
+            {'name': 'site-a.example.com', 'domains': ['a.example.com', 'b.example.com']},
+            {'name': 'site-b.example.com', 'domains': ['c.example.com']},
+        ]
+        result = plugin.get_site_matches({'order_id': '700'})
+        assert result['status'] is True
+        data = result['data']
+        assert len(data) == 2
+        # site-a: 已绑定，全部匹配
+        assert data[0]['site_name'] == 'site-a.example.com'
+        assert data[0]['bound'] is True
+        assert data[0]['match_type'] == 'full'
+        # site-b: 未绑定，无匹配
+        assert data[1]['site_name'] == 'site-b.example.com'
+        assert data[1]['bound'] is False
+        assert data[1]['match_type'] is None
+
+    def test_no_sites(self, plugin):
+        plugin._config.add_cert(order_id=701, cert_name='test', domains=['a.example.com'],
+                                api_url='https://api.example.com', api_token=TOKEN)
+        plugin._site_mgr.get_sites.return_value = []
+        result = plugin.get_site_matches({'order_id': '701'})
+        assert result['status'] is True
+        assert result['data'] == []
+
+    def test_site_name_string_compat(self, plugin):
+        """site_name 为旧格式字符串时也能正确判断 bound"""
+        plugin._config.add_cert(order_id=702, cert_name='test', domains=['a.example.com'],
+                                api_url='https://api.example.com', api_token=TOKEN,
+                                site_names=['s.example.com'])
+        # 模拟旧格式：手动改为字符串
+        certs = plugin._config.get_certs()
+        for c in certs:
+            if c['order_id'] == 702:
+                c['site_name'] = 's.example.com'
+        plugin._config.save_certs(certs)
+        plugin._site_mgr.get_sites.return_value = [
+            {'name': 's.example.com', 'domains': ['a.example.com']},
+        ]
+        result = plugin.get_site_matches({'order_id': '702'})
+        assert result['status'] is True
+        assert result['data'][0]['bound'] is True
+
+
 class TestFetchDeployUrl:
     def test_missing_url(self, plugin):
         result = plugin.fetch_deploy_url({})

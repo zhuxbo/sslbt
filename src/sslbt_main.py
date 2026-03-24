@@ -562,6 +562,35 @@ class sslbt_main:
         except Exception as e:
             return _err('获取证书详情失败: %s' % str(e))
 
+    def get_site_matches(self, args=None):
+        """获取所有站点与指定证书的匹配度"""
+        try:
+            order_id = _get_param(args, 'order_id', '')
+            if not order_id:
+                return _err('请提供订单 ID')
+            cert_entry = self._config.get_cert(int(order_id))
+            if not cert_entry:
+                return _err('订单不存在')
+            cert_domains = cert_entry.get('domains', [])
+            bound = cert_entry.get('site_name', [])
+            if isinstance(bound, str):
+                bound = [bound] if bound else []
+            bound_set = set(bound)
+            sites = self._site_mgr.get_sites()
+            result = []
+            for s in sites:
+                name = s['name']
+                match = SiteManager.match_domains(cert_domains, s.get('domains', []))
+                result.append({
+                    'site_name': name,
+                    'bound': name in bound_set,
+                    'match_type': match['type'] if match else None,
+                    'unmatched': match['unmatched'] if match else [],
+                })
+            return _ok(result)
+        except Exception as e:
+            return _err('获取站点匹配失败: %s' % str(e))
+
     def batch_set_renew_mode(self, args=None):
         """批量设置所有证书的续签模式"""
         try:

@@ -58,20 +58,14 @@ get_channel() {
     [[ "$1" == *"-"* ]] && echo "dev" || echo "main"
 }
 
-ensure_tag() {
+check_tag() {
     local tag="$1"
     local head_commit=$(git -C "$PROJECT_ROOT" rev-parse HEAD)
     local tag_commit=$(git -C "$PROJECT_ROOT" rev-parse "refs/tags/$tag" 2>/dev/null || echo "")
     if [ -z "$tag_commit" ]; then
-        log_info "创建 tag: $tag"
-        git -C "$PROJECT_ROOT" tag "$tag"
-        git -C "$PROJECT_ROOT" push origin "$tag"
+        log_warning "tag $tag 不存在，建议: git tag $tag && git push origin $tag"
     elif [ "$tag_commit" != "$head_commit" ]; then
-        log_warning "tag $tag 指向其他提交，更新到当前提交"
-        git -C "$PROJECT_ROOT" tag -d "$tag"
-        git -C "$PROJECT_ROOT" push origin ":refs/tags/$tag" 2>/dev/null || true
-        git -C "$PROJECT_ROOT" tag "$tag"
-        git -C "$PROJECT_ROOT" push origin "$tag"
+        log_warning "tag $tag 指向其他提交，非当前 HEAD"
     else
         log_info "tag $tag 已指向当前提交"
     fi
@@ -107,7 +101,7 @@ update_releases_json_remote() {
     log_info "更新 releases.json..."
 
     ssh_cmd "$SERVER_HOST" "$SERVER_PORT" "RELEASES_FILE='$SERVER_DIR/releases.json' VERSION='$version' CHANNEL='$channel' CHECKSUM='$checksum' python3 << 'PYEOF'
-import json, os
+import json, os, re
 from datetime import datetime
 
 releases_file = os.environ['RELEASES_FILE']
@@ -116,6 +110,12 @@ channel = os.environ['CHANNEL']
 checksum = os.environ.get('CHECKSUM', '')
 
 v_version = version if version.startswith('v') else f'v{version}'
+
+def ver_key(s):
+    s = s[1:] if s.startswith('v') else s
+    base, _, pre = s.partition('-')
+    nums = tuple(int(x) for x in base.split('.'))
+    return (nums, 0 if not pre else -1, pre)
 
 data = {'channels': {}, 'versions': {}}
 if os.path.exists(releases_file):
@@ -145,9 +145,12 @@ existing = [i for i, v in enumerate(versions) if strip_v(v['version']) == strip_
 if existing:
     versions[existing[0]] = version_entry
 else:
-    versions.insert(0, version_entry)
+    versions.append(version_entry)
 
-data['channels'][channel]['latest'] = v_version
+versions.sort(key=lambda v: ver_key(v['version']), reverse=True)
+
+latest = versions[0]['version'] if versions else ''
+data['channels'][channel]['latest'] = latest
 data['channels'][channel]['versions'] = versions
 
 if v_version not in data['versions']:
@@ -193,8 +196,15 @@ if os.path.isdir(channel_dir):
         if d.startswith('v'): existing.add(d)
 versions = data['channels'][channel].get('versions', [])
 data['channels'][channel]['versions'] = [v for v in versions if v['version'] in existing]
-# 修正 latest 字段
+
+def ver_key(s):
+    s = s[1:] if s.startswith('v') else s
+    base, _, pre = s.partition('-')
+    nums = tuple(int(x) for x in base.split('.'))
+    return (nums, 0 if not pre else -1, pre)
+
 filtered = data['channels'][channel]['versions']
+filtered.sort(key=lambda v: ver_key(v['version']), reverse=True)
 if filtered:
     data['channels'][channel]['latest'] = filtered[0]['version']
 elif channel in data['channels']:
@@ -278,7 +288,7 @@ main() {
     local channel=$(get_channel "$version")
 
     if [ "$channel" = "main" ]; then
-        ensure_tag "v${version#v}"
+        check_tag "v${version#v}"
     fi
 
     if [[ "$version" != v* ]]; then version="v$version"; fi
