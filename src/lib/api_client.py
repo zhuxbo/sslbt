@@ -125,7 +125,7 @@ class APIClient:
             raise APIError("未找到订单数据")
         return items[0]
 
-    def submit_csr(self, order_id, csr, domains):
+    def submit_csr(self, order_id, csr, domains, validation_method=''):
         """提交 CSR。对标 Fetcher.Update"""
         url = _build_api_url(self._base_url)
         if self._logger:
@@ -136,6 +136,8 @@ class APIClient:
             'csr': csr,
             'domains': ','.join(domains) if isinstance(domains, list) else domains,
         }
+        if validation_method:
+            data['validation_method'] = validation_method
         result = self._request('POST', url, data=data)
         return self._parse_data(result)
 

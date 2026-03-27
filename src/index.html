@@ -261,39 +261,27 @@
     padding: 3px 0;
   }
 
-  /* 绑定站点子列表 */
-  .ssl-site-list {
-    margin-bottom: 12px;
+  /* 绑定站点（与证书信息同布局，带分隔线） */
+  .ssl-detail-grid-sites {
     border-top: 1px solid #ebeef5;
-    padding: 8px 0;
+    padding-top: 8px;
+    padding-bottom: 8px;
+    margin-bottom: 0;
   }
-  .ssl-site-list-title {
-    font-size: 12px;
-    color: #909399;
-    margin-bottom: 6px;
-    text-align: center;
-  }
-  .ssl-site-item {
-    padding: 5px 0;
-    font-size: 12px;
-    color: #606266;
-  }
-  .ssl-site-item .ssl-site-row {
+  .ssl-detail-grid-sites .ssl-site-row {
     display: flex;
     align-items: center;
     gap: 8px;
   }
-  .ssl-site-item .ssl-unmatched {
-    display: block;
+  .ssl-detail-grid-sites .ssl-site-tags {
+    margin-left: auto;
+    display: flex;
+    gap: 8px;
+    white-space: nowrap;
+  }
+  .ssl-detail-grid-sites .ssl-unmatched {
     font-size: 11px;
     color: #e6a23c;
-    margin-top: 2px;
-    padding-left: 0;
-  }
-  .ssl-no-sites {
-    font-size: 12px;
-    color: #c0c4cc;
-    padding: 4px 0;
   }
 
   /* 详情操作按钮 */
@@ -614,11 +602,10 @@
       h += '<div class="ssl-detail-item"><span class="ssl-detail-label">上次部署</span><span class="ssl-detail-val">' + P._fmtTime(lastDeploy) + '</span></div>';
       h += '</div>';
 
-      // 绑定站点子列表
+      // 绑定站点（与证书信息同布局）
       var siteDetails = d._site_details || [];
       if (siteDetails.length > 0) {
-        h += '<div class="ssl-site-list">';
-        h += '<div class="ssl-site-list-title">绑定站点</div>';
+        var sitesHtml = '';
         for (var i = 0; i < siteDetails.length; i++) {
           var sd = siteDetails[i];
           var matchTag = '';
@@ -634,16 +621,14 @@
             matchTag = '<span class="ssl-tag ssl-tag-info">无匹配</span>';
           }
           var deployStatus = m.last_deploy_at ? '<span class="ssl-tag ssl-tag-success">已部署</span>' : '<span class="ssl-tag ssl-tag-info">未部署</span>';
-          h += '<div class="ssl-site-item">';
-          h += '<div class="ssl-site-row"><span>' + P._e(sd.site_name) + '</span> ' + matchTag + ' ' + deployStatus + '</div>';
+          sitesHtml += '<div class="ssl-site-row"><span>' + P._e(sd.site_name) + '</span><span class="ssl-site-tags">' + matchTag + deployStatus + '</span></div>';
           if (sd.match && sd.match.type === 'partial' && sd.match.unmatched && sd.match.unmatched.length) {
-            h += '<span class="ssl-unmatched">未覆盖: ' + P._e(sd.match.unmatched.join(', ')) + '</span>';
+            sitesHtml += '<div class="ssl-unmatched">未覆盖: ' + P._e(sd.match.unmatched.join(', ')) + '</div>';
           }
-          h += '</div>';
         }
+        h += '<div class="ssl-detail-grid ssl-detail-grid-sites">';
+        h += '<div class="ssl-detail-item"><span class="ssl-detail-label">绑定站点</span><span class="ssl-detail-val">' + sitesHtml + '</span></div>';
         h += '</div>';
-      } else {
-        // 未绑定站点时不显示额外提示，状态标签已标明
       }
 
       // 操作按钮
@@ -928,17 +913,23 @@
         var statusMap = { active: '正常', pending: '待签发', expired: '已过期', revoked: '已吊销', processing: '处理中' };
         var statusText = statusMap[d.status] || d.status || '-';
         var domains = d.domains || d.common_name || d.domain || '-';
+        var updated = d._order_updated;
+        var h = '<div style="padding:20px 30px;font-size:13px;line-height:2">';
+        if (updated) {
+          h += '<p style="color:#e6a23c;font-weight:bold">订单已续费，ID 已自动更新</p>';
+        }
+        h += '<p><b>订单 ID：</b>' + P._e(String(d.order_id || oid)) + '</p>';
+        h += '<p><b>状态：</b>' + P._e(statusText) + '</p>';
+        h += '<p><b>域名：</b>' + P._e(domains) + '</p>';
+        h += '<p><b>过期时间：</b>' + P._e(d.expires_at || '-') + '</p>';
+        h += '</div>';
         layer.open({
           type: 1,
           title: '证书状态',
-          area: ['420px', '240px'],
+          area: ['420px', updated ? '290px' : '270px'],
           offset: 'auto',
-          content:
-            '<div style="padding:20px 30px;font-size:13px;line-height:2">' +
-            '<p><b>状态：</b>' + P._e(statusText) + '</p>' +
-            '<p><b>域名：</b>' + P._e(domains) + '</p>' +
-            '<p><b>过期时间：</b>' + P._e(d.expires_at || '-') + '</p>' +
-            '</div>',
+          content: h,
+          end: function () { if (updated) { P._certCache = {}; P.loadCerts(); } },
         });
       });
     },
@@ -954,52 +945,76 @@
       }
       if (!cert) { layer.msg('证书数据未加载', { icon: 2 }); return; }
 
-      var siteNames = cert.site_name || [];
-      if (typeof siteNames === 'string') siteNames = siteNames ? [siteNames] : [];
       var renewMode = cert.renew_mode || '';
       var apiUrl = cert.api_url || '';
       var apiTokenMasked = cert.api_token_masked || '';
 
-      var ipt = 'style="width:100%;padding:7px 10px;border:1px solid #dcdfe6;border-radius:3px;font-size:13px;box-sizing:border-box"';
-      var lbl = 'style="display:block;margin-bottom:4px;font-size:13px;color:#606266"';
-      var row = 'style="margin-bottom:14px"';
+      P._call('get_site_matches', { order_id: oid }, function (r) {
+        var allSites = (r.status && r.data) ? r.data : [];
 
-      layer.open({
-        type: 1,
-        title: '编辑证书 #' + oid,
-        area: ['480px', '420px'],
-        offset: 'auto',
-        content:
-          '<div style="padding:20px 30px">' +
-          '<div ' + row + '><label ' + lbl + '>绑定站点（逗号分隔）</label><input id="edit-sites" value="' + P._e(siteNames.join(', ')) + '" placeholder="site1.com, site2.com" ' + ipt + ' /></div>' +
-          '<div ' + row + '><label ' + lbl + '>续签模式</label><select id="edit-renew-mode" ' + ipt + '>' +
-          '<option value="pull"' + (renewMode !== 'local' ? ' selected' : '') + '>自动签发</option>' +
-          '<option value="local"' + (renewMode === 'local' ? ' selected' : '') + '>本机提交</option></select></div>' +
-          '<div ' + row + '><label ' + lbl + '>API URL</label><input id="edit-api-url" value="' + P._e(apiUrl) + '" placeholder="https://..." ' + ipt + ' /></div>' +
-          '<div ' + row + '><label ' + lbl + '>API Token' + (apiTokenMasked ? ' <span style="color:#c0c4cc;font-weight:400">当前: ' + P._e(apiTokenMasked) + '</span>' : '') + '</label><input id="edit-api-token" value="" placeholder="留空则不修改" ' + ipt + ' /></div>' +
-          '</div>',
-        btn: ['保存', '取消'],
-        yes: function (idx) {
-          var sitesStr = $('#edit-sites').val().trim();
-          var newSites = sitesStr ? sitesStr.split(/[,，]/).map(function (s) { return s.trim(); }).filter(Boolean) : [];
-          var newMode = $('#edit-renew-mode').val();
-          var newApiUrl = $('#edit-api-url').val().trim();
-          var newApiToken = $('#edit-api-token').val().trim();
-          layer.close(idx);
-          var closeLoading = P._loading('保存中...');
-          var params = {
-            order_id: oid,
-            site_names: newSites.join(','),
-            renew_mode: newMode
-          };
-          if (newApiUrl) params.api_url = newApiUrl;
-          if (newApiToken) params.api_token = newApiToken;
-          P._call('update_cert_config', params, function (r) {
-            closeLoading();
-            layer.msg(r.status ? '保存成功' : r.msg, { icon: r.status ? 1 : 2 });
-            if (r.status) { delete P._certCache[oid]; P.loadCerts(); }
-          });
-        },
+        var ipt = 'style="width:100%;padding:7px 10px;border:1px solid #dcdfe6;border-radius:3px;font-size:13px;box-sizing:border-box"';
+        var lbl = 'style="display:block;margin-bottom:4px;font-size:13px;color:#606266"';
+        var row = 'style="margin-bottom:14px"';
+
+        // 站点多选列表
+        var sitesHtml = '<div id="edit-sites-list" style="max-height:150px;overflow-y:auto;border:1px solid #dcdfe6;border-radius:3px;padding:6px 10px">';
+        if (!allSites.length) {
+          sitesHtml += '<span style="color:#c0c4cc;font-size:12px">暂无站点</span>';
+        }
+        for (var i = 0; i < allSites.length; i++) {
+          var s = allSites[i];
+          var tag = '';
+          if (s.match_type === 'full') {
+            tag = '<span class="ssl-tag ssl-tag-success" style="margin-left:6px">全部匹配</span>';
+          } else if (s.match_type === 'partial') {
+            tag = '<span class="ssl-tag ssl-tag-warning" style="margin-left:6px">部分匹配</span>';
+          } else {
+            tag = '<span class="ssl-tag ssl-tag-info" style="margin-left:6px">无匹配</span>';
+          }
+          sitesHtml += '<label style="display:flex;align-items:center;padding:3px 0;font-size:12px;cursor:pointer;gap:6px">';
+          sitesHtml += '<input type="checkbox" class="edit-site-cb" value="' + P._e(s.site_name) + '"' + (s.bound ? ' checked' : '') + ' />';
+          sitesHtml += '<span>' + P._e(s.site_name) + '</span>' + tag;
+          sitesHtml += '</label>';
+        }
+        sitesHtml += '</div>';
+
+        layer.open({
+          type: 1,
+          title: '编辑证书 #' + oid,
+          area: ['480px', '460px'],
+          offset: 'auto',
+          content:
+            '<div style="padding:20px 30px">' +
+            '<div ' + row + '><label ' + lbl + '>绑定站点</label>' + sitesHtml + '</div>' +
+            '<div ' + row + '><label ' + lbl + '>续签模式</label><select id="edit-renew-mode" ' + ipt + '>' +
+            '<option value="pull"' + (renewMode !== 'local' ? ' selected' : '') + '>自动签发</option>' +
+            '<option value="local"' + (renewMode === 'local' ? ' selected' : '') + '>本机提交</option></select></div>' +
+            '<div ' + row + '><label ' + lbl + '>API URL</label><input id="edit-api-url" value="' + P._e(apiUrl) + '" placeholder="https://..." ' + ipt + ' /></div>' +
+            '<div ' + row + '><label ' + lbl + '>API Token' + (apiTokenMasked ? ' <span style="color:#c0c4cc;font-weight:400">当前: ' + P._e(apiTokenMasked) + '</span>' : '') + '</label><input id="edit-api-token" value="" placeholder="留空则不修改" ' + ipt + ' /></div>' +
+            '</div>',
+          btn: ['保存', '取消'],
+          yes: function (idx) {
+            var newSites = [];
+            $('.edit-site-cb:checked').each(function () { newSites.push($(this).val()); });
+            var newMode = $('#edit-renew-mode').val();
+            var newApiUrl = $('#edit-api-url').val().trim();
+            var newApiToken = $('#edit-api-token').val().trim();
+            layer.close(idx);
+            var closeLoading = P._loading('保存中...');
+            var params = {
+              order_id: oid,
+              site_names: newSites.join(','),
+              renew_mode: newMode
+            };
+            if (newApiUrl) params.api_url = newApiUrl;
+            if (newApiToken) params.api_token = newApiToken;
+            P._call('update_cert_config', params, function (r) {
+              closeLoading();
+              layer.msg(r.status ? '保存成功' : r.msg, { icon: r.status ? 1 : 2 });
+              if (r.status) { delete P._certCache[oid]; P.loadCerts(); }
+            });
+          },
+        });
       });
     },
 
@@ -1162,14 +1177,13 @@
         checksum: P._ui.checksum || ''
       }, function (r) {
         if (r.status) {
-          sp.innerHTML = '';
-          layer.confirm('更新成功！需要重启面板以加载新代码，是否立即重启？', { offset: 'auto', btn: ['重启', '稍后'] }, function (idx) {
-            layer.close(idx);
-            sp.innerHTML = '<span style="color:#e6a23c">正在重启面板...</span>';
-            P._call('restart_panel', null, function () {});
-            setTimeout(function () { location.reload(); }, 5000);
-          }, function () {
-            sp.innerHTML = '<span style="color:#67c23a">更新成功，请手动执行 bt restart</span>';
+          sp.innerHTML = '<span style="color:#67c23a">更新成功！</span>';
+          layer.alert('插件更新成功。刷新页面即可加载新版本，若遇到异常请重启面板（bt restart）。', {
+            title: '更新完成',
+            icon: 1,
+            offset: 'auto',
+            btn: ['刷新页面'],
+            yes: function () { (window.top || window).location.reload(); }
           });
         } else {
           sp.innerHTML = '<span style="color:#f56c6c">更新失败: ' + P._e(r.msg || '未知错误') + '</span>';

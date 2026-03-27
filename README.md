@@ -5,8 +5,10 @@
 ## 功能
 
 - 证书管理：添加、部署、删除证书订单
+- IP 证书：支持 IP 地址证书（SAN 中的 IP Address 类型）
 - 批量添加：批量查询并添加证书，自动匹配宝塔站点
 - 自动续签：支持 Pull 和 Local 两种续签模式
+- 文件验证：Local 模式支持 ACME 文件验证（自动放置/清理验证文件）
 - 批量部署：一键部署所有已绑定站点的证书
 - 计划任务：添加证书时自动创建，定期检查证书过期并自动续签，多证书分散执行
 - 多站点绑定：一张证书可部署到多个站点，支持域名通配符匹配
@@ -32,7 +34,7 @@ curl -fsSL https://release.cnssl.com/sslbt/install.sh | bash -s -- release.cnssl
 curl -fsSL https://release.cnssl.com/sslbt/install.sh | bash -s -- release.cnssl.com --dev
 ```
 
-升级：重新运行安装命令即可，已有配置和证书数据不会被覆盖。安装完成后会提示是否重启面板。
+升级：重新运行安装命令即可，已有配置和证书数据不会被覆盖。升级后刷新页面即可生效，无需重启面板。
 
 ### 手动安装
 

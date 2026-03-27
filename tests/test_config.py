@@ -251,6 +251,34 @@ class TestConfigManager:
         assert cert['metadata']['last_deploy_at'] == '2026-01-01T00:00:00Z'
         assert cert['metadata']['cert_serial'] == 'ABC123'
 
+    def test_update_order_id(self, config_manager):
+        """续费后更新订单 ID"""
+        config_manager.add_cert(11111, 'order-11111', ['a.com'])
+        config_manager.update_metadata(11111, {'cert_serial': 'ABC', 'last_deploy_at': '2026-01-01'})
+        config_manager.update_order_id(11111, 22222)
+        assert config_manager.get_cert(11111) is None
+        cert = config_manager.get_cert(22222)
+        assert cert is not None
+        assert cert['cert_name'] == 'order-22222'
+        assert cert['domains'] == ['a.com']
+        # metadata 保留
+        assert cert['metadata']['cert_serial'] == 'ABC'
+        assert cert['metadata']['last_deploy_at'] == '2026-01-01'
+
+    def test_update_order_id_conflict(self, config_manager):
+        """新订单 ID 已存在时报错"""
+        config_manager.add_cert(11111, 'order-11111', ['a.com'])
+        config_manager.add_cert(22222, 'order-22222', ['b.com'])
+        with pytest.raises(ValueError, match='已存在'):
+            config_manager.update_order_id(11111, 22222)
+        # 原始配置未变
+        assert config_manager.get_cert(11111) is not None
+
+    def test_update_order_id_not_found(self, config_manager):
+        """旧订单 ID 不存在时报错"""
+        with pytest.raises(ValueError, match='不存在'):
+            config_manager.update_order_id(99999, 88888)
+
     def test_config_manager_with_logger(self, tmp_data_dir):
         """ConfigManager 接受 logger 参数"""
         from unittest.mock import MagicMock

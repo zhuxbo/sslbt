@@ -256,6 +256,76 @@ class TestDeployCert:
         assert 'API' in result['msg']
 
 
+    @patch('sslbt_main.APIClient')
+    def test_deploy_processing_with_file(self, mock_api_cls, plugin):
+        """processing + file 状态放置验证文件"""
+        plugin._config.add_cert(
+            order_id=302,
+            cert_name='test',
+            domains=['a.com'],
+            site_names=['a.com'],
+            api_url='https://api.example.com',
+            api_token=TOKEN,
+        )
+        mock_api = MagicMock()
+        mock_api.query_order.return_value = {
+            'status': 'processing',
+            'file': {'path': '.well-known/acme-challenge/token123', 'content': 'verify'},
+        }
+        mock_api_cls.return_value = mock_api
+
+        plugin._site_mgr.get_site.return_value = {
+            'name': 'a.com',
+            'path': '/tmp/test-webroot',
+        }
+        result = plugin.deploy_cert({'order_id': '302'})
+        assert result['status'] is True
+        assert '验证文件' in result['msg']
+
+    @patch('sslbt_main.APIClient')
+    def test_deploy_processing_no_file(self, mock_api_cls, plugin):
+        """processing 无 file 字段返回提示"""
+        plugin._config.add_cert(
+            order_id=303,
+            cert_name='test',
+            domains=['a.com'],
+            site_names=['a.com'],
+            api_url='https://api.example.com',
+            api_token=TOKEN,
+        )
+        mock_api = MagicMock()
+        mock_api.query_order.return_value = {'status': 'processing'}
+        mock_api_cls.return_value = mock_api
+
+        result = plugin.deploy_cert({'order_id': '303'})
+        assert result['status'] is False
+        assert '处理中' in result['msg']
+
+    @patch('sslbt_main.APIClient')
+    def test_deploy_processing_file_place_fails(self, mock_api_cls, plugin):
+        """验证文件放置全部失败时返回错误"""
+        plugin._config.add_cert(
+            order_id=304,
+            cert_name='test',
+            domains=['a.com'],
+            site_names=['a.com'],
+            api_url='https://api.example.com',
+            api_token=TOKEN,
+        )
+        mock_api = MagicMock()
+        mock_api.query_order.return_value = {
+            'status': 'processing',
+            'file': {'path': '.well-known/acme-challenge/token123', 'content': 'verify'},
+        }
+        mock_api_cls.return_value = mock_api
+
+        # get_site 返回 None，导致 place_file 返回空列表
+        plugin._site_mgr.get_site.return_value = None
+        result = plugin.deploy_cert({'order_id': '304'})
+        assert result['status'] is False
+        assert '失败' in result['msg']
+
+
 class TestCheckCert:
     def test_no_cert(self, plugin):
         """不存在的订单"""
@@ -316,6 +386,64 @@ class TestUpdateCertConfig:
             'api_token': 'too-short',
         })
         assert result['status'] is False
+
+
+class TestGetSiteMatches:
+    def test_missing_order_id(self, plugin):
+        result = plugin.get_site_matches({})
+        assert result['status'] is False
+
+    def test_order_not_found(self, plugin):
+        result = plugin.get_site_matches({'order_id': '999'})
+        assert result['status'] is False
+
+    def test_returns_all_sites_with_match_info(self, plugin):
+        plugin._config.add_cert(order_id=700, cert_name='test',
+                                domains=['a.example.com', 'b.example.com'],
+                                api_url='https://api.example.com', api_token=TOKEN,
+                                site_names=['site-a.example.com'])
+        plugin._site_mgr.get_sites.return_value = [
+            {'name': 'site-a.example.com', 'domains': ['a.example.com', 'b.example.com']},
+            {'name': 'site-b.example.com', 'domains': ['c.example.com']},
+        ]
+        result = plugin.get_site_matches({'order_id': '700'})
+        assert result['status'] is True
+        data = result['data']
+        assert len(data) == 2
+        # site-a: 已绑定，全部匹配
+        assert data[0]['site_name'] == 'site-a.example.com'
+        assert data[0]['bound'] is True
+        assert data[0]['match_type'] == 'full'
+        # site-b: 未绑定，无匹配
+        assert data[1]['site_name'] == 'site-b.example.com'
+        assert data[1]['bound'] is False
+        assert data[1]['match_type'] is None
+
+    def test_no_sites(self, plugin):
+        plugin._config.add_cert(order_id=701, cert_name='test', domains=['a.example.com'],
+                                api_url='https://api.example.com', api_token=TOKEN)
+        plugin._site_mgr.get_sites.return_value = []
+        result = plugin.get_site_matches({'order_id': '701'})
+        assert result['status'] is True
+        assert result['data'] == []
+
+    def test_site_name_string_compat(self, plugin):
+        """site_name 为旧格式字符串时也能正确判断 bound"""
+        plugin._config.add_cert(order_id=702, cert_name='test', domains=['a.example.com'],
+                                api_url='https://api.example.com', api_token=TOKEN,
+                                site_names=['s.example.com'])
+        # 模拟旧格式：手动改为字符串
+        certs = plugin._config.get_certs()
+        for c in certs:
+            if c['order_id'] == 702:
+                c['site_name'] = 's.example.com'
+        plugin._config.save_certs(certs)
+        plugin._site_mgr.get_sites.return_value = [
+            {'name': 's.example.com', 'domains': ['a.example.com']},
+        ]
+        result = plugin.get_site_matches({'order_id': '702'})
+        assert result['status'] is True
+        assert result['data'][0]['bound'] is True
 
 
 class TestFetchDeployUrl:

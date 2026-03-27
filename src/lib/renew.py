@@ -43,11 +43,12 @@ def needs_renewal(cert_entry, renew_before_days):
 class RenewEngine:
     """续签引擎"""
 
-    def __init__(self, config_manager, api_factory, deployer, logger=None):
+    def __init__(self, config_manager, api_factory, deployer, logger=None, file_verifier=None):
         self._config = config_manager
         self._api_factory = api_factory
         self._deployer = deployer
         self._logger = logger
+        self._file_verifier = file_verifier
         self._data_dir = config_manager._data_dir
 
     def check_and_renew_all(self, spread=False):
@@ -171,6 +172,7 @@ class RenewEngine:
             self._logger.info("Pull 模式续签: order_id=%s", order_id)
 
         cert_data = api.query_order(order_id)
+        order_id = self._check_order_update(cert_entry, cert_data)
 
         status = cert_data.get('status', '')
         certificate = cert_data.get('certificate', '')
@@ -250,6 +252,37 @@ class RenewEngine:
         except (ValueError, AttributeError):
             pass
 
+    def _check_order_update(self, cert_entry, cert_data):
+        """检查 API 返回的 order_id 是否变化（续费），变化则更新配置和 pending key 路径"""
+        old_id = cert_entry['order_id']
+        new_id = cert_data.get('order_id')
+        if not new_id or int(new_id) == int(old_id):
+            return old_id
+        new_id = int(new_id)
+        if self._logger:
+            self._logger.info("订单续费，ID 更新: %s → %s", old_id, new_id)
+        try:
+            self._config.update_order_id(old_id, new_id)
+        except ValueError as e:
+            if self._logger:
+                self._logger.warn("更新订单 ID 失败: %s", str(e))
+            return old_id
+        # 重命名 pending key 目录
+        old_name = cert_entry.get('cert_name', 'order-%s' % old_id)
+        new_name = 'order-%d' % new_id
+        old_dir = os.path.join(self._data_dir, 'pending-keys', old_name)
+        new_dir = os.path.join(self._data_dir, 'pending-keys', new_name)
+        try:
+            if os.path.isdir(old_dir) and not os.path.exists(new_dir):
+                os.rename(old_dir, new_dir)
+        except OSError as e:
+            if self._logger:
+                self._logger.warn("重命名 pending key 目录失败: %s", str(e))
+        # 更新内存中的 cert_entry
+        cert_entry['order_id'] = new_id
+        cert_entry['cert_name'] = new_name
+        return new_id
+
     def _handle_processing(self, cert_entry, api):
         """处理已提交 CSR 的 processing 状态"""
         order_id = cert_entry['order_id']
@@ -263,9 +296,12 @@ class RenewEngine:
                 if datetime.now(timezone.utc) - sub_dt > timedelta(hours=CSR_PENDING_TIMEOUT_HOURS):
                     if self._logger:
                         self._logger.info("CSR pending 超时，清除状态")
+                    self._cleanup_verify_files(meta)
                     self._config.update_metadata(order_id, {
                         'last_issue_state': '',
                         'csr_submitted_at': '',
+                        'pending_file_verify': '',
+                        'pending_verify_paths': [],
                     })
                     return False
             except (ValueError, AttributeError):
@@ -273,9 +309,12 @@ class RenewEngine:
 
         # 查询订单状态
         cert_data = api.query_order(order_id)
+        order_id = self._check_order_update(cert_entry, cert_data)
         status = cert_data.get('status', '')
 
         if status == 'processing':
+            # 检查是否有新的验证文件需要放置
+            self._try_place_verify_file(cert_entry, cert_data)
             if self._logger:
                 self._logger.info("证书仍在处理中，继续等待")
             return False
@@ -283,13 +322,19 @@ class RenewEngine:
         if status != 'active':
             if self._logger:
                 self._logger.info("证书状态异常: %s，清除状态", status)
+            self._cleanup_verify_files(meta)
             self._config.update_metadata(order_id, {
                 'last_issue_state': '',
                 'csr_submitted_at': '',
+                'pending_file_verify': '',
+                'pending_verify_paths': [],
             })
             return False
 
-        # 证书已签发，读取 pending key 并部署
+        # 证书已签发，清理验证文件
+        self._cleanup_verify_files(meta)
+
+        # 读取 pending key 并部署
         certificate = cert_data.get('certificate', '')
         ca_certificate = cert_data.get('ca_certificate', '')
 
@@ -357,20 +402,36 @@ class RenewEngine:
         })
 
         # 提交 CSR
+        validation_method = cert_entry.get('validation_method', '')
         try:
-            cert_data = api.submit_csr(order_id, csr_pem, domains)
+            cert_data = api.submit_csr(order_id, csr_pem, domains,
+                                       validation_method=validation_method)
         except APIError:
             self._cleanup_pending_key(cert_entry)
             raise
 
+        order_id = self._check_order_update(cert_entry, cert_data)
         status = cert_data.get('status', 'processing')
         now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
 
-        self._config.update_metadata(order_id, {
+        meta_update = {
             'csr_submitted_at': now,
             'last_csr_hash': csr_hash,
             'last_issue_state': status,
-        })
+        }
+
+        # 处理文件验证
+        if status == 'processing':
+            file_info = cert_data.get('file')
+            if file_info and self._file_verifier:
+                site_names = cert_entry.get('site_name', [])
+                if isinstance(site_names, str):
+                    site_names = [site_names] if site_names else []
+                placed = self._file_verifier.place_file(file_info, site_names)
+                meta_update['pending_file_verify'] = file_info
+                meta_update['pending_verify_paths'] = placed
+
+        self._config.update_metadata(order_id, meta_update)
 
         if status == 'active':
             # 立即签发，部署
@@ -396,6 +457,37 @@ class RenewEngine:
         if self._logger:
             self._logger.info("CSR 已提交，等待签发: status=%s", status)
         return False
+
+    def _cleanup_verify_files(self, meta):
+        """清理 metadata 中记录的验证文件"""
+        if not self._file_verifier:
+            return
+        paths = meta.get('pending_verify_paths', [])
+        if paths:
+            self._file_verifier.cleanup_files(paths)
+
+    def _try_place_verify_file(self, cert_entry, cert_data):
+        """检查 API 返回是否有新的验证文件需要放置"""
+        if not self._file_verifier:
+            return
+        file_info = cert_data.get('file')
+        if not file_info:
+            return
+        meta = cert_entry.get('metadata', {})
+        old_file = meta.get('pending_file_verify', '')
+        # 验证文件未变化则跳过
+        if old_file and old_file == file_info:
+            return
+        # 清理旧文件，放置新文件
+        self._cleanup_verify_files(meta)
+        site_names = cert_entry.get('site_name', [])
+        if isinstance(site_names, str):
+            site_names = [site_names] if site_names else []
+        placed = self._file_verifier.place_file(file_info, site_names)
+        self._config.update_metadata(cert_entry['order_id'], {
+            'pending_file_verify': file_info,
+            'pending_verify_paths': placed,
+        })
 
     def _pending_key_path(self, cert_entry):
         cert_name = cert_entry.get('cert_name', 'order-%s' % cert_entry.get('order_id'))

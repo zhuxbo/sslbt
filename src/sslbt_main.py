@@ -13,6 +13,14 @@ DATA_DIR = os.path.join(PLUGIN_DIR, 'data')
 # 添加 lib 到路径
 sys.path.insert(0, PLUGIN_DIR)
 
+# 热更新：宝塔面板每次请求调用 reload(sslbt_main)，但不会递归 reload 子模块，
+# 导致升级后 lib/ 下的模块仍是旧版本。检测到 reload 时清除缓存，重新 import 即可。
+# 判断方式：首次 import 时 sslbt_main 类尚未定义，reload 时已存在。
+# 副作用：reload 会重置类变量（如 _pending_tokens），升级瞬间进行中的操作需重试。
+if hasattr(sys.modules.get('sslbt_main'), 'sslbt_main'):
+    for _mod in [k for k in sys.modules if k == 'lib' or k.startswith('lib.')]:
+        del sys.modules[_mod]
+
 from lib.config import ConfigManager  # noqa: E402
 from lib.logger import Logger  # noqa: E402
 from lib.api_client import APIClient, APIError  # noqa: E402
@@ -20,6 +28,7 @@ from lib.cert_utils import build_fullchain, parse_cert_info  # noqa: E402
 from lib.site_manager import SiteManager  # noqa: E402
 from lib.deployer import Deployer, DeployError  # noqa: E402
 from lib.renew import RenewEngine  # noqa: E402
+from lib.file_verifier import FileVerifier  # noqa: E402
 from lib.cron import CronManager  # noqa: E402
 from lib.updater import Updater  # noqa: E402
 
@@ -156,6 +165,7 @@ class sslbt_main:
             site_names_str = _get_param(args, 'site_names', '')
             site_names = [s.strip() for s in site_names_str.split(',') if s.strip()] if site_names_str else []
             renew_mode = _get_param(args, 'renew_mode', '')
+            validation_method = _get_param(args, 'validation_method', '')
 
             if not order_id:
                 return _err('请提供订单 ID')
@@ -180,6 +190,7 @@ class sslbt_main:
                 renew_mode=renew_mode,
                 api_url=api_url,
                 api_token=api_token,
+                validation_method=validation_method,
             )
 
             self._logger.info("添加证书: order_id=%s, domains=%s", order_id, ','.join(domains))
@@ -307,7 +318,34 @@ class sslbt_main:
 
             # 查询证书
             cert_data = api.query_order(order_id)
+
+            # 检查订单 ID 是否变化（续费场景）
+            new_id = cert_data.get('order_id')
+            if new_id and int(new_id) != order_id:
+                self._logger.info("订单续费，ID 更新: %s → %s", order_id, new_id)
+                try:
+                    self._config.update_order_id(order_id, int(new_id))
+                    order_id = int(new_id)
+                except ValueError as e:
+                    self._logger.warn("更新订单 ID 失败: %s", str(e))
+
             status = cert_data.get('status', '')
+
+            if status == 'processing':
+                file_info = cert_data.get('file')
+                if file_info:
+                    verifier = FileVerifier(self._site_mgr, self._logger)
+                    placed = verifier.place_file(file_info, site_name)
+                    if placed:
+                        self._config.update_metadata(order_id, {
+                            'pending_file_verify': file_info,
+                            'pending_verify_paths': placed,
+                            'last_issue_state': 'processing',
+                        })
+                        return _ok(msg='验证文件已放置，等待 CA 验证后签发')
+                    return _err('验证文件放置失败')
+                return _err('证书处理中，请稍后再试')
+
             if status != 'active':
                 return _err('证书状态为 %s，无法部署' % status)
 
@@ -379,21 +417,39 @@ class sslbt_main:
             return _err('批量部署失败: %s' % str(e))
 
     def check_cert(self, args=None):
-        """检查证书状态"""
+        """检查证书状态，续费后自动更新订单 ID 和域名"""
         try:
             order_id = _get_param(args, 'order_id', '')
             if not order_id:
                 return _err('请提供订单 ID')
 
-            cert_entry = self._config.get_cert(int(order_id))
+            order_id = int(order_id)
+            cert_entry = self._config.get_cert(order_id)
             if not cert_entry:
                 return _err('订单 %s 不存在' % order_id)
             api = self._get_api_for_cert(cert_entry)
             if not api:
                 return _err('该证书未配置 API 连接')
 
-            cert_data = api.query_order(int(order_id))
-            return _ok(cert_data)
+            cert_data = api.query_order(order_id)
+            result = dict(cert_data)
+
+            # 检查订单 ID 是否变化（续费场景）
+            new_id = cert_data.get('order_id')
+            if new_id and int(new_id) != order_id:
+                self._logger.info("检查发现订单续费，ID 更新: %s → %s", order_id, new_id)
+                try:
+                    self._config.update_order_id(order_id, int(new_id))
+                    order_id = int(new_id)
+                    result['_order_updated'] = True
+                    # 更新域名
+                    domains = self._parse_cert_domains(cert_data)
+                    if domains:
+                        self._config.update_cert(order_id, {'domains': domains})
+                except ValueError as e:
+                    self._logger.warn("更新订单 ID 失败: %s", str(e))
+
+            return _ok(result)
         except APIError as e:
             return _err('API 错误: %s' % str(e))
         except Exception as e:
@@ -535,6 +591,35 @@ class sslbt_main:
         except Exception as e:
             return _err('获取证书详情失败: %s' % str(e))
 
+    def get_site_matches(self, args=None):
+        """获取所有站点与指定证书的匹配度"""
+        try:
+            order_id = _get_param(args, 'order_id', '')
+            if not order_id:
+                return _err('请提供订单 ID')
+            cert_entry = self._config.get_cert(int(order_id))
+            if not cert_entry:
+                return _err('订单不存在')
+            cert_domains = cert_entry.get('domains', [])
+            bound = cert_entry.get('site_name', [])
+            if isinstance(bound, str):
+                bound = [bound] if bound else []
+            bound_set = set(bound)
+            sites = self._site_mgr.get_sites()
+            result = []
+            for s in sites:
+                name = s['name']
+                match = SiteManager.match_domains(cert_domains, s.get('domains', []))
+                result.append({
+                    'site_name': name,
+                    'bound': name in bound_set,
+                    'match_type': match['type'] if match else None,
+                    'unmatched': match['unmatched'] if match else [],
+                })
+            return _ok(result)
+        except Exception as e:
+            return _err('获取站点匹配失败: %s' % str(e))
+
     def batch_set_renew_mode(self, args=None):
         """批量设置所有证书的续签模式"""
         try:
@@ -556,7 +641,8 @@ class sslbt_main:
         """手动执行续签检查"""
         try:
             deployer = self._get_deployer()
-            engine = RenewEngine(self._config, self._get_api_for_cert, deployer, self._logger)
+            file_verifier = FileVerifier(self._site_mgr, self._logger)
+            engine = RenewEngine(self._config, self._get_api_for_cert, deployer, self._logger, file_verifier)
             results = engine.check_and_renew_all()
             return _ok(results, msg='续签检查完成')
         except Exception as e:
@@ -567,7 +653,8 @@ class sslbt_main:
         """计划任务调用的续签检查（分散执行）"""
         try:
             deployer = self._get_deployer()
-            engine = RenewEngine(self._config, self._get_api_for_cert, deployer, self._logger)
+            file_verifier = FileVerifier(self._site_mgr, self._logger)
+            engine = RenewEngine(self._config, self._get_api_for_cert, deployer, self._logger, file_verifier)
             results = engine.check_and_renew_all(spread=True)
             return _ok(results, msg='续签检查完成')
         except Exception as e:
@@ -652,14 +739,7 @@ class sslbt_main:
                 download_path=download_path,
                 checksum=checksum,
             )
-            return _ok(msg='更新完成，请刷新页面')
+            return _ok(msg='更新完成')
         except Exception as e:
             self._logger.error("更新失败: %s", str(e))
             return _err('更新失败: %s' % str(e))
-
-    def restart_panel(self, args=None):
-        """重启宝塔面板"""
-        self._logger.info("用户触发面板重启")
-        import subprocess
-        subprocess.Popen(['bt', 'restart'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return _ok(msg='正在重启')

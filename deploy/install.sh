@@ -44,6 +44,15 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# 检测 Python3 路径（宝塔自带 Python 可能不在系统 PATH 中）
+PYTHON3=""
+for _py in python3 /www/server/panel/pyenv/bin/python3 python; do
+    if command -v "$_py" &>/dev/null && "$_py" -c "import json" &>/dev/null; then
+        PYTHON3="$_py"
+        break
+    fi
+done
+
 RELEASE_PATH="/sslbt"
 FALLBACK_HOST="release.cnssl.com"
 if [ -n "$RELEASE_HOST" ]; then
@@ -97,8 +106,8 @@ VERSION=$(get_target_version)
 
 # 检测已安装版本
 CURRENT_VERSION=""
-if [ -f "$PLUGIN_DIR/info.json" ]; then
-    CURRENT_VERSION=$(python3 -c "
+if [ -f "$PLUGIN_DIR/info.json" ] && [ -n "$PYTHON3" ]; then
+    CURRENT_VERSION=$($PYTHON3 -c "
 import json
 try:
     v = json.load(open('$PLUGIN_DIR/info.json'))['versions']
@@ -128,8 +137,8 @@ fi
 
 # SHA256 校验（从缓存的 RELEASES_JSON 中提取，避免重复下载）
 EXPECTED_HASH=""
-if [ -n "$RELEASES_JSON" ] && command -v python3 >/dev/null 2>&1; then
-    EXPECTED_HASH=$(echo "$RELEASES_JSON" | python3 -c "
+if [ -n "$RELEASES_JSON" ] && [ -n "$PYTHON3" ]; then
+    EXPECTED_HASH=$(echo "$RELEASES_JSON" | $PYTHON3 -c "
 import sys, json
 try:
     d = json.load(sys.stdin)
@@ -176,7 +185,7 @@ if [ "$FORCE" = true ] && [ -d "$PLUGIN_DIR" ]; then
     fi
 else
     mkdir -p "$PLUGIN_DIR"
-    unzip -o "$TMP_FILE" -d "$PLUGIN_DIR" -x "data/*" >/dev/null
+    unzip -o "$TMP_FILE" -d "$PLUGIN_DIR" -x "data/*" >/dev/null 2>&1
 fi
 
 rm -f "$TMP_FILE"
@@ -211,8 +220,8 @@ DATA_DIR="$PLUGIN_DIR/data"
 mkdir -p "$DATA_DIR"
 CONFIG_FILE="$DATA_DIR/config.json"
 
-if [ -f "$CONFIG_FILE" ]; then
-    python3 -c "
+if [ -f "$CONFIG_FILE" ] && [ -n "$PYTHON3" ]; then
+    $PYTHON3 -c "
 import json, os, tempfile
 path = '$CONFIG_FILE'
 url = '$RELEASE_URL'
@@ -229,6 +238,15 @@ with os.fdopen(fd, 'w', encoding='utf-8') as f:
 os.replace(tmp, path)
 os.chmod(path, 0o600)
 " 2>/dev/null || echo_warn "写入 release_url 失败"
+elif [ -f "$CONFIG_FILE" ]; then
+    # Python 不可用时用 sed 更新已有配置
+    if grep -q '"release_url"' "$CONFIG_FILE"; then
+        sed -i 's|"release_url" *: *"[^"]*"|"release_url": "'"$RELEASE_URL"'"|' "$CONFIG_FILE"
+    else
+        # 在最后的 } 前插入 release_url
+        sed -i 's|}$|,\n  "release_url": "'"$RELEASE_URL"'"\n}|' "$CONFIG_FILE"
+    fi
+    chmod 600 "$CONFIG_FILE"
 else
     printf '{\n  "release_url": "%s"\n}\n' "$RELEASE_URL" > "$CONFIG_FILE"
     chmod 600 "$CONFIG_FILE"
@@ -239,12 +257,4 @@ echo_info "安装完成！$VERSION"
 echo ""
 echo "插件位置: $PLUGIN_DIR"
 echo "打开宝塔面板 → 软件商店 → 第三方应用 → sslbt 证书管理"
-echo ""
-read -p "$(echo -e "${GREEN}[INFO]${NC} 需要重启面板以加载新代码，是否立即重启？[Y/n] ")" confirm < /dev/tty
-confirm=${confirm:-Y}
-if [[ "$confirm" =~ ^[Yy]$ ]]; then
-    echo_info "正在重启面板..."
-    bt restart
-else
-    echo_warn "请稍后手动执行: bt restart"
-fi
+echo "刷新面板页面即可使用，无需重启面板。"
