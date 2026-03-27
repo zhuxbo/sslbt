@@ -172,6 +172,7 @@ class RenewEngine:
             self._logger.info("Pull 模式续签: order_id=%s", order_id)
 
         cert_data = api.query_order(order_id)
+        order_id = self._check_order_update(cert_entry, cert_data)
 
         status = cert_data.get('status', '')
         certificate = cert_data.get('certificate', '')
@@ -251,6 +252,37 @@ class RenewEngine:
         except (ValueError, AttributeError):
             pass
 
+    def _check_order_update(self, cert_entry, cert_data):
+        """检查 API 返回的 order_id 是否变化（续费），变化则更新配置和 pending key 路径"""
+        old_id = cert_entry['order_id']
+        new_id = cert_data.get('order_id')
+        if not new_id or int(new_id) == int(old_id):
+            return old_id
+        new_id = int(new_id)
+        if self._logger:
+            self._logger.info("订单续费，ID 更新: %s → %s", old_id, new_id)
+        try:
+            self._config.update_order_id(old_id, new_id)
+        except ValueError as e:
+            if self._logger:
+                self._logger.warn("更新订单 ID 失败: %s", str(e))
+            return old_id
+        # 重命名 pending key 目录
+        old_name = cert_entry.get('cert_name', 'order-%s' % old_id)
+        new_name = 'order-%d' % new_id
+        old_dir = os.path.join(self._data_dir, 'pending-keys', old_name)
+        new_dir = os.path.join(self._data_dir, 'pending-keys', new_name)
+        try:
+            if os.path.isdir(old_dir) and not os.path.exists(new_dir):
+                os.rename(old_dir, new_dir)
+        except OSError as e:
+            if self._logger:
+                self._logger.warn("重命名 pending key 目录失败: %s", str(e))
+        # 更新内存中的 cert_entry
+        cert_entry['order_id'] = new_id
+        cert_entry['cert_name'] = new_name
+        return new_id
+
     def _handle_processing(self, cert_entry, api):
         """处理已提交 CSR 的 processing 状态"""
         order_id = cert_entry['order_id']
@@ -277,6 +309,7 @@ class RenewEngine:
 
         # 查询订单状态
         cert_data = api.query_order(order_id)
+        order_id = self._check_order_update(cert_entry, cert_data)
         status = cert_data.get('status', '')
 
         if status == 'processing':
@@ -377,6 +410,7 @@ class RenewEngine:
             self._cleanup_pending_key(cert_entry)
             raise
 
+        order_id = self._check_order_update(cert_entry, cert_data)
         status = cert_data.get('status', 'processing')
         now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
 

@@ -318,6 +318,17 @@ class sslbt_main:
 
             # 查询证书
             cert_data = api.query_order(order_id)
+
+            # 检查订单 ID 是否变化（续费场景）
+            new_id = cert_data.get('order_id')
+            if new_id and int(new_id) != order_id:
+                self._logger.info("订单续费，ID 更新: %s → %s", order_id, new_id)
+                try:
+                    self._config.update_order_id(order_id, int(new_id))
+                    order_id = int(new_id)
+                except ValueError as e:
+                    self._logger.warn("更新订单 ID 失败: %s", str(e))
+
             status = cert_data.get('status', '')
 
             if status == 'processing':
@@ -406,21 +417,39 @@ class sslbt_main:
             return _err('批量部署失败: %s' % str(e))
 
     def check_cert(self, args=None):
-        """检查证书状态"""
+        """检查证书状态，续费后自动更新订单 ID 和域名"""
         try:
             order_id = _get_param(args, 'order_id', '')
             if not order_id:
                 return _err('请提供订单 ID')
 
-            cert_entry = self._config.get_cert(int(order_id))
+            order_id = int(order_id)
+            cert_entry = self._config.get_cert(order_id)
             if not cert_entry:
                 return _err('订单 %s 不存在' % order_id)
             api = self._get_api_for_cert(cert_entry)
             if not api:
                 return _err('该证书未配置 API 连接')
 
-            cert_data = api.query_order(int(order_id))
-            return _ok(cert_data)
+            cert_data = api.query_order(order_id)
+            result = dict(cert_data)
+
+            # 检查订单 ID 是否变化（续费场景）
+            new_id = cert_data.get('order_id')
+            if new_id and int(new_id) != order_id:
+                self._logger.info("检查发现订单续费，ID 更新: %s → %s", order_id, new_id)
+                try:
+                    self._config.update_order_id(order_id, int(new_id))
+                    order_id = int(new_id)
+                    result['_order_updated'] = True
+                    # 更新域名
+                    domains = self._parse_cert_domains(cert_data)
+                    if domains:
+                        self._config.update_cert(order_id, {'domains': domains})
+                except ValueError as e:
+                    self._logger.warn("更新订单 ID 失败: %s", str(e))
+
+            return _ok(result)
         except APIError as e:
             return _err('API 错误: %s' % str(e))
         except Exception as e:

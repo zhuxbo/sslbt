@@ -92,12 +92,12 @@ Bearer Token 认证，部署链接格式：`https://domain/api/deploy?token=xxx&
   fetch_deploy_url → 提取 token/order → GET ?order=xxx → 解析 domains（DNS+IP SAN） → 匹配站点 → add_cert
 
 部署证书
-  query_order → active: 取 cert/key/ca → 校验匹配 → panelSite.SetSSL() → callback
+  query_order → 检查 order_id 变更 → active: 取 cert/key/ca → 校验匹配 → panelSite.SetSSL() → callback
              → processing + file: FileVerifier.place_file() → 等待 CA 验证
 
 自动续签（定时任务）
-  Pull: query_order → active 则部署
-  Local: generate_csr → submit_csr(validation_method) → processing + file → 放置验证文件 → 等待 → active → 部署 + 清理验证文件
+  Pull: query_order → 检查 order_id 变更 → active 则部署
+  Local: generate_csr → submit_csr(validation_method) → 检查 order_id 变更 → processing + file → 放置验证文件 → 等待 → active → 部署 + 清理验证文件
 ```
 
 ## 文件验证流程
@@ -122,6 +122,7 @@ Bearer Token 认证，部署链接格式：`https://domain/api/deploy?token=xxx&
 - 已过期证书（days_remaining < 0）不再触发续签
 - deploy_multi 全部站点失败时不更新 metadata（保留重试状态）
 - 单次续签上限 MAX_RENEW_BATCH=100，超出按配置文件顺序截断，剩余下次 cron 处理；紧急证书由用户手动触发
+- 续费订单 ID 更新：API 返回的 `order_id` 与本地不同时，`_check_order_update` 原子更新 config（order_id + cert_name）+ 重命名 pending key 目录 + 更新内存 cert_entry，后续操作使用新 ID；冲突（新 ID 已存在）时 warn 并沿用旧 ID
 
 ## 已知局限（无需处理，仅记录）
 
@@ -140,7 +141,7 @@ Bearer Token 认证，部署链接格式：`https://domain/api/deploy?token=xxx&
 - `validation_method`：证书级验证方式（`delegation` 或 `file`），空值默认服务端决定
 - 站点唯一绑定：一个站点只能绑定一个证书，add_cert / update_cert / update_cert_config 均校验
 - ConfigManager 支持可选 `logger` 参数，JSON 损坏时记录 error 并创建 .bak 备份
-- `add_cert` / `update_cert` / `remove_cert` 使用 `_update_json` 原子读-改-写（独立锁文件防止竞态）
+- `add_cert` / `update_cert` / `remove_cert` / `update_order_id` 使用 `_update_json` 原子读-改-写（独立锁文件防止竞态）
 
 ## 前端约定
 

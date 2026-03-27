@@ -422,6 +422,135 @@ class TestRenewEngine:
         assert any('截断' in s or '上限' in s for s in warn_calls)
 
 
+class TestOrderUpdate:
+    """续费 order_id 更新测试"""
+
+    @pytest.fixture
+    def engine(self, tmp_data_dir):
+        config = ConfigManager(tmp_data_dir)
+        mock_api = MagicMock()
+        api_factory = MagicMock(return_value=mock_api)
+        deployer = MagicMock()
+        deployer.deploy_multi.return_value = [{'site_name': 'example.com', 'status': True, 'message': '部署成功'}]
+        logger = MagicMock()
+        eng = RenewEngine(config, api_factory, deployer, logger)
+        eng._mock_api = mock_api
+        return eng
+
+    def test_pull_renew_updates_order_id(self, engine, tmp_data_dir):
+        """Pull 模式：API 返回新 order_id 时更新配置并用新 ID 部署"""
+        engine._mock_api.query_order.return_value = {
+            'order_id': 99999,
+            'status': 'active',
+            'certificate': '---CERT---',
+            'ca_certificate': '---CA---',
+            'private_key': '---KEY---',
+        }
+        cert = _make_cert_entry(10, order_id=12345)
+        engine._config.add_cert(
+            order_id=12345, cert_name='order-12345',
+            domains=cert['domains'], site_names=cert['site_name'],
+        )
+        result = engine._renew_pull(cert, engine._mock_api)
+        assert result is True
+        assert engine._config.get_cert(12345) is None
+        assert engine._config.get_cert(99999) is not None
+        assert engine._config.get_cert(99999)['cert_name'] == 'order-99999'
+        # deploy_multi 使用了新 order_id
+        assert engine._deployer.deploy_multi.call_args[1]['order_id'] == 99999
+
+    def test_no_order_id_in_response(self, engine, tmp_data_dir):
+        """API 响应无 order_id 字段时不更新"""
+        engine._mock_api.query_order.return_value = {
+            'status': 'active',
+            'certificate': '---CERT---',
+            'ca_certificate': '---CA---',
+            'private_key': '---KEY---',
+        }
+        cert = _make_cert_entry(10, order_id=12345)
+        engine._config.add_cert(
+            order_id=12345, cert_name='order-12345',
+            domains=cert['domains'], site_names=cert['site_name'],
+        )
+        result = engine._renew_pull(cert, engine._mock_api)
+        assert result is True
+        assert engine._config.get_cert(12345) is not None
+
+    def test_handle_processing_updates_order_id(self, engine, tmp_data_dir):
+        """Local 模式 processing→active：更新 order_id 并重命名 pending key"""
+        cert = _make_cert_entry(10, renew_mode='local', issue_state='processing', order_id=12345)
+        now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        cert['metadata']['csr_submitted_at'] = now
+        cert['cert_name'] = 'order-12345'
+        engine._config.add_cert(
+            order_id=12345, cert_name='order-12345',
+            domains=cert['domains'], site_names=cert['site_name'],
+        )
+        # 写入 pending key
+        key_dir = os.path.join(tmp_data_dir, 'pending-keys', 'order-12345')
+        os.makedirs(key_dir, exist_ok=True)
+        with open(os.path.join(key_dir, 'pending-key.pem'), 'w') as f:
+            f.write('KEY-PEM')
+
+        engine._mock_api.query_order.return_value = {
+            'order_id': 99999,
+            'status': 'active',
+            'certificate': '---CERT---',
+            'ca_certificate': '---CA---',
+        }
+        result = engine._handle_processing(cert, engine._mock_api)
+        assert result is True
+        assert engine._config.get_cert(12345) is None
+        assert engine._config.get_cert(99999) is not None
+        # 旧 pending key 目录已不存在
+        assert not os.path.isdir(key_dir)
+        # deploy_multi 使用了新 order_id
+        assert engine._deployer.deploy_multi.call_args[1]['order_id'] == 99999
+
+    @patch('lib.renew.cert_utils.generate_csr')
+    def test_submit_csr_updates_order_id(self, mock_csr, engine, tmp_data_dir):
+        """Local 模式 submit_csr：API 返回新 order_id 时更新配置"""
+        mock_csr.return_value = ('CSR-PEM', 'KEY-PEM', 'hash123')
+        engine._mock_api.submit_csr.return_value = {
+            'order_id': 99999,
+            'status': 'processing',
+        }
+        cert = _make_cert_entry(10, renew_mode='local', order_id=12345)
+        cert['cert_name'] = 'order-12345'
+        engine._config.add_cert(
+            order_id=12345, cert_name='order-12345',
+            domains=cert['domains'], site_names=cert['site_name'],
+        )
+        result = engine._submit_new_csr(cert, engine._mock_api)
+        assert result is False
+        assert engine._config.get_cert(12345) is None
+        new_cert = engine._config.get_cert(99999)
+        assert new_cert is not None
+        assert new_cert['cert_name'] == 'order-99999'
+
+    def test_order_update_conflict_uses_old_id(self, engine, tmp_data_dir):
+        """新 order_id 已存在时继续使用旧 ID"""
+        engine._mock_api.query_order.return_value = {
+            'order_id': 22222,
+            'status': 'active',
+            'certificate': '---CERT---',
+            'ca_certificate': '---CA---',
+            'private_key': '---KEY---',
+        }
+        cert = _make_cert_entry(10, order_id=11111)
+        engine._config.add_cert(order_id=11111, cert_name='order-11111',
+                                domains=['a.com'], site_names=['a.com'])
+        engine._config.add_cert(order_id=22222, cert_name='order-22222',
+                                domains=['b.com'], site_names=['b.com'])
+        result = engine._renew_pull(cert, engine._mock_api)
+        assert result is True
+        # 旧 ID 仍然存在
+        assert engine._config.get_cert(11111) is not None
+        # deploy_multi 使用了旧 order_id
+        assert engine._deployer.deploy_multi.call_args[1]['order_id'] == 11111
+        engine._logger.warn.assert_called()
+
+
 class TestCalcSpreadDelay:
     """动态分散延迟计算"""
 

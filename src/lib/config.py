@@ -263,6 +263,26 @@ class ConfigManager:
                 return c
         return None
 
+    def update_order_id(self, old_order_id, new_order_id):
+        """更新证书的订单 ID（续费场景，原子操作）"""
+        old_order_id = int(old_order_id)
+        new_order_id = int(new_order_id)
+
+        def updater(data):
+            certs = self._normalize_certs(data.get('certificates', []))
+            for c in certs:
+                if c.get('order_id') == new_order_id:
+                    raise ValueError("订单 %d 已存在" % new_order_id)
+            for c in certs:
+                if c.get('order_id') == old_order_id:
+                    c['order_id'] = new_order_id
+                    c['cert_name'] = 'order-%d' % new_order_id
+                    data['certificates'] = certs
+                    return data
+            raise ValueError("订单 %d 不存在" % old_order_id)
+
+        self._update_json(self._certs_path, updater, {'certificates': []})
+
     def remove_cert(self, order_id):
         """删除证书条目（原子操作）"""
         order_id = int(order_id)

@@ -913,17 +913,23 @@
         var statusMap = { active: '正常', pending: '待签发', expired: '已过期', revoked: '已吊销', processing: '处理中' };
         var statusText = statusMap[d.status] || d.status || '-';
         var domains = d.domains || d.common_name || d.domain || '-';
+        var updated = d._order_updated;
+        var h = '<div style="padding:20px 30px;font-size:13px;line-height:2">';
+        if (updated) {
+          h += '<p style="color:#e6a23c;font-weight:bold">订单已续费，ID 已自动更新</p>';
+        }
+        h += '<p><b>订单 ID：</b>' + P._e(String(d.order_id || oid)) + '</p>';
+        h += '<p><b>状态：</b>' + P._e(statusText) + '</p>';
+        h += '<p><b>域名：</b>' + P._e(domains) + '</p>';
+        h += '<p><b>过期时间：</b>' + P._e(d.expires_at || '-') + '</p>';
+        h += '</div>';
         layer.open({
           type: 1,
           title: '证书状态',
-          area: ['420px', '240px'],
+          area: ['420px', updated ? '290px' : '270px'],
           offset: 'auto',
-          content:
-            '<div style="padding:20px 30px;font-size:13px;line-height:2">' +
-            '<p><b>状态：</b>' + P._e(statusText) + '</p>' +
-            '<p><b>域名：</b>' + P._e(domains) + '</p>' +
-            '<p><b>过期时间：</b>' + P._e(d.expires_at || '-') + '</p>' +
-            '</div>',
+          content: h,
+          end: function () { if (updated) { P._certCache = {}; P.loadCerts(); } },
         });
       });
     },
@@ -1172,7 +1178,7 @@
       }, function (r) {
         if (r.status) {
           sp.innerHTML = '<span style="color:#67c23a">更新成功！</span>';
-          layer.alert('插件更新成功，请刷新页面以加载新版本。', {
+          layer.alert('插件更新成功。刷新页面即可加载新版本，若遇到异常请重启面板（bt restart）。', {
             title: '更新完成',
             icon: 1,
             offset: 'auto',
