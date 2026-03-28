@@ -136,6 +136,10 @@ class sslbt_main:
             if update_channel in ('main', 'dev'):
                 cfg['update_channel'] = update_channel
 
+            release_url = _get_param(args, 'release_url', None)
+            if release_url is not None:
+                cfg['release_url'] = release_url.strip().rstrip('/')
+
             self._config.save_config(cfg)
             self._logger.info("配置已更新")
             return _ok(msg='配置保存成功')

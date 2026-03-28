@@ -28,7 +28,7 @@ while [[ $# -gt 0 ]]; do
             echo "用法: curl -fsSL <url>/install.sh | bash -s -- [host] [选项]"
             echo ""
             echo "参数:"
-            echo "  [host]         发布服务器（域名或域名+路径）"
+            echo "  [host]         发布服务器域名（默认 release.cnssl.com）"
             echo ""
             echo "选项:"
             echo "  --dev          安装测试版"
@@ -54,15 +54,8 @@ for _py in python3 /www/server/panel/pyenv/bin/python3 python; do
 done
 
 RELEASE_PATH="/sslbt"
-FALLBACK_HOST="release.cnssl.com"
-if [ -n "$RELEASE_HOST" ]; then
-    RELEASE_URL="https://${RELEASE_HOST%/}${RELEASE_PATH}"
-elif [ -n "${SSLBT_RELEASE_URL:-}" ]; then
-    RELEASE_URL="${SSLBT_RELEASE_URL%/}"
-else
-    RELEASE_URL="https://${FALLBACK_HOST}${RELEASE_PATH}"
-    echo_warn "未指定服务器，使用默认: $RELEASE_URL"
-fi
+RELEASE_HOST="${RELEASE_HOST:-release.cnssl.com}"
+RELEASE_URL="https://${RELEASE_HOST%/}${RELEASE_PATH}"
 
 [ "$EUID" -ne 0 ] && { echo_error "请使用 root 权限运行"; exit 1; }
 
@@ -70,6 +63,7 @@ PANEL_DIR="/www/server/panel"
 PLUGIN_DIR="$PANEL_DIR/plugin/sslbt"
 [ ! -d "$PANEL_DIR" ] && { echo_error "未检测到宝塔面板: $PANEL_DIR"; exit 1; }
 echo_info "宝塔面板: $PANEL_DIR"
+echo_info "发布服务器: $RELEASE_HOST"
 
 normalize_version() {
     local ver="$1"
@@ -257,4 +251,3 @@ echo_info "安装完成！$VERSION"
 echo ""
 echo "插件位置: $PLUGIN_DIR"
 echo "打开宝塔面板 → 软件商店 → 第三方应用 → sslbt 证书管理"
-echo "刷新面板页面即可使用，无需重启面板。"
