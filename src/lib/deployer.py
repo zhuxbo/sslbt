@@ -87,11 +87,13 @@ class Deployer:
                     meta['cert_serial'] = cert_info['serial']
             meta['last_issue_state'] = ''
             meta['issue_retry_count'] = 0
+            meta['csr_submitted_at'] = ''
+            meta['last_csr_hash'] = ''
             try:
                 self._config.update_metadata(order_id, meta)
             except Exception as e:
                 if self._logger:
-                    self._logger.warn("更新证书配置失败: %s", str(e))
+                    self._logger.warning("更新证书配置失败: %s", str(e))
 
         # 发送部署回调
         cb_api = api_client or self._api
@@ -140,7 +142,7 @@ class Deployer:
             except Exception as e:
                 results.append({'site_name': site_name, 'status': False, 'message': str(e)})
                 if self._logger:
-                    self._logger.warn("站点部署失败: site=%s, error=%s", site_name, str(e))
+                    self._logger.warning("站点部署失败: site=%s, error=%s", site_name, str(e))
 
         success_count = sum(1 for r in results if r.get('status'))
         now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
@@ -158,11 +160,13 @@ class Deployer:
                     meta['cert_serial'] = cert_info['serial']
             meta['last_issue_state'] = ''
             meta['issue_retry_count'] = 0
+            meta['csr_submitted_at'] = ''
+            meta['last_csr_hash'] = ''
             try:
                 self._config.update_metadata(order_id, meta)
             except Exception as e:
                 if self._logger:
-                    self._logger.warn("更新证书配置失败: %s", str(e))
+                    self._logger.warning("更新证书配置失败: %s", str(e))
 
         # 发送部署回调（任一站点失败即 failure）
         cb_api = api_client or self._api
@@ -206,4 +210,4 @@ class Deployer:
             )
         except Exception as e:
             if self._logger:
-                self._logger.warn("部署回调失败（非关键）: %s", str(e))
+                self._logger.warning("部署回调失败（非关键）: %s", str(e))

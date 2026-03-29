@@ -121,20 +121,16 @@ class sslbt_main:
         """保存插件配置"""
         try:
             cfg = self._config.get_config()
-            interval = _get_param(args, 'check_interval_hours', '')
-            renew_days = _get_param(args, 'renew_before_days', '')
             renew_mode = _get_param(args, 'renew_mode', '')
 
-            if interval:
-                cfg['check_interval_hours'] = max(1, int(interval))
-            if renew_days:
-                cfg['renew_before_days'] = min(13, max(1, int(renew_days)))
             if renew_mode in ('pull', 'local'):
-                cfg['renew_mode'] = renew_mode
+                if 'schedule' not in cfg:
+                    cfg['schedule'] = {}
+                cfg['schedule']['renew_mode'] = renew_mode
 
-            update_channel = _get_param(args, 'update_channel', '')
-            if update_channel in ('main', 'dev'):
-                cfg['update_channel'] = update_channel
+            upgrade_channel = _get_param(args, 'upgrade_channel', '')
+            if upgrade_channel in ('main', 'dev'):
+                cfg['upgrade_channel'] = upgrade_channel
 
             release_url = _get_param(args, 'release_url', None)
             if release_url is not None:
@@ -154,10 +150,11 @@ class sslbt_main:
         try:
             certs = self._config.get_certs()
             for c in certs:
-                token = c.get('api_token', '')
+                api = c.get('api', {})
+                token = api.get('token', '')
                 if token:
-                    c['api_token_masked'] = token[:6] + '***' + token[-4:] if len(token) > 10 else '***'
-                    c['api_token'] = ''
+                    api['token_masked'] = token[:6] + '***' + token[-4:] if len(token) > 10 else '***'
+                    api['token'] = ''
             return _ok(certs)
         except Exception as e:
             return _err('获取证书列表失败: %s' % str(e))
@@ -192,12 +189,18 @@ class sslbt_main:
                 domains=domains,
                 site_names=site_names,
                 renew_mode=renew_mode,
-                api_url=api_url,
-                api_token=api_token,
+                api={'url': api_url, 'token': api_token},
                 validation_method=validation_method,
             )
 
             self._logger.info("添加证书: order_id=%s, domains=%s", order_id, ','.join(domains))
+
+            # 根据续签模式设置 auto_reissue
+            effective_mode = renew_mode or self._config.get_config().get('schedule', {}).get('renew_mode', 'pull')
+            try:
+                api.toggle_auto_reissue(order_id, effective_mode == 'pull')
+            except Exception as e:
+                self._logger.warning("toggle_auto_reissue 失败: order_id=%s, error=%s", order_id, str(e))
 
             # 自动创建计划任务（如果尚未设置）
             try:
@@ -205,7 +208,7 @@ class sslbt_main:
                 if not cron_mgr.get_status().get('exists'):
                     cron_mgr.setup()
             except Exception as e:
-                self._logger.warn("自动创建计划任务失败: %s", str(e))
+                self._logger.warning("自动创建计划任务失败: %s", str(e))
 
             return _ok(entry, msg='证书添加成功')
         except ValueError as e:
@@ -265,14 +268,17 @@ class sslbt_main:
 
             api_url = _get_param(args, 'api_url', '')
             api_token = _get_param(args, 'api_token', '')
-            if api_url:
-                if not api_url.startswith(('http://', 'https://')):
-                    return _err('API URL 必须以 http:// 或 https:// 开头')
-                updates['api_url'] = api_url.strip().rstrip('/')
-            if api_token:
-                from lib.api_client import validate_token
-                validate_token(api_token.strip())
-                updates['api_token'] = api_token.strip()
+            if api_url or api_token:
+                api_updates = {}
+                if api_url:
+                    if not api_url.startswith(('http://', 'https://')):
+                        return _err('API URL 必须以 http:// 或 https:// 开头')
+                    api_updates['url'] = api_url.strip().rstrip('/')
+                if api_token:
+                    from lib.api_client import validate_token
+                    validate_token(api_token.strip())
+                    api_updates['token'] = api_token.strip()
+                updates['api'] = api_updates
 
             if not updates:
                 return _err('无更新内容')
@@ -331,7 +337,7 @@ class sslbt_main:
                     self._config.update_order_id(order_id, int(new_id))
                     order_id = int(new_id)
                 except ValueError as e:
-                    self._logger.warn("更新订单 ID 失败: %s", str(e))
+                    self._logger.warning("更新订单 ID 失败: %s", str(e))
 
             status = cert_data.get('status', '')
 
@@ -379,6 +385,15 @@ class sslbt_main:
 
             success_count = sum(1 for r in results if r['status'])
             fail_count = len(results) - success_count
+
+            # 部署有成功则更新 auto_reissue
+            if success_count > 0:
+                effective_mode = self._config.get_renew_mode(cert_entry)
+                try:
+                    api.toggle_auto_reissue(order_id, effective_mode == 'pull')
+                except Exception as e:
+                    self._logger.warning("toggle_auto_reissue 失败: order_id=%s, error=%s", order_id, str(e))
+
             if fail_count == 0:
                 return _ok(results, msg='部署成功（%d 个站点）' % success_count)
             return _ok(results, msg='部署完成：%d 成功，%d 失败' % (success_count, fail_count))
@@ -451,7 +466,7 @@ class sslbt_main:
                     if domains:
                         self._config.update_cert(order_id, {'domains': domains})
                 except ValueError as e:
-                    self._logger.warn("更新订单 ID 失败: %s", str(e))
+                    self._logger.warning("更新订单 ID 失败: %s", str(e))
 
             return _ok(result)
         except APIError as e:
@@ -470,6 +485,11 @@ class sslbt_main:
             parsed = urlparse(url)
             if parsed.scheme not in ('http', 'https'):
                 return _err('不支持的 URL 协议')
+
+            from lib.net_guard import check_ssrf
+            ssrf_reason = check_ssrf(url)
+            if ssrf_reason:
+                return _err('URL 不安全: %s' % ssrf_reason)
 
             # 从 URL 中解析 token 和 order
             params = parse_qs(parsed.query)
@@ -540,8 +560,10 @@ class sslbt_main:
                 'created_at': time.time(),
             }
             return _ok({
-                'api_url': api_url,
-                'api_token_masked': token[:6] + '***' if len(token) > 6 else '***',
+                'api': {
+                    'url': api_url,
+                    'token_masked': token[:6] + '***' if len(token) > 6 else '***',
+                },
                 'session_id': session_id,
                 'order': order_value,
                 'certs': certs,
@@ -561,11 +583,12 @@ class sslbt_main:
             if not cert_entry:
                 return _err('订单 %s 不存在' % order_id)
 
-            # 隐藏 api_token
-            token = cert_entry.get('api_token', '')
+            # 隐藏 api token
+            api = cert_entry.get('api', {})
+            token = api.get('token', '')
             if token:
-                cert_entry['api_token_masked'] = token[:6] + '***' + token[-4:] if len(token) > 10 else '***'
-                cert_entry['api_token'] = ''
+                api['token_masked'] = token[:6] + '***' + token[-4:] if len(token) > 10 else '***'
+                api['token'] = ''
 
             # 站点匹配详情
             site_names = cert_entry.get('site_name', [])
@@ -734,13 +757,11 @@ class sslbt_main:
             if not version:
                 return _err('请指定目标版本')
 
-            download_path = _get_param(args, 'download_path', '')
             checksum = _get_param(args, 'checksum', '')
 
             updater = Updater(PLUGIN_DIR, self._config, self._logger)
             updater.do_update(
                 version=version,
-                download_path=download_path,
                 checksum=checksum,
             )
             return _ok(msg='更新完成')
