@@ -101,7 +101,7 @@ update_releases_json_remote() {
     log_info "更新 releases.json..."
 
     ssh_cmd "$SERVER_HOST" "$SERVER_PORT" "RELEASES_FILE='$SERVER_DIR/releases.json' VERSION='$version' CHANNEL='$channel' CHECKSUM='$checksum' python3 << 'PYEOF'
-import json, os, re
+import json, os
 from datetime import datetime
 
 releases_file = os.environ['RELEASES_FILE']
@@ -109,15 +109,16 @@ version = os.environ['VERSION']
 channel = os.environ['CHANNEL']
 checksum = os.environ.get('CHECKSUM', '')
 
-v_version = version if version.startswith('v') else f'v{version}'
+# spec 6.1: version 不带 v 前缀
+bare = version[1:] if version.startswith('v') else version
 
 def ver_key(s):
-    s = s[1:] if s.startswith('v') else s
     base, _, pre = s.partition('-')
     nums = tuple(int(x) for x in base.split('.'))
     return (nums, 0 if not pre else -1, pre)
 
-data = {'channels': {}, 'versions': {}}
+# spec 6.1: 通道做顶层 key
+data = {}
 if os.path.exists(releases_file):
     try:
         with open(releases_file, 'r') as f:
@@ -125,23 +126,24 @@ if os.path.exists(releases_file):
     except:
         pass
 
-for k in ('channels', 'versions'):
-    if k not in data:
-        data[k] = {}
+# 清除旧格式遗留字段
+for old_key in ('channels', 'versions', 'latest_main', 'latest_dev'):
+    data.pop(old_key, None)
 
-if channel not in data['channels']:
-    data['channels'][channel] = {'versions': []}
+if channel not in data:
+    data[channel] = {'latest': '', 'versions': []}
 
-versions = data['channels'][channel].get('versions', [])
+ch = data[channel]
+versions = ch.get('versions', [])
+
+# spec 6.1: checksums 内嵌在版本条目中
 version_entry = {
-    'version': v_version,
-    'date': datetime.now().strftime('%Y-%m-%d'),
-    'path': f'{channel}/{v_version}',
+    'version': bare,
+    'released_at': datetime.now().strftime('%Y-%m-%d'),
+    'checksums': {'sslbt.zip': checksum},
 }
 
-def strip_v(s):
-    return s[1:] if s.startswith('v') else s
-existing = [i for i, v in enumerate(versions) if strip_v(v['version']) == strip_v(v_version)]
+existing = [i for i, v in enumerate(versions) if v['version'] == bare]
 if existing:
     versions[existing[0]] = version_entry
 else:
@@ -149,21 +151,13 @@ else:
 
 versions.sort(key=lambda v: ver_key(v['version']), reverse=True)
 
-latest = versions[0]['version'] if versions else ''
-data['channels'][channel]['latest'] = latest
-data['channels'][channel]['versions'] = versions
-
-if v_version not in data['versions']:
-    data['versions'][v_version] = {}
-data['versions'][v_version]['checksums'] = {'sslbt.zip': checksum}
-
-data['latest_main'] = data['channels'].get('main', {}).get('latest', '')
-data['latest_dev'] = data['channels'].get('dev', {}).get('latest', '')
+ch['latest'] = versions[0]['version'] if versions else ''
+ch['versions'] = versions
 
 with open(releases_file, 'w') as f:
     json.dump(data, f, indent=2)
 os.chmod(releases_file, 0o644)
-print(f'已更新 releases.json: {channel}/{v_version}')
+print(f'已更新 releases.json: {channel}/{bare}')
 PYEOF"
 }
 
@@ -180,7 +174,7 @@ cleanup_old_versions_remote() {
         fi
     "
 
-    # 同步 releases.json
+    # 同步 releases.json：移除已删除目录对应的版本条目
     ssh_cmd "$SERVER_HOST" "$SERVER_PORT" "python3 << 'PYEOF'
 import json, os
 releases_file = '$SERVER_DIR/releases.json'
@@ -189,28 +183,27 @@ channel_dir = '$SERVER_DIR/$channel'
 if not os.path.exists(releases_file): exit(0)
 with open(releases_file, 'r') as f:
     data = json.load(f)
-if 'channels' not in data or channel not in data['channels']: exit(0)
+if channel not in data: exit(0)
+
+# spec 6.3: 目录名加 v 前缀，version 字段不带 v 前缀
 existing = set()
 if os.path.isdir(channel_dir):
     for d in os.listdir(channel_dir):
-        if d.startswith('v'): existing.add(d)
-versions = data['channels'][channel].get('versions', [])
-data['channels'][channel]['versions'] = [v for v in versions if v['version'] in existing]
+        if d.startswith('v'):
+            existing.add(d[1:])  # 去 v 前缀，与 version 字段一致
+
+versions = data[channel].get('versions', [])
+data[channel]['versions'] = [v for v in versions if v['version'] in existing]
 
 def ver_key(s):
-    s = s[1:] if s.startswith('v') else s
     base, _, pre = s.partition('-')
     nums = tuple(int(x) for x in base.split('.'))
     return (nums, 0 if not pre else -1, pre)
 
-filtered = data['channels'][channel]['versions']
+filtered = data[channel]['versions']
 filtered.sort(key=lambda v: ver_key(v['version']), reverse=True)
-if filtered:
-    data['channels'][channel]['latest'] = filtered[0]['version']
-elif channel in data['channels']:
-    data['channels'][channel]['latest'] = ''
-data['latest_main'] = data['channels'].get('main', {}).get('latest', '')
-data['latest_dev'] = data['channels'].get('dev', {}).get('latest', '')
+data[channel]['latest'] = filtered[0]['version'] if filtered else ''
+
 with open(releases_file, 'w') as f:
     json.dump(data, f, indent=2)
 os.chmod(releases_file, 0o644)

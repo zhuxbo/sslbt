@@ -141,13 +141,13 @@ fi
 # SHA256 校验（spec 6.1: checksums 按文件名索引）
 EXPECTED_HASH=""
 if [ -n "$RELEASES_JSON" ] && [ -n "$PYTHON3" ]; then
-    # VERSION 带 v 前缀，spec version 字段不带 v 前缀
+    # spec 6.1: checksums 内嵌在版本条目中，version 不带 v 前缀
     EXPECTED_HASH=$($PYTHON3 -c "
 import sys, json
 try:
     d = json.load(sys.stdin)
     ch = d.get('$CHANNEL', {})
-    target = '${VERSION#v}'  # 去掉 v 前缀
+    target = '${VERSION#v}'
     for v in ch.get('versions', []):
         if v.get('version', '') == target:
             h = v.get('checksums', {}).get('sslbt.zip', '')
