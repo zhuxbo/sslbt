@@ -3,16 +3,15 @@
 import os
 import time
 import random
-from datetime import datetime, timezone, timedelta
+import fcntl
+from datetime import datetime, timezone
 
 from . import cert_utils
 from .api_client import APIError
 
 # 常量，对标 sslctl
-RENEW_DEFAULT_DAYS = 13
+RENEW_DEFAULT_DAYS = 14
 MAX_ISSUE_RETRY_COUNT = 10
-CSR_PENDING_TIMEOUT_HOURS = 24
-RETRY_RESET_DAYS = 7
 RENEW_SLEEP_MIN = 5
 RENEW_SLEEP_MAX = 120
 SPREAD_TOTAL_MAX = 600  # 分散延迟总量上限（秒）
@@ -57,6 +56,25 @@ class RenewEngine:
         Args:
             spread: 是否在续签间加随机延迟，避免集中请求 API（cron 调用时为 True）
         """
+        # 并发保护：非阻塞获取进程锁
+        lock_path = os.path.join(self._data_dir, 'renew.lock')
+        lock_fd = open(lock_path, 'w')
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            lock_fd.close()
+            if self._logger:
+                self._logger.info("另一个续签进程正在运行，跳过本次检查")
+            return []
+
+        try:
+            return self._do_renew_all(spread)
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            lock_fd.close()
+
+    def _do_renew_all(self, spread=False):
+        """实际续签逻辑（已持有进程锁）"""
         certs = self._config.get_certs()
 
         # 阶段 1: 收集需续签的证书和对应 API 客户端
@@ -68,21 +86,29 @@ class RenewEngine:
             if not order_id:
                 continue
             renew_mode = self._config.get_renew_mode(cert)
+            # local 模式：重试超限则跳过（spec 3.2）
+            if renew_mode == 'local':
+                meta = cert.get('metadata', {})
+                if meta.get('issue_retry_count', 0) > MAX_ISSUE_RETRY_COUNT:
+                    if self._logger:
+                        self._logger.warning("证书 order_id=%s CSR 重试超限，跳过", order_id)
+                    continue
             renew_days = self._config.get_renew_before_days(cert)
             if not needs_renewal(cert, renew_days):
                 continue
             api = self._api_factory(cert)
             if not api:
                 if self._logger:
-                    self._logger.warn("证书 order_id=%s 缺少 API 配置，跳过续签", order_id)
+                    self._logger.warning("证书 order_id=%s 缺少 API 配置，跳过续签", order_id)
                 continue
             pending_list.append((cert, api, renew_mode))
 
         # 阶段 2: 截断并计算延迟
         if len(pending_list) > MAX_RENEW_BATCH:
             if self._logger:
-                self._logger.warn("需续签证书 %d 个，超过单次上限 %d，截断处理",
-                                  len(pending_list), MAX_RENEW_BATCH)
+                self._logger.warning(
+                    "需续签证书 %d 个，超过单次上限 %d，截断处理",
+                    len(pending_list), MAX_RENEW_BATCH)
             pending_list = pending_list[:MAX_RENEW_BATCH]
         sleep_min, sleep_max = self._calc_spread_delay(len(pending_list))
 
@@ -159,11 +185,22 @@ class RenewEngine:
             raise RuntimeError("所有站点部署失败: %s" % failed_msgs)
         if fail_count > 0 and self._logger:
             failed = [r['site_name'] for r in results if not r.get('status')]
-            self._logger.warn(
+            self._logger.warning(
                 "部分站点部署失败: order_id=%s, failed_sites=%s",
                 order_id, ','.join(failed),
             )
         return True
+
+    def _update_renew_before_days(self, api):
+        """从 api.last_renew_before_days 更新全局配置"""
+        try:
+            days = int(getattr(api, 'last_renew_before_days', 0) or 0)
+        except (TypeError, ValueError):
+            return
+        if days > 0:
+            cfg = self._config.get_config()
+            cfg['schedule']['renew_before_days'] = days
+            self._config.save_config(cfg)
 
     def _renew_pull(self, cert_entry, api):
         """Pull 模式续签：查询订单 → 证书就绪则部署"""
@@ -172,6 +209,7 @@ class RenewEngine:
             self._logger.info("Pull 模式续签: order_id=%s", order_id)
 
         cert_data = api.query_order(order_id)
+        self._update_renew_before_days(api)
         order_id = self._check_order_update(cert_entry, cert_data)
 
         status = cert_data.get('status', '')
@@ -186,7 +224,7 @@ class RenewEngine:
 
         if not ca_certificate:
             if self._logger:
-                self._logger.warn("缺少中间证书，等待下次检查")
+                self._logger.warning("缺少中间证书，等待下次检查")
             return False
 
         # 构建完整证书链并部署
@@ -198,7 +236,7 @@ class RenewEngine:
 
         if not site_names:
             if self._logger:
-                self._logger.warn("未绑定站点，跳过部署")
+                self._logger.warning("未绑定站点，跳过部署")
             return False
 
         results = self._deployer.deploy_multi(
@@ -219,12 +257,9 @@ class RenewEngine:
         if self._logger:
             self._logger.info("Local 模式续签: order_id=%s", order_id)
 
-        # 检查重试计数是否需要重置
-        self._check_retry_reset(order_id, meta)
-
-        # 检查重试次数
+        # 检查重试次数，超过上限等待人工处理
         retry_count = meta.get('issue_retry_count', 0)
-        if retry_count >= MAX_ISSUE_RETRY_COUNT:
+        if retry_count > MAX_ISSUE_RETRY_COUNT:
             raise RuntimeError("CSR 提交重试次数已达上限 (%d)" % MAX_ISSUE_RETRY_COUNT)
 
         last_state = meta.get('last_issue_state', '')
@@ -233,24 +268,6 @@ class RenewEngine:
             return self._handle_processing(cert_entry, api)
         else:
             return self._submit_new_csr(cert_entry, api)
-
-    def _check_retry_reset(self, order_id, meta):
-        """检查是否需要重置重试计数（提交超过 7 天）"""
-        submitted_at = meta.get('csr_submitted_at', '')
-        if not submitted_at:
-            return
-        try:
-            sub_dt = datetime.fromisoformat(submitted_at.replace('Z', '+00:00'))
-            if datetime.now(timezone.utc) - sub_dt > timedelta(days=RETRY_RESET_DAYS):
-                if self._logger:
-                    self._logger.info("CSR 提交超过 %d 天，重置重试计数", RETRY_RESET_DAYS)
-                self._config.update_metadata(order_id, {
-                    'issue_retry_count': 0,
-                    'last_issue_state': '',
-                    'csr_submitted_at': '',
-                })
-        except (ValueError, AttributeError):
-            pass
 
     def _check_order_update(self, cert_entry, cert_data):
         """检查 API 返回的 order_id 是否变化（续费），变化则更新配置和 pending key 路径"""
@@ -265,7 +282,7 @@ class RenewEngine:
             self._config.update_order_id(old_id, new_id)
         except ValueError as e:
             if self._logger:
-                self._logger.warn("更新订单 ID 失败: %s", str(e))
+                self._logger.warning("更新订单 ID 失败: %s", str(e))
             return old_id
         # 重命名 pending key 目录
         old_name = cert_entry.get('cert_name', 'order-%s' % old_id)
@@ -277,7 +294,7 @@ class RenewEngine:
                 os.rename(old_dir, new_dir)
         except OSError as e:
             if self._logger:
-                self._logger.warn("重命名 pending key 目录失败: %s", str(e))
+                self._logger.warning("重命名 pending key 目录失败: %s", str(e))
         # 更新内存中的 cert_entry
         cert_entry['order_id'] = new_id
         cert_entry['cert_name'] = new_name
@@ -288,27 +305,9 @@ class RenewEngine:
         order_id = cert_entry['order_id']
         meta = cert_entry.get('metadata', {})
 
-        # 检查 CSR pending 超时
-        submitted_at = meta.get('csr_submitted_at', '')
-        if submitted_at:
-            try:
-                sub_dt = datetime.fromisoformat(submitted_at.replace('Z', '+00:00'))
-                if datetime.now(timezone.utc) - sub_dt > timedelta(hours=CSR_PENDING_TIMEOUT_HOURS):
-                    if self._logger:
-                        self._logger.info("CSR pending 超时，清除状态")
-                    self._cleanup_verify_files(meta)
-                    self._config.update_metadata(order_id, {
-                        'last_issue_state': '',
-                        'csr_submitted_at': '',
-                        'pending_file_verify': '',
-                        'pending_verify_paths': [],
-                    })
-                    return False
-            except (ValueError, AttributeError):
-                pass
-
         # 查询订单状态
         cert_data = api.query_order(order_id)
+        self._update_renew_before_days(api)
         order_id = self._check_order_update(cert_entry, cert_data)
         status = cert_data.get('status', '')
 
@@ -340,7 +339,7 @@ class RenewEngine:
 
         if not certificate or not ca_certificate:
             if self._logger:
-                self._logger.warn("证书内容不完整")
+                self._logger.warning("证书内容不完整")
             return False
 
         pending_key = self._read_pending_key(cert_entry)
@@ -361,7 +360,7 @@ class RenewEngine:
 
         if not site_names:
             if self._logger:
-                self._logger.warn("未绑定站点，跳过部署")
+                self._logger.warning("未绑定站点，跳过部署")
             return False
 
         results = self._deployer.deploy_multi(
@@ -410,6 +409,7 @@ class RenewEngine:
             self._cleanup_pending_key(cert_entry)
             raise
 
+        self._update_renew_before_days(api)
         order_id = self._check_order_update(cert_entry, cert_data)
         status = cert_data.get('status', 'processing')
         now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
@@ -522,4 +522,4 @@ class RenewEngine:
                 os.rmdir(dir_path)
         except OSError as e:
             if self._logger:
-                self._logger.error("清理 pending key 失败: %s, error=%s", path, str(e))
+                self._logger.error("清理 pending key 失败: %s, error=%s", os.path.basename(path), str(e))

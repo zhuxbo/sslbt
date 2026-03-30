@@ -29,48 +29,45 @@ TOKEN = 'a' * 32 + '.test-token-abcdefghij1234'
 
 class TestGetConfig:
     def test_get_config_no_api_fields(self, plugin):
-        """全局配置不包含 api_url/api_token"""
+        """全局配置不包含 api_url/api_token/check_interval_hours"""
         result = plugin.get_config()
         assert result['status'] is True
         data = result['data']
         assert 'api_url' not in data
         assert 'api_token' not in data
         assert 'api_token_masked' not in data
-        assert 'check_interval_hours' in data
+        assert 'check_interval_hours' not in data
+        assert 'schedule' in data
+        assert data['upgrade_channel'] == 'main'
 
 
 class TestSaveConfig:
-    def test_save_interval_and_renew_days(self, plugin):
-        result = plugin.save_config({'check_interval_hours': '12', 'renew_before_days': '10'})
-        assert result['status'] is True
+    def test_save_config_ignores_renew_days(self, plugin):
+        """save_config 不再处理 renew_before_days（由 API 下发）"""
+        plugin.save_config({'renew_before_days': '10'})
         cfg = plugin._config.get_config()
-        assert cfg['check_interval_hours'] == 12
-        assert cfg['renew_before_days'] == 10
-        # 超过 13 的值被截断
-        plugin.save_config({'renew_before_days': '20'})
-        assert plugin._config.get_config()['renew_before_days'] == 13
+        assert cfg['schedule']['renew_before_days'] == 14  # 保持默认值
 
     def test_save_config_no_api_fields(self, plugin):
         """save_config 不处理 api_url/api_token"""
         plugin.save_config({
             'api_url': 'https://evil.com',
             'api_token': 'some-token',
-            'check_interval_hours': '8',
         })
         cfg = plugin._config.get_config()
         assert 'api_url' not in cfg
         assert 'api_token' not in cfg
-        assert cfg['check_interval_hours'] == 8
+        assert 'check_interval_hours' not in cfg
 
     def test_save_renew_mode(self, plugin):
         plugin.save_config({'renew_mode': 'local'})
         cfg = plugin._config.get_config()
-        assert cfg['renew_mode'] == 'local'
+        assert cfg['schedule']['renew_mode'] == 'local'
 
-    def test_save_update_channel(self, plugin):
-        plugin.save_config({'update_channel': 'dev'})
+    def test_save_upgrade_channel(self, plugin):
+        plugin.save_config({'upgrade_channel': 'dev'})
         cfg = plugin._config.get_config()
-        assert cfg['update_channel'] == 'dev'
+        assert cfg['upgrade_channel'] == 'dev'
 
 
 class TestAddCert:
@@ -103,8 +100,8 @@ class TestAddCert:
         assert result['status'] is True
         cert = plugin._config.get_cert(100)
         assert cert is not None
-        assert cert['api_url'] == 'https://api.example.com'
-        assert cert['api_token'] == TOKEN
+        assert cert['api']['url'] == 'https://api.example.com'
+        assert cert['api']['token'] == TOKEN
 
 
 class TestParseCertDomains:
@@ -217,8 +214,8 @@ class TestCertList:
         assert result['status'] is True
         certs = result['data']
         assert len(certs) == 1
-        assert certs[0]['api_token'] == ''
-        assert '***' in certs[0].get('api_token_masked', '')
+        assert certs[0]['api']['token'] == ''
+        assert '***' in certs[0]['api'].get('token_masked', '')
 
 
 class TestRemoveCert:
@@ -352,8 +349,8 @@ class TestUpdateCertConfig:
         })
         assert result['status'] is True
         cert = plugin._config.get_cert(500)
-        assert cert['api_url'] == 'https://new.example.com'
-        assert cert['api_token'] == TOKEN  # token 未被清除
+        assert cert['api']['url'] == 'https://new.example.com'
+        assert cert['api']['token'] == TOKEN  # token 未被清除
 
     def test_update_api_token(self, plugin):
         """可更新证书的 API Token"""
@@ -366,7 +363,7 @@ class TestUpdateCertConfig:
         })
         assert result['status'] is True
         cert = plugin._config.get_cert(501)
-        assert cert['api_token'] == new_token
+        assert cert['api']['token'] == new_token
 
     def test_update_api_url_invalid_scheme(self, plugin):
         """非法 URL 协议被拒绝"""
@@ -482,8 +479,8 @@ class TestFetchDeployUrl:
         assert result['status'] is True
         data = result['data']
         assert 'session_id' in data
-        assert 'api_token' not in data  # 明文 token 不应出现
-        assert data['api_token_masked'].endswith('***')  # 仅返回脱敏值
+        assert 'token' not in data.get('api', {}) or data['api']['token'] == ''  # 明文 token 不应出现
+        assert data['api']['token_masked'].endswith('***')  # 仅返回脱敏值
 
     @patch('urllib.request.urlopen')
     def test_add_cert_with_session_id(self, mock_urlopen, plugin):
@@ -513,8 +510,8 @@ class TestFetchDeployUrl:
             })
             assert result['status'] is True
             cert = plugin._config.get_cert(100)
-            assert cert['api_url'] == 'https://api.example.com'
-            assert cert['api_token'] == TOKEN
+            assert cert['api']['url'] == 'https://api.example.com'
+            assert cert['api']['token'] == TOKEN
 
     @patch('urllib.request.urlopen')
     def test_session_id_reusable_for_batch(self, mock_urlopen, plugin):
@@ -569,9 +566,214 @@ class TestFetchDeployUrl:
         assert '认证失败' in result['msg']
 
 
+class TestSaveReleaseUrl:
+    def test_save_release_url(self, plugin):
+        """save_config 可设置 release_url"""
+        result = plugin.save_config({'release_url': 'https://release.example.com/sslbt'})
+        assert result['status'] is True
+        cfg = plugin._config.get_config()
+        assert cfg['release_url'] == 'https://release.example.com/sslbt'
+
+    def test_save_release_url_strips(self, plugin):
+        """release_url 自动去除首尾空格和末尾斜杠"""
+        plugin.save_config({'release_url': '  https://release.example.com/sslbt/  '})
+        cfg = plugin._config.get_config()
+        assert cfg['release_url'] == 'https://release.example.com/sslbt'
+
+    def test_save_release_url_empty(self, plugin):
+        """可清空 release_url"""
+        plugin.save_config({'release_url': 'https://release.example.com/sslbt'})
+        plugin.save_config({'release_url': ''})
+        cfg = plugin._config.get_config()
+        assert cfg['release_url'] == ''
+
+    def test_save_release_url_not_affect_other_fields(self, plugin):
+        """设置 release_url 不影响其他字段"""
+        plugin.save_config({'renew_mode': 'local'})
+        plugin.save_config({'release_url': 'https://release.example.com/sslbt'})
+        cfg = plugin._config.get_config()
+        assert cfg['schedule']['renew_mode'] == 'local'
+        assert cfg['release_url'] == 'https://release.example.com/sslbt'
+
+
+class TestCheckCertOrderUpdate:
+    @patch('sslbt_main.APIClient')
+    def test_check_cert_updates_order_id(self, mock_api_cls, plugin):
+        """check_cert 检测到新 order_id 时自动更新配置"""
+        plugin._config.add_cert(
+            order_id=800, cert_name='order-800', domains=['a.example.com'],
+            api_url='https://api.example.com', api_token=TOKEN,
+        )
+        mock_api = MagicMock()
+        mock_api.query_order.return_value = {
+            'order_id': 900,
+            'status': 'active',
+            'domains': 'a.example.com',
+        }
+        mock_api_cls.return_value = mock_api
+
+        result = plugin.check_cert({'order_id': '800'})
+        assert result['status'] is True
+        assert result['data']['_order_updated'] is True
+        # 旧 ID 不存在，新 ID 存在
+        assert plugin._config.get_cert(800) is None
+        new_cert = plugin._config.get_cert(900)
+        assert new_cert is not None
+        assert new_cert['cert_name'] == 'order-900'
+
+    @patch('sslbt_main.APIClient')
+    def test_check_cert_same_order_id(self, mock_api_cls, plugin):
+        """check_cert order_id 未变化时不更新"""
+        plugin._config.add_cert(
+            order_id=801, cert_name='order-801', domains=['a.example.com'],
+            api_url='https://api.example.com', api_token=TOKEN,
+        )
+        mock_api = MagicMock()
+        mock_api.query_order.return_value = {
+            'order_id': 801,
+            'status': 'active',
+            'domains': 'a.example.com',
+        }
+        mock_api_cls.return_value = mock_api
+
+        result = plugin.check_cert({'order_id': '801'})
+        assert result['status'] is True
+        assert '_order_updated' not in result['data']
+        assert plugin._config.get_cert(801) is not None
+
+    @patch('sslbt_main.APIClient')
+    def test_check_cert_order_update_conflict(self, mock_api_cls, plugin):
+        """check_cert 新 order_id 已存在时不更新，不报错"""
+        plugin._config.add_cert(
+            order_id=802, cert_name='order-802', domains=['a.example.com'],
+            api_url='https://api.example.com', api_token=TOKEN,
+        )
+        plugin._config.add_cert(
+            order_id=903, cert_name='order-903', domains=['b.example.com'],
+            api_url='https://api.example.com', api_token=TOKEN,
+        )
+        mock_api = MagicMock()
+        mock_api.query_order.return_value = {
+            'order_id': 903,
+            'status': 'active',
+            'domains': 'a.example.com',
+        }
+        mock_api_cls.return_value = mock_api
+
+        result = plugin.check_cert({'order_id': '802'})
+        assert result['status'] is True
+        # 冲突时不更新，旧 ID 仍存在
+        assert '_order_updated' not in result['data']
+        assert plugin._config.get_cert(802) is not None
+
+    @patch('sslbt_main.APIClient')
+    def test_check_cert_updates_domains(self, mock_api_cls, plugin):
+        """check_cert 更新 order_id 时同步更新域名"""
+        plugin._config.add_cert(
+            order_id=803, cert_name='order-803', domains=['old.example.com'],
+            api_url='https://api.example.com', api_token=TOKEN,
+        )
+        mock_api = MagicMock()
+        mock_api.query_order.return_value = {
+            'order_id': 904,
+            'status': 'active',
+            'domains': 'new.example.com,www.new.example.com',
+        }
+        mock_api_cls.return_value = mock_api
+
+        result = plugin.check_cert({'order_id': '803'})
+        assert result['status'] is True
+        new_cert = plugin._config.get_cert(904)
+        assert 'new.example.com' in new_cert['domains']
+        assert 'www.new.example.com' in new_cert['domains']
+
+
 class TestLogs:
     def test_get_logs(self, plugin):
         plugin._logger.info("test message")
         result = plugin.get_logs({})
         assert result['status'] is True
         assert 'test message' in result['data']['content']
+
+
+class TestToggleAutoReissue:
+    @patch('sslbt_main.CronManager')
+    @patch('sslbt_main.APIClient')
+    def test_add_cert_calls_toggle_pull_mode(self, mock_api_cls, mock_cron_cls, plugin):
+        """pull 模式添加证书时调用 toggle_auto_reissue(True)"""
+        mock_api = MagicMock()
+        mock_api.query_order.return_value = {'status': 'active', 'domains': 'a.com'}
+        mock_api_cls.return_value = mock_api
+        mock_cron = MagicMock()
+        mock_cron.get_status.return_value = {'exists': True}
+        mock_cron_cls.return_value = mock_cron
+
+        plugin.add_cert({
+            'order_id': '900',
+            'api_url': 'https://api.example.com',
+            'api_token': TOKEN,
+            'renew_mode': 'pull',
+        })
+        mock_api.toggle_auto_reissue.assert_called_once_with(900, True)
+
+    @patch('sslbt_main.CronManager')
+    @patch('sslbt_main.APIClient')
+    def test_add_cert_calls_toggle_local_mode(self, mock_api_cls, mock_cron_cls, plugin):
+        """local 模式添加证书时调用 toggle_auto_reissue(False)"""
+        mock_api = MagicMock()
+        mock_api.query_order.return_value = {'status': 'active', 'domains': 'a.com'}
+        mock_api_cls.return_value = mock_api
+        mock_cron = MagicMock()
+        mock_cron.get_status.return_value = {'exists': True}
+        mock_cron_cls.return_value = mock_cron
+
+        plugin.add_cert({
+            'order_id': '901',
+            'api_url': 'https://api.example.com',
+            'api_token': TOKEN,
+            'renew_mode': 'local',
+        })
+        mock_api.toggle_auto_reissue.assert_called_once_with(901, False)
+
+    @patch('sslbt_main.CronManager')
+    @patch('sslbt_main.APIClient')
+    def test_add_cert_toggle_failure_does_not_block(self, mock_api_cls, mock_cron_cls, plugin):
+        """toggle_auto_reissue 抛异常时添加证书仍然成功"""
+        mock_api = MagicMock()
+        mock_api.query_order.return_value = {'status': 'active', 'domains': 'a.com'}
+        mock_api.toggle_auto_reissue.side_effect = Exception('network error')
+        mock_api_cls.return_value = mock_api
+        mock_cron = MagicMock()
+        mock_cron.get_status.return_value = {'exists': True}
+        mock_cron_cls.return_value = mock_cron
+
+        result = plugin.add_cert({
+            'order_id': '902',
+            'api_url': 'https://api.example.com',
+            'api_token': TOKEN,
+        })
+        assert result['status'] is True
+
+    @patch('sslbt_main.APIClient')
+    def test_deploy_cert_calls_toggle_on_success(self, mock_api_cls, plugin):
+        """deploy_cert 部署成功后调用 toggle_auto_reissue"""
+        plugin._config.add_cert(
+            order_id=910, cert_name='test', domains=['a.com'],
+            site_names=['a.com'], api_url='https://api.example.com',
+            api_token=TOKEN, renew_mode='pull',
+        )
+        mock_api = MagicMock()
+        mock_api.query_order.return_value = {
+            'status': 'active',
+            'certificate': '---CERT---',
+            'ca_certificate': '---CA---',
+            'private_key': '---KEY---',
+        }
+        mock_api_cls.return_value = mock_api
+
+        deployer_mock = MagicMock()
+        deployer_mock.deploy_multi.return_value = [{'site_name': 'a.com', 'status': True, 'message': 'ok'}]
+        with patch('sslbt_main.Deployer', return_value=deployer_mock):
+            plugin.deploy_cert({'order_id': '910'})
+
+        mock_api.toggle_auto_reissue.assert_called_once_with(910, True)

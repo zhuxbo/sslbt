@@ -590,8 +590,9 @@
       }
       var renewMode = d._effective_renew_mode || '';
       var renewLabel = renewMode === 'local' ? '本机提交' : '自动签发';
-      var apiInfo = d.api_url ? P._e(d.api_url) : '未配置';
-      if (d.api_token_masked) apiInfo += ' (' + P._e(d.api_token_masked) + ')';
+      var apiObj = d.api || {};
+      var apiInfo = apiObj.url ? P._e(apiObj.url) : '未配置';
+      if (apiObj.token_masked) apiInfo += ' (' + P._e(apiObj.token_masked) + ')';
       var lastDeploy = m.last_deploy_at || '-';
 
       var h = '<div class="ssl-detail-grid">';
@@ -708,9 +709,9 @@
         var data = r.result.data;
         var certs = data.certs || [];
         for (var j = 0; j < certs.length; j++) {
-          certs[j]._api_url = data.api_url;
+          certs[j]._api_url = (data.api || {}).url || '';
           certs[j]._session_id = data.session_id;
-          certs[j]._api_token_masked = data.api_token_masked;
+          certs[j]._api_token_masked = (data.api || {}).token_masked || '';
           allCerts.push(certs[j]);
         }
       }
@@ -946,8 +947,9 @@
       if (!cert) { layer.msg('证书数据未加载', { icon: 2 }); return; }
 
       var renewMode = cert.renew_mode || '';
-      var apiUrl = cert.api_url || '';
-      var apiTokenMasked = cert.api_token_masked || '';
+      var certApi = cert.api || {};
+      var apiUrl = certApi.url || '';
+      var apiTokenMasked = certApi.token_masked || '';
 
       P._call('get_site_matches', { order_id: oid }, function (r) {
         var allSites = (r.status && r.data) ? r.data : [];
@@ -1055,13 +1057,7 @@
         var c = r.data;
         var h = '';
 
-        // Section 1: 提前续签
-        h += '<div class="ssl-settings-section"><table>';
-        h += '<tr><td>提前续签</td><td><span style="display:inline-flex;align-items:center;border:1px solid #dcdfe6;border-radius:4px;overflow:hidden"><input id="set-renew-days" type="number" min="1" max="13" value="' + (c.renew_before_days || 13) + '" style="width:50px;border:none;outline:none;padding:4px 6px;font-size:13px" /><span style="padding:0 8px;background:#f5f7fa;color:#909399;font-size:12px;line-height:28px">天</span></span> ';
-        h += '<button class="ssl-btn ssl-btn-primary ssl-btn-sm" style="width:58px" onclick="sslbt.saveSettings()">保存</button></td></tr>';
-        h += '</table></div>';
-
-        // Section 2: 计划任务
+        // Section 1: 计划任务
         h += '<div class="ssl-settings-section"><table>';
         h += '<tr><td>计划任务</td><td>';
         h += '<button class="ssl-btn ssl-btn-sm" onclick="sslbt.setupCron()">设置计划任务</button> ';
@@ -1083,8 +1079,8 @@
         h += '<tr><td>当前版本</td><td style="text-align:left !important"><span style="display:inline-block;padding-left:2px;color:#303133;font-weight:500">' + P._e(c.plugin_version || '0.0.0') + '</span></td></tr>';
         h += '<tr><td>更新通道</td><td>';
         h += '<select id="update-channel" style="width:120px" onchange="sslbt.saveUpdateChannel()">';
-        h += '<option value="main"' + ((c.update_channel || 'main') === 'main' ? ' selected' : '') + '>稳定版</option>';
-        h += '<option value="dev"' + (c.update_channel === 'dev' ? ' selected' : '') + '>测试版</option></select> ';
+        h += '<option value="main"' + ((c.upgrade_channel || 'main') === 'main' ? ' selected' : '') + '>稳定版</option>';
+        h += '<option value="dev"' + (c.upgrade_channel === 'dev' ? ' selected' : '') + '>测试版</option></select> ';
         h += '<button class="ssl-btn ssl-btn-sm" onclick="sslbt.checkUpdate()">检查更新</button>';
         h += '<span id="update-result" style="margin-left:10px"></span>';
         h += '</td></tr>';
@@ -1102,12 +1098,6 @@
         var el = document.getElementById('cron-status');
         if (!el) return;
         el.textContent = d.exists ? '当前: ' + d.cycle : '未设置';
-      });
-    },
-
-    saveSettings: function () {
-      P._call('save_config', { renew_before_days: $('#set-renew-days').val() }, function (r) {
-        layer.msg(r.msg, { icon: r.status ? 1 : 2 });
       });
     },
 
@@ -1140,12 +1130,41 @@
     },
 
     saveUpdateChannel: function () {
-      P._call('save_config', { update_channel: $('#update-channel').val() }, function (r) {
+      P._call('save_config', { upgrade_channel: $('#update-channel').val() }, function (r) {
         if (r.status) layer.msg('已切换', { icon: 1 });
       });
     },
 
     _ui: null,
+    _promptReleaseUrl: function () {
+      layer.open({
+        type: 1,
+        title: '设置升级服务器',
+        area: ['400px', '200px'],
+        offset: 'auto',
+        content:
+          '<div style="padding:20px 30px">' +
+          '<p style="font-size:13px;color:#606266;margin-bottom:12px">升级服务器不可用，请输入新的域名：</p>' +
+          '<input id="new-release-host" placeholder="例如 release.cnssl.com" style="width:100%;padding:8px 10px;border:1px solid #dcdfe6;border-radius:3px;font-size:13px;box-sizing:border-box" />' +
+          '</div>',
+        btn: ['保存', '取消'],
+        yes: function (idx) {
+          var host = ($('#new-release-host').val() || '').trim();
+          if (!host) { layer.msg('请输入域名', { icon: 2 }); return; }
+          var url = 'https://' + host.replace(/^https?:\/\//, '').replace(/\/+$/, '') + '/sslbt';
+          P._call('save_config', { release_url: url }, function (r) {
+            layer.close(idx);
+            if (r.status) {
+              layer.msg('已更新，请重新检查更新', { icon: 1 });
+              document.getElementById('update-result').innerHTML = '';
+            } else {
+              layer.msg(r.msg, { icon: 2 });
+            }
+          });
+        },
+      });
+    },
+
     checkUpdate: function () {
       var sp = document.getElementById('update-result');
       sp.innerHTML = '<span style="color:#e6a23c">检查中...</span>';
@@ -1157,12 +1176,14 @@
               ' <button class="ssl-btn ssl-btn-success ssl-btn-sm" onclick="sslbt.doUpdate()">立即更新</button>';
             P._ui = d;
           } else if (d.error) {
-            sp.innerHTML = '<span style="color:#f56c6c">' + P._e(d.error) + '</span>';
+            sp.innerHTML = '<span style="color:#f56c6c">' + P._e(d.error) + '</span>' +
+              ' <button class="ssl-btn ssl-btn-sm" onclick="sslbt._promptReleaseUrl()">设置</button>';
           } else {
             sp.innerHTML = '<span style="color:#909399">当前已是最新版本</span>';
           }
         } else {
-          sp.innerHTML = '<span style="color:#f56c6c">' + P._e(r.msg || '检查失败') + '</span>';
+          sp.innerHTML = '<span style="color:#f56c6c">' + P._e(r.msg || '检查失败') + '</span>' +
+            ' <button class="ssl-btn ssl-btn-sm" onclick="sslbt._promptReleaseUrl()">设置升级地址</button>';
         }
       });
     },
@@ -1173,7 +1194,6 @@
       sp.innerHTML = '<span style="color:#e6a23c">更新中，请勿关闭页面...</span>';
       P._call('do_update', {
         version: P._ui.latest_version,
-        download_path: P._ui.download_path || '',
         checksum: P._ui.checksum || ''
       }, function (r) {
         if (r.status) {
@@ -1186,7 +1206,8 @@
             yes: function () { (window.top || window).location.reload(); }
           });
         } else {
-          sp.innerHTML = '<span style="color:#f56c6c">更新失败: ' + P._e(r.msg || '未知错误') + '</span>';
+          sp.innerHTML = '<span style="color:#f56c6c">更新失败: ' + P._e(r.msg || '未知错误') + '</span>' +
+            ' <button class="ssl-btn ssl-btn-sm" onclick="sslbt._promptReleaseUrl()">更换升级地址</button>';
         }
       });
     },

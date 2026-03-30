@@ -7,11 +7,13 @@ import fcntl
 import shutil
 
 DEFAULT_CONFIG = {
-    'check_interval_hours': 6,
-    'renew_before_days': 13,
-    'renew_mode': 'pull',
     'release_url': '',
-    'update_channel': 'main',
+    'upgrade_channel': 'main',
+    'schedule': {
+        'renew_mode': 'pull',
+        'renew_before_days': 14,
+    },
+    'certificates': [],
 }
 
 DEFAULT_CERT_ENTRY = {
@@ -21,8 +23,10 @@ DEFAULT_CERT_ENTRY = {
     'enabled': True,
     'renew_mode': '',
     'validation_method': '',
-    'api_url': '',
-    'api_token': '',
+    'api': {
+        'url': '',
+        'token': '',
+    },
     'site_name': [],
     'server_type': 'nginx',
     'metadata': {
@@ -36,6 +40,125 @@ DEFAULT_CERT_ENTRY = {
     },
 }
 
+# ==================== 迁移规则（数据驱动） ====================
+# 添加新的迁移只需在此追加条目，不需要修改迁移逻辑
+#
+# 规则格式:
+#   'old_key': ('delete',)                    静默移除
+#   'old_key': ('rename', 'new_key')          重命名
+#   'old_key': ('move', 'parent', 'child')    扁平字段移入子对象
+#
+# spread 操作通过 _SPREAD_RULES 独立定义（全局字段分发到数组元素）:
+#   ('source_key', 'array_key', 'target_key') — 顶层 source_key → 每个 array_key[] 元素的 target_key
+
+# 全局字段迁移
+_GLOBAL_FIELD_RULES = {
+    'renew_before_days':    ('move', 'schedule', 'renew_before_days'),
+    'renew_mode':           ('move', 'schedule', 'renew_mode'),
+    'update_channel':       ('rename', 'upgrade_channel'),
+    'api_url':              ('delete',),
+    'api_token':            ('delete',),
+    'version':              ('delete',),
+    'check_interval_hours': ('delete',),
+}
+
+# 证书字段迁移
+_CERT_FIELD_RULES = {
+    'api_url':   ('move', 'api', 'url'),
+    'api_token': ('move', 'api', 'token'),
+}
+
+# 旧文件合并：旧文件名 → 合并到哪个字段
+_OLD_FILE_MERGES = {
+    'certs.json': 'certificates',
+}
+
+# spread 规则：顶层字段分发到数组元素（仅补全缺失字段）
+# ('source_key', 'array_key', 'target_key')
+_SPREAD_RULES = []
+
+
+# ==================== 通用迁移引擎 ====================
+
+def _apply_field_rules(data, rules):
+    """对 dict 就地执行字段迁移规则，返回 changed 标志"""
+    changed = False
+    moves = []
+    renames = []
+    deletes = []
+
+    for key in list(data.keys()):
+        rule = rules.get(key)
+        if not rule:
+            continue
+        action = rule[0]
+        if action == 'delete':
+            deletes.append(key)
+        elif action == 'rename':
+            renames.append((key, rule[1]))
+        elif action == 'move':
+            moves.append((key, rule[1], rule[2]))
+
+    for key in deletes:
+        del data[key]
+        changed = True
+
+    for old_key, new_key in renames:
+        if new_key not in data:
+            data[new_key] = data[old_key]
+            changed = True
+        del data[old_key]
+
+    for old_key, parent, child in moves:
+        if parent not in data or not isinstance(data[parent], dict):
+            data[parent] = {}
+        data[parent].setdefault(child, data[old_key])
+        del data[old_key]
+        changed = True
+
+    return changed
+
+
+def _apply_spread_rules(data, rules):
+    """将顶层字段分发到数组元素（仅补全缺失字段），返回 changed 标志"""
+    changed = False
+    for source_key, array_key, target_key in rules:
+        value = data.get(source_key)
+        items = data.get(array_key)
+        if value is None or not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if target_key not in item:
+                item[target_key] = copy.deepcopy(value) if isinstance(value, (dict, list)) else value
+                changed = True
+    return changed
+
+
+def _fill_defaults(data, defaults):
+    """根据 defaults 结构递归补齐缺失字段、校正类型，返回是否有变化
+
+    - 缺失字段：填入默认值
+    - 默认 dict 但实际非 dict：替换为默认值
+    - 默认 list 但实际 str：转换为 [str] 或 []
+    """
+    changed = False
+    for key, default_value in defaults.items():
+        if key not in data:
+            data[key] = copy.deepcopy(default_value) if isinstance(default_value, (dict, list)) else default_value
+            changed = True
+        elif isinstance(default_value, dict):
+            if not isinstance(data[key], dict):
+                data[key] = copy.deepcopy(default_value)
+                changed = True
+            else:
+                changed = _fill_defaults(data[key], default_value) or changed
+        elif isinstance(default_value, list) and isinstance(data[key], str):
+            data[key] = [data[key]] if data[key] else []
+            changed = True
+    return changed
+
 
 class ConfigManager:
     """配置读写管理，文件锁保护"""
@@ -44,8 +167,54 @@ class ConfigManager:
         self._data_dir = data_dir
         self._logger = logger
         self._config_path = os.path.join(data_dir, 'config.json')
-        self._certs_path = os.path.join(data_dir, 'certs.json')
         os.makedirs(data_dir, exist_ok=True)
+        self._ensure_config()
+
+    def _ensure_config(self):
+        """启动时校验配置：合并旧文件、执行迁移、持久化"""
+        raw = self._read_json(self._config_path, DEFAULT_CONFIG)
+        changed = False
+
+        # 合并旧文件（先记录，写入成功后再删除）
+        merged_files = []
+        for old_name, field in _OLD_FILE_MERGES.items():
+            old_path = os.path.join(self._data_dir, old_name)
+            if not os.path.isfile(old_path):
+                continue
+            try:
+                old_data = self._read_json(old_path, {})
+                items = old_data.get(field, [])
+                if items and not raw.get(field):
+                    raw[field] = items
+                    changed = True
+                merged_files.append(old_path)
+            except OSError:
+                pass
+
+        # 全局字段迁移
+        changed = _apply_field_rules(raw, _GLOBAL_FIELD_RULES) or changed
+        changed = _apply_spread_rules(raw, _SPREAD_RULES) or changed
+        changed = _fill_defaults(raw, DEFAULT_CONFIG) or changed
+
+        # 证书字段迁移
+        for cert in raw.get('certificates', []):
+            changed = _apply_field_rules(cert, _CERT_FIELD_RULES) or changed
+            changed = _fill_defaults(cert, DEFAULT_CERT_ENTRY) or changed
+
+        if changed:
+            try:
+                self._write_json(self._config_path, raw)
+            except OSError:
+                pass
+
+        # 写入成功后再删除旧文件
+        for path in merged_files:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    # ==================== JSON 读写 ====================
 
     def _read_json(self, path, default):
         if not os.path.isfile(path):
@@ -61,7 +230,6 @@ class ConfigManager:
         except json.JSONDecodeError:
             if self._logger:
                 self._logger.error("配置文件 JSON 解析失败: %s", path)
-            # 备份损坏文件
             try:
                 shutil.copy2(path, path + '.bak')
             except OSError:
@@ -71,9 +239,8 @@ class ConfigManager:
             return copy.deepcopy(default)
 
     def _write_json(self, path, data):
-        # 拒绝写入符号链接目标
         if os.path.islink(path):
-            raise OSError("refusing to write to symlink: %s" % path)
+            raise OSError("refusing to write to symlink: %s" % os.path.basename(path))
         tmp_path = path + '.tmp'
         with open(tmp_path, 'w', encoding='utf-8') as f:
             fcntl.flock(f, fcntl.LOCK_EX)
@@ -89,12 +256,11 @@ class ConfigManager:
     def _update_json(self, path, updater_fn, default):
         """原子读-改-写: 在排他锁保护下执行 updater_fn(data) -> data"""
         if os.path.islink(path):
-            raise OSError("refusing to write to symlink: %s" % path)
+            raise OSError("refusing to write to symlink: %s" % os.path.basename(path))
         lock_path = path + '.lock'
         with open(lock_path, 'w') as lf:
             fcntl.flock(lf, fcntl.LOCK_EX)
             try:
-                # 读取当前数据
                 if os.path.isfile(path):
                     try:
                         with open(path, 'r', encoding='utf-8') as f:
@@ -112,7 +278,6 @@ class ConfigManager:
                 else:
                     data = copy.deepcopy(default)
                 result = updater_fn(data)
-                # 写入 tmp 然后 replace
                 tmp_path = path + '.tmp'
                 with open(tmp_path, 'w', encoding='utf-8') as tf:
                     json.dump(result, tf, indent=2, ensure_ascii=False)
@@ -124,44 +289,49 @@ class ConfigManager:
             finally:
                 fcntl.flock(lf, fcntl.LOCK_UN)
 
-    # --- 全局配置 ---
-
-    # 废弃字段，读取时自动清除
-    _DEPRECATED_KEYS = {'api_url', 'api_token', 'version'}
+    # ==================== 全局配置 ====================
 
     def get_config(self):
-        """返回全局配置，自动清除废弃字段"""
-        cfg = self._read_json(self._config_path, DEFAULT_CONFIG)
-        merged = copy.deepcopy(DEFAULT_CONFIG)
-        for k, v in cfg.items():
-            if k not in self._DEPRECATED_KEYS:
-                merged[k] = v
-        return merged
+        """返回全局配置（不含 certificates）"""
+        raw = self._read_json(self._config_path, DEFAULT_CONFIG)
+        _apply_field_rules(raw, _GLOBAL_FIELD_RULES)
+        _fill_defaults(raw, DEFAULT_CONFIG)
+        return {k: v for k, v in raw.items() if k != 'certificates'}
 
     def save_config(self, cfg):
-        # 写入前清除废弃字段
-        clean = {k: v for k, v in cfg.items() if k not in self._DEPRECATED_KEYS}
-        self._write_json(self._config_path, clean)
+        """保存全局配置字段，保留 certificates 不变"""
+        def updater(data):
+            clean = copy.deepcopy(cfg)
+            _apply_field_rules(clean, _GLOBAL_FIELD_RULES)
+            for k, v in clean.items():
+                if k != 'certificates':
+                    data[k] = v
+            return data
 
-    # --- 证书列表 ---
+        self._update_json(self._config_path, updater, DEFAULT_CONFIG)
+
+    # ==================== 证书列表 ====================
 
     @staticmethod
     def _normalize_certs(certs):
-        """规范化证书列表：site_name 字符串转列表"""
+        """对证书列表执行迁移和默认值填充"""
         for cert in certs:
-            site_name = cert.get('site_name', [])
-            if isinstance(site_name, str):
-                cert['site_name'] = [site_name] if site_name else []
+            _apply_field_rules(cert, _CERT_FIELD_RULES)
+            _fill_defaults(cert, DEFAULT_CERT_ENTRY)
         return certs
 
     def get_certs(self):
         """返回证书列表的深拷贝"""
-        data = self._read_json(self._certs_path, {'certificates': []})
+        data = self._read_json(self._config_path, DEFAULT_CONFIG)
         certs = copy.deepcopy(data.get('certificates', []))
         return self._normalize_certs(certs)
 
     def save_certs(self, certs):
-        self._write_json(self._certs_path, {'certificates': certs})
+        def updater(data):
+            data['certificates'] = certs
+            return data
+
+        self._update_json(self._config_path, updater, DEFAULT_CONFIG)
 
     def get_cert(self, order_id):
         """按 order_id 查找证书配置"""
@@ -193,7 +363,8 @@ class ConfigManager:
         return bound
 
     def add_cert(self, order_id, cert_name, domains, site_name='', renew_mode='',
-                 api_url='', api_token='', site_names=None, validation_method=''):
+                 api_url='', api_token='', site_names=None, validation_method='',
+                 api=None):
         """添加证书条目，自动排除已被其他证书绑定的站点"""
         order_id = int(order_id)
         requested = site_names if site_names is not None else ([site_name] if site_name else [])
@@ -212,22 +383,22 @@ class ConfigManager:
             entry['site_name'] = available
             entry['renew_mode'] = renew_mode
             entry['validation_method'] = validation_method
-            entry['api_url'] = api_url
-            entry['api_token'] = api_token
+            if api:
+                entry['api'] = {'url': api.get('url', ''), 'token': api.get('token', '')}
+            else:
+                entry['api'] = {'url': api_url, 'token': api_token}
             certs.append(entry)
             data['certificates'] = certs
             return data
 
-        result = self._update_json(self._certs_path, updater, {'certificates': []})
-        # 返回最后添加的条目
+        result = self._update_json(self._config_path, updater, DEFAULT_CONFIG)
         certs = result.get('certificates', [])
         return certs[-1] if certs else None
 
     def get_cert_api(self, cert_entry):
         """获取证书的 API 配置"""
-        url = cert_entry.get('api_url', '')
-        token = cert_entry.get('api_token', '')
-        return url, token
+        api = cert_entry.get('api', {})
+        return api.get('url', ''), api.get('token', '')
 
     def update_cert(self, order_id, updates):
         """更新指定证书的字段（原子操作）"""
@@ -237,7 +408,6 @@ class ConfigManager:
             certs = self._normalize_certs(data.get('certificates', []))
             for i, c in enumerate(certs):
                 if c.get('order_id') == order_id:
-                    # 如果更新 site_name，过滤已被其他证书绑定的站点
                     if 'site_name' in updates:
                         bound = self._collect_bound_sites(certs, exclude_order_id=order_id)
                         requested = updates['site_name']
@@ -245,10 +415,10 @@ class ConfigManager:
                             requested = [requested] if requested else []
                         updates['site_name'] = [s for s in requested if s not in bound]
                     for k, v in updates.items():
-                        if k == 'metadata' and isinstance(v, dict):
-                            if 'metadata' not in c:
-                                c['metadata'] = copy.deepcopy(DEFAULT_CERT_ENTRY['metadata'])
-                            c['metadata'].update(v)
+                        if k in ('metadata', 'api') and isinstance(v, dict):
+                            if k not in c or not isinstance(c.get(k), dict):
+                                c[k] = copy.deepcopy(DEFAULT_CERT_ENTRY.get(k, {}))
+                            c[k].update(v)
                         else:
                             c[k] = v
                     certs[i] = c
@@ -256,8 +426,7 @@ class ConfigManager:
                     return data
             raise ValueError("订单 %d 不存在" % order_id)
 
-        result = self._update_json(self._certs_path, updater, {'certificates': []})
-        # 返回更新后的证书条目
+        result = self._update_json(self._config_path, updater, DEFAULT_CONFIG)
         for c in result.get('certificates', []):
             if c.get('order_id') == order_id:
                 return c
@@ -281,7 +450,7 @@ class ConfigManager:
                     return data
             raise ValueError("订单 %d 不存在" % old_order_id)
 
-        self._update_json(self._certs_path, updater, {'certificates': []})
+        self._update_json(self._config_path, updater, DEFAULT_CONFIG)
 
     def remove_cert(self, order_id):
         """删除证书条目（原子操作）"""
@@ -292,7 +461,7 @@ class ConfigManager:
             data['certificates'] = [c for c in certs if c.get('order_id') != order_id]
             return data
 
-        self._update_json(self._certs_path, updater, {'certificates': []})
+        self._update_json(self._config_path, updater, DEFAULT_CONFIG)
 
     def update_metadata(self, order_id, meta_updates):
         """更新指定证书的 metadata 字段"""
@@ -304,12 +473,12 @@ class ConfigManager:
         if mode:
             return mode
         cfg = self.get_config()
-        return cfg.get('renew_mode', 'pull')
+        return cfg.get('schedule', {}).get('renew_mode', 'pull')
 
     def get_renew_before_days(self, cert_entry):
         """获取提前续签天数"""
         cfg = self.get_config()
-        days = cfg.get('renew_before_days', 0)
+        days = cfg.get('schedule', {}).get('renew_before_days', 0)
         if days > 0:
             return days
-        return 13  # RENEW_DEFAULT_DAYS
+        return 14  # RENEW_DEFAULT_DAYS

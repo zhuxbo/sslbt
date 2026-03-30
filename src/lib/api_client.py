@@ -4,12 +4,15 @@ import json
 import time
 import ssl
 import re
-from urllib.request import Request, urlopen
+import http.client
+from urllib.request import Request, HTTPHandler, HTTPSHandler, build_opener
 from urllib.error import URLError, HTTPError
 from urllib.parse import urlencode, urlparse
 
 API_CODE_SUCCESS = 1
 MAX_RETRIES = 3
+TIMEOUT_GET = 30
+TIMEOUT_POST = 60
 MAX_RESPONSE_SIZE = 512 * 1024  # 512KB
 MAX_CALLBACK_RESPONSE_SIZE = 64 * 1024  # 64KB
 BATCH_MAX_RESPONSE_SIZE = 5 * 1024 * 1024  # 5MB
@@ -40,14 +43,56 @@ def _build_api_url(base_url, suffix=''):
     return base_url.rstrip('/') + '/api/deploy' + suffix
 
 
+# DNS Rebinding 防护：TCP 连接后二次校验目标 IP（spec 10.1）
+
+class _SafeHTTPConnection(http.client.HTTPConnection):
+    def connect(self):
+        super().connect()
+        from .net_guard import verify_ip
+        ip = self.sock.getpeername()[0]
+        reason = verify_ip(ip)
+        if reason:
+            self.close()
+            raise OSError("DNS Rebinding 防护: %s" % reason)
+
+
+class _SafeHTTPSConnection(http.client.HTTPSConnection):
+    def connect(self):
+        super().connect()
+        from .net_guard import verify_ip
+        ip = self.sock.getpeername()[0]
+        reason = verify_ip(ip)
+        if reason:
+            self.close()
+            raise OSError("DNS Rebinding 防护: %s" % reason)
+
+
+class _SafeHTTPHandler(HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(_SafeHTTPConnection, req)
+
+
+class _SafeHTTPSHandler(HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(_SafeHTTPSConnection, req, context=self._context)
+
+
 class APIClient:
     """证书平台 API 客户端"""
 
-    def __init__(self, base_url, token, logger=None, timeout=30):
+    def __init__(self, base_url, token, logger=None, timeout=None):
         if not base_url:
             raise ValueError("API URL 不能为空")
         if not base_url.startswith(('http://', 'https://')):
             raise ValueError("API URL 必须以 http:// 或 https:// 开头")
+        # HTTPS 强制：仅 localhost/127.0.0.1 允许 HTTP（spec 10.1）
+        parsed = urlparse(base_url)
+        if parsed.scheme == 'http' and parsed.hostname not in ('localhost', '127.0.0.1', '::1'):
+            raise ValueError("API URL 必须使用 HTTPS（仅 localhost/127.0.0.1 允许 HTTP）")
+        from .net_guard import check_ssrf
+        ssrf_reason = check_ssrf(base_url)
+        if ssrf_reason:
+            raise ValueError("API URL 不安全: %s" % ssrf_reason)
         validate_token(token)
         self._base_url = base_url.rstrip('/')
         self._token = token
@@ -55,6 +100,13 @@ class APIClient:
         self._timeout = timeout
         # 使用系统 CA 验证，不支持自签名证书（API 服务端本身是证书签发方，应有有效证书）
         self._ssl_ctx = ssl.create_default_context()
+        # DNS Rebinding 防护的安全 opener
+        self._opener = build_opener(
+            _SafeHTTPHandler(),
+            _SafeHTTPSHandler(context=self._ssl_ctx),
+        )
+        # 上次 API 调用返回的 renew_before_days（> 0 时有效）
+        self.last_renew_before_days = 0
 
     def _request(self, method, url, data=None, max_size=MAX_RESPONSE_SIZE):
         """发送 HTTP 请求，带重试"""
@@ -75,8 +127,10 @@ class APIClient:
                     self._logger.info("API 重试 %d/%d: %s", attempt + 1, MAX_RETRIES, url)
             try:
                 req = Request(url, data=body, headers=headers, method=method)
-                ctx = self._ssl_ctx if url.startswith('https') else None
-                resp = urlopen(req, timeout=self._timeout, context=ctx)
+                timeout = self._timeout
+                if timeout is None:
+                    timeout = TIMEOUT_POST if method == 'POST' else TIMEOUT_GET
+                resp = self._opener.open(req, timeout=timeout)
                 resp_data = resp.read(max_size)
                 return json.loads(resp_data.decode('utf-8'))
             except HTTPError as e:
@@ -120,7 +174,9 @@ class APIClient:
         if self._logger:
             self._logger.info("查询订单: order_id=%s", order_id)
         result = self._request('GET', url)
-        items, total = self._parse_paginated_data(result)
+        items, total, renew_before_days = self._parse_paginated_data(result)
+        if renew_before_days > 0:
+            self.last_renew_before_days = renew_before_days
         if not items:
             raise APIError("未找到订单数据")
         return items[0]
@@ -139,7 +195,11 @@ class APIClient:
         if validation_method:
             data['validation_method'] = validation_method
         result = self._request('POST', url, data=data)
-        return self._parse_data(result)
+        cert_data = self._parse_data(result)
+        renew_before_days = cert_data.get('renew_before_days', 0)
+        if renew_before_days and int(renew_before_days) > 0:
+            self.last_renew_before_days = int(renew_before_days)
+        return cert_data
 
     def callback(self, order_id, status, deployed_at=''):
         """部署结果回调"""
@@ -152,28 +212,39 @@ class APIClient:
             'deployed_at': deployed_at,
         }
         result = self._request('POST', url, data=data, max_size=MAX_CALLBACK_RESPONSE_SIZE)
+        if isinstance(result, dict) and result.get('code') == API_CODE_SUCCESS:
+            resp_data = result.get('data') or {}
+            if isinstance(resp_data, dict):
+                renew_before_days = resp_data.get('renew_before_days', 0)
+                if renew_before_days and int(renew_before_days) > 0:
+                    self.last_renew_before_days = int(renew_before_days)
         return result
 
     def _parse_paginated_data(self, result):
-        """解析批量查询的分页响应"""
+        """解析批量查询的分页响应，返回 (items, total, renew_before_days)"""
         if not isinstance(result, dict):
             raise APIError("无效的 API 响应格式")
         code = result.get('code', 0)
         if code != API_CODE_SUCCESS:
             raise APIError(result.get('msg', '未知错误'), code=code)
         data = result.get('data')
+        # renew_before_days 在 data 层（与 total/data 同级）
+        renew_before_days = 0
         if data is None:
-            return [], 0
-        # 分页格式: {"total": N, "currentPage": 1, "pageSize": 100, "data": [...]}
+            return [], 0, 0
+        # 分页格式: {"total": N, "currentPage": 1, "pageSize": 100, "data": [...], "renew_before_days": N}
         if isinstance(data, dict) and 'data' in data:
             items = data.get('data', [])
             total = data.get('total', len(items))
-            return items if isinstance(items, list) else [], total
+            rbd = data.get('renew_before_days', 0)
+            if rbd and int(rbd) > 0:
+                renew_before_days = int(rbd)
+            return items if isinstance(items, list) else [], total, renew_before_days
         # 兼容数组格式
         if isinstance(data, list):
-            return data, len(data)
+            return data, len(data), 0
         # 兼容单对象
-        return [data], 1
+        return [data], 1, 0
 
     def query_batch(self, query=''):
         """批量查询证书，自动分页"""
@@ -187,13 +258,32 @@ class APIClient:
                 params['order'] = query
             url = _build_api_url(self._base_url) + '?' + urlencode(params)
             result = self._request('GET', url, max_size=BATCH_MAX_RESPONSE_SIZE)
-            items, total = self._parse_paginated_data(result)
+            items, total, renew_before_days = self._parse_paginated_data(result)
+            if renew_before_days > 0:
+                self.last_renew_before_days = renew_before_days
             all_certs.extend(items)
             if len(all_certs) >= total or not items:
                 break
         if self._logger:
             self._logger.info("批量查询完成: 共 %d 条", len(all_certs))
         return all_certs
+
+    def toggle_auto_reissue(self, order_id, auto_reissue):
+        """切换订单自动续签开关（非关键路径，失败仅记日志）"""
+        url = _build_api_url(self._base_url, '/auto-reissue')
+        if self._logger:
+            self._logger.info("toggle_auto_reissue: order_id=%s, auto_reissue=%s", order_id, auto_reissue)
+        data = {
+            'order_id': int(order_id),
+            'auto_reissue': bool(auto_reissue),
+        }
+        try:
+            result = self._request('POST', url, data=data)
+            return result
+        except Exception as e:
+            if self._logger:
+                self._logger.warning("toggle_auto_reissue 失败: order_id=%s, error=%s", order_id, str(e))
+            return None
 
     def test_connection(self):
         """测试 API 连接"""

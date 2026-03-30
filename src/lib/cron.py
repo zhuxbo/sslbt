@@ -34,7 +34,7 @@ def _cron_db_path():
 
 
 def _find_cron_ids():
-    """直接查数据库找到所有同名计划任务 ID"""
+    """通过脚本内容匹配插件路径，找到所有本插件的计划任务 ID"""
     db_path = _cron_db_path()
     if not os.path.exists(db_path):
         return []
@@ -42,7 +42,8 @@ def _find_cron_ids():
         conn = sqlite3.connect(db_path)
         try:
             rows = conn.execute(
-                'SELECT id FROM crontab WHERE name = ?', (CRON_NAME,)
+                "SELECT id FROM crontab WHERE sBody LIKE ?",
+                ('%' + PLUGIN_DIR + '%',),
             ).fetchall()
             return [r[0] for r in rows]
         finally:
@@ -63,7 +64,7 @@ class CronManager:
         self.remove()
 
         script = self._build_script()
-        run_hour = random.randint(0, 23)
+        run_hour = random.randint(9, 23)
         run_minute = random.randint(0, 59)
 
         try:
@@ -86,6 +87,7 @@ class CronManager:
             )
 
             cron_obj.AddCrontab(params)
+            self._dedup(cron_obj)
             if self._logger:
                 self._logger.info("计划任务创建成功: 每天 %d:%02d", run_hour, run_minute)
             return {'status': True, 'message': '计划任务已创建'}
@@ -121,8 +123,8 @@ class CronManager:
                 conn.row_factory = sqlite3.Row
                 row = conn.execute(
                     'SELECT id, status, type, where1, where_hour, where_minute, addtime'
-                    ' FROM crontab WHERE name = ? LIMIT 1',
-                    (CRON_NAME,),
+                    " FROM crontab WHERE sBody LIKE ? LIMIT 1",
+                    ('%' + PLUGIN_DIR + '%',),
                 ).fetchone()
             finally:
                 conn.close()
@@ -138,6 +140,21 @@ class CronManager:
             }
         except Exception:
             return {'exists': False}
+
+    def _dedup(self, cron_obj):
+        """保留最新一条同名任务，删除多余的"""
+        ids = _find_cron_ids()
+        if len(ids) <= 1:
+            return
+        keep_id = max(ids)
+        for cron_id in ids:
+            if cron_id != keep_id:
+                try:
+                    cron_obj.DelCrontab(_BtParams(id=cron_id))
+                    if self._logger:
+                        self._logger.info("清理重复任务: id=%s", cron_id)
+                except Exception:
+                    pass
 
     def _build_script(self):
         """构建续签检查脚本"""

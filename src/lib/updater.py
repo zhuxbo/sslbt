@@ -4,13 +4,37 @@ import os
 import json
 import hashlib
 import shutil
+import ssl
 import tempfile
 import zipfile
-from urllib.request import Request, urlopen
+from urllib.parse import urlparse
+from urllib.request import Request, build_opener
+
+from .api_client import _SafeHTTPHandler, _SafeHTTPSHandler
+from .net_guard import check_ssrf
 
 MAX_RELEASES_SIZE = 256 * 1024
 MAX_ZIP_SIZE = 10 * 1024 * 1024
 CONNECT_TIMEOUT = 15
+
+_ALLOWED_CHANNELS = ('main', 'dev')
+_ALLOWED_HTTP_HOSTS = ('localhost', '127.0.0.1', '::1')
+
+
+def _enforce_https(url):
+    """spec 10.5: 升级下载必须 HTTPS，仅 loopback 允许 HTTP"""
+    parsed = urlparse(url)
+    if parsed.scheme == 'https':
+        return
+    if parsed.scheme == 'http' and parsed.hostname in _ALLOWED_HTTP_HOSTS:
+        return
+    raise ValueError("升级地址必须使用 HTTPS（仅 localhost 允许 HTTP）")
+
+
+def _validate_channel(channel):
+    """spec 10.5: 通道白名单，防止路径遍历"""
+    if channel not in _ALLOWED_CHANNELS:
+        raise ValueError("无效的升级通道: %s" % channel)
 
 
 def compare_versions(v1, v2):
@@ -53,6 +77,11 @@ class Updater:
         self._plugin_dir = plugin_dir
         self._config = config_manager
         self._logger = logger
+        ssl_ctx = ssl.create_default_context()
+        self._opener = build_opener(
+            _SafeHTTPHandler(),
+            _SafeHTTPSHandler(context=ssl_ctx),
+        )
 
     def _get_current_version(self):
         info_path = os.path.join(self._plugin_dir, 'info.json')
@@ -68,36 +97,50 @@ class Updater:
 
     def _fetch_releases(self, release_url):
         url = release_url.rstrip('/') + '/releases.json'
+        _enforce_https(url)
+        ssrf_reason = check_ssrf(url)
+        if ssrf_reason:
+            raise ValueError("升级地址不安全: %s" % ssrf_reason)
         req = Request(url, headers={'User-Agent': 'sslbt-plugin'})
-        resp = urlopen(req, timeout=CONNECT_TIMEOUT)
+        resp = self._opener.open(req, timeout=CONNECT_TIMEOUT)
         data = resp.read(MAX_RELEASES_SIZE)
         return json.loads(data)
 
+    # sslbt 产物文件名
+    ARTIFACT_NAME = 'sslbt.zip'
+
     def _parse_releases(self, releases_data, channel):
+        """解析 releases.json（spec 6.1: 通道做顶层 key）
+
+        格式: {main: {latest, versions: [{version, released_at, checksums: {filename: hash}}]}, dev: ...}
+        """
         current = self._get_current_version()
-        ch = releases_data.get('channels', {}).get(channel, {})
+        ch = releases_data.get(channel, {})
+        if not ch:
+            return {'has_update': False, 'current_version': current}
+
         latest = ch.get('latest', '')
         if not latest:
             return {'has_update': False, 'current_version': current}
-
         if not latest.startswith('v'):
             latest = 'v' + latest
 
         has_update = compare_versions(current, latest) < 0
-        download_path = ''
-        for v_entry in ch.get('versions', []):
-            if v_entry.get('version') == latest:
-                download_path = v_entry.get('path', '')
-                break
 
-        ver_info = releases_data.get('versions', {}).get(latest, {})
-        checksum = ver_info.get('checksums', {}).get('sslbt.zip', '')
+        # 在 versions 中找到 latest 对应条目，提取 checksum
+        checksum = ''
+        for v in ch.get('versions', []):
+            ver = v.get('version', '')
+            if not ver.startswith('v'):
+                ver = 'v' + ver
+            if ver == latest:
+                checksum = v.get('checksums', {}).get(self.ARTIFACT_NAME, '')
+                break
 
         return {
             'has_update': has_update,
             'current_version': current,
             'latest_version': latest,
-            'download_path': download_path,
             'checksum': checksum,
         }
 
@@ -107,7 +150,8 @@ class Updater:
         if not release_url:
             return {'has_update': False, 'error': '未配置更新地址'}
 
-        channel = cfg.get('update_channel', 'main')
+        channel = cfg.get('upgrade_channel', 'main')
+        _validate_channel(channel)
         try:
             releases = self._fetch_releases(release_url)
             return self._parse_releases(releases, channel)
@@ -130,10 +174,13 @@ class Updater:
         return h.hexdigest() == expected_hash
 
     def _safe_extract(self, zip_path, target_dir):
-        """安全解压：跳过 data/，路径遍历防护（realpath 检查），清除 __pycache__"""
+        """安全解压：符号链接拒绝、跳过 data/、路径遍历防护、权限设置、清除 __pycache__"""
         real_target = os.path.realpath(target_dir)
         with zipfile.ZipFile(zip_path, 'r') as zf:
             for info in zf.infolist():
+                # spec 10.2: 符号链接防护
+                if info.external_attr >> 28 == 0xA:
+                    raise ValueError("ZIP 包含符号链接: %s" % info.filename)
                 name = info.filename
                 if name.startswith('data/') or name == 'data':
                     continue
@@ -142,35 +189,46 @@ class Updater:
                     raise ValueError("unsafe path in zip: %s" % name)
                 if info.is_dir():
                     os.makedirs(target_path, exist_ok=True)
+                    os.chmod(target_path, 0o700)
                     continue
-                os.makedirs(os.path.dirname(target_path), exist_ok=True)
+                parent = os.path.dirname(target_path)
+                os.makedirs(parent, exist_ok=True)
+                if parent != real_target:
+                    os.chmod(parent, 0o700)
                 with zf.open(info) as src, open(target_path, 'wb') as dst:
                     shutil.copyfileobj(src, dst)
+                os.chmod(target_path, 0o600)
 
         for root, dirs, _files in os.walk(target_dir):
             for d in dirs[:]:
                 if d == '__pycache__':
                     shutil.rmtree(os.path.join(root, d), ignore_errors=True)
 
-    def do_update(self, version, release_url=None, download_path=None, checksum=''):
+    def do_update(self, version, release_url=None, channel=None, checksum=''):
         if release_url is None:
             cfg = self._config.get_config()
             release_url = cfg.get('release_url', '')
         if not release_url:
             raise ValueError("未配置更新地址")
+        if channel is None:
+            cfg = self._config.get_config()
+            channel = cfg.get('upgrade_channel', 'main')
+        _validate_channel(channel)
 
-        if download_path:
-            url = "%s/%s/sslbt.zip" % (release_url.rstrip('/'), download_path)
-        else:
-            channel = 'dev' if '-' in version else 'main'
-            url = "%s/%s/%s/sslbt.zip" % (release_url.rstrip('/'), channel, version)
+        # spec 6.3: GET {release_url}/{channel}/v{version}/{filename}
+        ver = version if version.startswith('v') else 'v' + version
+        url = "%s/%s/%s/%s" % (release_url.rstrip('/'), channel, ver, self.ARTIFACT_NAME)
+        _enforce_https(url)
+        ssrf_reason = check_ssrf(url)
+        if ssrf_reason:
+            raise ValueError("升级地址不安全: %s" % ssrf_reason)
 
         fd, tmp_path = tempfile.mkstemp(suffix='.zip')
         try:
             os.close(fd)
             self._logger.info("下载更新: %s", url)
             req = Request(url, headers={'User-Agent': 'sslbt-plugin'})
-            resp = urlopen(req, timeout=30)
+            resp = self._opener.open(req, timeout=30)
             with open(tmp_path, 'wb') as f:
                 while True:
                     chunk = resp.read(8192)

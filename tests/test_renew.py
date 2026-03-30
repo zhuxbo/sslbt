@@ -129,9 +129,26 @@ class TestRenewEngine:
         assert results == []
 
     def test_retry_count_limit(self, engine):
-        cert = _make_cert_entry(10, renew_mode='local', retry_count=MAX_ISSUE_RETRY_COUNT)
+        """retry_count > MAX_ISSUE_RETRY_COUNT 时拒绝（spec 3.2: > 10）"""
+        cert = _make_cert_entry(10, renew_mode='local', retry_count=MAX_ISSUE_RETRY_COUNT + 1)
         with pytest.raises(RuntimeError, match='上限'):
             engine._renew_local(cert, engine._mock_api)
+
+    @patch('lib.renew.cert_utils.generate_csr')
+    def test_retry_count_at_limit_still_allowed(self, mock_csr, engine, tmp_data_dir):
+        """retry_count == MAX_ISSUE_RETRY_COUNT 时仍允许一次（spec: > 10 才停止）"""
+        mock_csr.return_value = ('CSR-PEM', 'KEY-PEM', 'hash123')
+        engine._mock_api.submit_csr.return_value = {'status': 'processing'}
+        cert = _make_cert_entry(10, renew_mode='local', retry_count=MAX_ISSUE_RETRY_COUNT)
+        engine._config.add_cert(
+            order_id=cert['order_id'],
+            cert_name=cert['cert_name'],
+            domains=cert['domains'],
+            site_names=cert['site_name'],
+        )
+        engine._config.update_metadata(cert['order_id'], cert['metadata'])
+        # 不应抛出异常
+        engine._renew_local(cert, engine._mock_api)
 
     @patch('lib.renew.cert_utils.generate_csr')
     def test_local_submit_csr(self, mock_csr, engine, tmp_data_dir):
@@ -208,10 +225,10 @@ class TestRenewEngine:
         assert result is True
         engine._deployer.deploy_multi.assert_called_once()
 
-    def test_local_handle_processing_timeout(self, engine, tmp_data_dir):
-        """CSR pending 超时 → 清除状态"""
+    def test_local_handle_processing_always_queries_api(self, engine, tmp_data_dir):
+        """processing 状态下始终查询 API，无超时自动清除"""
         cert = _make_cert_entry(10, renew_mode='local', issue_state='processing')
-        # 超时：25 小时前提交
+        # 即使提交已过很久，也继续等待
         old_time = (datetime.now(timezone.utc) - timedelta(hours=25)).strftime('%Y-%m-%dT%H:%M:%SZ')
         cert['metadata']['csr_submitted_at'] = old_time
 
@@ -221,26 +238,47 @@ class TestRenewEngine:
             domains=cert['domains'],
             site_names=cert['site_name'],
         )
+        engine._mock_api.query_order.return_value = {'status': 'processing'}
         result = engine._handle_processing(cert, engine._mock_api)
         assert result is False
-        # 不应该查询 API（超时直接清除）
-        engine._mock_api.query_order.assert_not_called()
+        # 仍然查询 API（无超时逻辑）
+        engine._mock_api.query_order.assert_called_once()
 
-    def test_retry_count_reset(self, engine, tmp_data_dir):
-        """超过 7 天自动重置重试计数"""
-        cert = _make_cert_entry(10, renew_mode='local', retry_count=5)
-        old_time = (datetime.now(timezone.utc) - timedelta(days=8)).strftime('%Y-%m-%dT%H:%M:%SZ')
-        cert['metadata']['csr_submitted_at'] = old_time
-
+    def test_retry_count_no_auto_reset(self, engine, tmp_data_dir):
+        """重试次数超限后等待人工处理，不自动重置"""
+        cert = _make_cert_entry(10, renew_mode='local', retry_count=MAX_ISSUE_RETRY_COUNT + 1)
         engine._config.add_cert(
             order_id=cert['order_id'],
             cert_name=cert['cert_name'],
             domains=cert['domains'],
             site_names=cert['site_name'],
         )
-        engine._check_retry_reset(cert['order_id'], cert['metadata'])
-        updated = engine._config.get_cert(cert['order_id'])
-        assert updated['metadata']['issue_retry_count'] == 0
+        # 超过上限直接抛出，不自动重置
+        with pytest.raises(RuntimeError, match='上限'):
+            engine._renew_local(cert, engine._mock_api)
+
+    def test_front_filter_skips_retry_exceeded(self, tmp_data_dir):
+        """前置过滤阶段跳过 local 模式重试超限的证书（spec 3.2）"""
+        config = ConfigManager(tmp_data_dir)
+        mock_api = MagicMock()
+        api_factory = MagicMock(return_value=mock_api)
+        deployer = MagicMock()
+        logger = MagicMock()
+        engine = RenewEngine(config, api_factory, deployer, logger)
+
+        cert = _make_cert_entry(10, renew_mode='local', retry_count=MAX_ISSUE_RETRY_COUNT + 1)
+        config.add_cert(
+            order_id=cert['order_id'],
+            cert_name=cert['cert_name'],
+            domains=cert['domains'],
+            site_names=cert['site_name'],
+            renew_mode='local',
+        )
+        config.update_metadata(cert['order_id'], cert['metadata'])
+        results = engine.check_and_renew_all()
+        assert results == []
+        # 不应创建 API 客户端（前置过滤即跳过）
+        api_factory.assert_not_called()
 
     def test_check_and_renew_all_api_none(self, tmp_data_dir):
         """api_factory 返回 None 时证书被跳过且记录 warn"""
@@ -261,8 +299,8 @@ class TestRenewEngine:
         config.update_metadata(cert['order_id'], cert['metadata'])
         results = engine.check_and_renew_all()
         assert results == []
-        logger.warn.assert_called_once()
-        assert 'API' in str(logger.warn.call_args) or 'api' in str(logger.warn.call_args).lower()
+        logger.warning.assert_called_once()
+        assert 'API' in str(logger.warning.call_args) or 'api' in str(logger.warning.call_args).lower()
 
     @patch('lib.renew.time.sleep')
     def test_spread_adds_delay(self, mock_sleep, tmp_data_dir):
@@ -362,7 +400,7 @@ class TestRenewEngine:
         assert len(results) == 1
         assert results[0]['order_id'] == 1002
         assert results[0]['status'] == 'success'
-        logger.warn.assert_called_once()
+        logger.warning.assert_called_once()
 
     def test_expired_cert_skipped(self, tmp_data_dir):
         """已过期证书不触发续签"""
@@ -418,8 +456,56 @@ class TestRenewEngine:
         results = engine.check_and_renew_all(spread=False)
         assert len(results) == MAX_RENEW_BATCH
         # 应记录截断警告
-        warn_calls = [str(c) for c in logger.warn.call_args_list]
+        warn_calls = [str(c) for c in logger.warning.call_args_list]
         assert any('截断' in s or '上限' in s for s in warn_calls)
+
+    def test_pull_renew_updates_renew_before_days(self, engine, tmp_data_dir):
+        """Pull 模式：query_order 返回 renew_before_days 时更新全局配置"""
+        mock_api = MagicMock()
+        mock_api.last_renew_before_days = 21
+        mock_api.query_order.return_value = {
+            'status': 'active',
+            'certificate': '---CERT---',
+            'ca_certificate': '---CA---',
+            'private_key': '---KEY---',
+        }
+        cert = _make_cert_entry(10)
+        engine._config.add_cert(
+            order_id=cert['order_id'],
+            cert_name=cert['cert_name'],
+            domains=cert['domains'],
+            site_names=cert['site_name'],
+        )
+        engine._renew_pull(cert, mock_api)
+        cfg = engine._config.get_config()
+        assert cfg['schedule']['renew_before_days'] == 21
+
+    @patch('lib.renew.cert_utils.generate_csr')
+    def test_local_submit_csr_updates_renew_before_days(self, mock_csr, engine, tmp_data_dir):
+        """Local 模式：submit_csr 返回 renew_before_days 时更新全局配置"""
+        mock_csr.return_value = ('CSR-PEM', 'KEY-PEM', 'hash123')
+        mock_api = MagicMock()
+        mock_api.last_renew_before_days = 30
+        mock_api.submit_csr.return_value = {'status': 'processing'}
+        cert = _make_cert_entry(10, renew_mode='local')
+        engine._config.add_cert(
+            order_id=cert['order_id'],
+            cert_name=cert['cert_name'],
+            domains=cert['domains'],
+            site_names=cert['site_name'],
+        )
+        engine._submit_new_csr(cert, mock_api)
+        cfg = engine._config.get_config()
+        assert cfg['schedule']['renew_before_days'] == 30
+
+    def test_update_renew_before_days_zero_ignored(self, engine):
+        """last_renew_before_days 为 0 时不更新配置"""
+        mock_api = MagicMock()
+        mock_api.last_renew_before_days = 0
+        engine._config.save_config({'schedule': {'renew_before_days': 14, 'renew_mode': 'pull'}})
+        engine._update_renew_before_days(mock_api)
+        cfg = engine._config.get_config()
+        assert cfg['schedule']['renew_before_days'] == 14
 
 
 class TestOrderUpdate:
@@ -548,7 +634,7 @@ class TestOrderUpdate:
         assert engine._config.get_cert(11111) is not None
         # deploy_multi 使用了旧 order_id
         assert engine._deployer.deploy_multi.call_args[1]['order_id'] == 11111
-        engine._logger.warn.assert_called()
+        engine._logger.warning.assert_called()
 
 
 class TestCalcSpreadDelay:
@@ -692,8 +778,8 @@ class TestFileVerifyIntegration:
         engine._file_verifier.cleanup_files.assert_called()
         engine._file_verifier.place_file.assert_called()
 
-    def test_handle_processing_timeout_cleans_verify_files(self, engine_with_verifier, tmp_data_dir):
-        """CSR 超时时也清理验证文件"""
+    def test_handle_processing_no_timeout_no_cleanup(self, engine_with_verifier, tmp_data_dir):
+        """processing 状态无超时，不会因时间而自动清理验证文件"""
         engine = engine_with_verifier
         cert = _make_cert_entry(10, renew_mode='local', issue_state='processing')
         old_time = (datetime.now(timezone.utc) - timedelta(hours=25)).strftime('%Y-%m-%dT%H:%M:%SZ')
@@ -704,9 +790,11 @@ class TestFileVerifyIntegration:
             order_id=cert['order_id'], cert_name=cert['cert_name'],
             domains=cert['domains'], site_names=cert['site_name'],
         )
+        engine._mock_api.query_order.return_value = {'status': 'processing'}
         result = engine._handle_processing(cert, engine._mock_api)
         assert result is False
-        engine._file_verifier.cleanup_files.assert_called_once()
+        # 仍在 processing，不清理验证文件（无超时）
+        engine._file_verifier.cleanup_files.assert_not_called()
 
     def test_submit_csr_without_file_verifier(self, tmp_data_dir):
         """file_verifier=None 时文件验证代码不执行"""

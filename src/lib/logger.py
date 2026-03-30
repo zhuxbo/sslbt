@@ -98,7 +98,7 @@ class Logger:
         self._ensure_date()
         self._logger.info(msg, *args)
 
-    def warn(self, msg, *args):
+    def warning(self, msg, *args):
         self._ensure_date()
         self._logger.warning(msg, *args)
 

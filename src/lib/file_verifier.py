@@ -53,7 +53,7 @@ class FileVerifier:
             site = self._site_mgr.get_site(site_name)
             if not site:
                 if self._logger:
-                    self._logger.warn("站点不存在，跳过: %s", site_name)
+                    self._logger.warning("站点不存在，跳过: %s", site_name)
                 continue
 
             site_root = site.get('path', '')
@@ -71,10 +71,10 @@ class FileVerifier:
                 _set_own(full_path, 'www')
                 placed.append(full_path)
                 if self._logger:
-                    self._logger.info("验证文件已放置: %s", full_path)
+                    self._logger.info("验证文件已放置: %s", rel_path)
             except OSError as e:
                 if self._logger:
-                    self._logger.error("写入验证文件失败: %s, error=%s", full_path, str(e))
+                    self._logger.error("写入验证文件失败: %s, error=%s", rel_path, str(e))
 
         return placed
 
@@ -92,7 +92,7 @@ class FileVerifier:
                 if os.path.isfile(path):
                     os.remove(path)
                     if self._logger:
-                        self._logger.info("验证文件已清理: %s", path)
+                        self._logger.info("验证文件已清理: %s", os.path.basename(path))
                 # 尝试清理空目录（acme-challenge → .well-known）
                 dir_path = os.path.dirname(path)
                 for _ in range(2):
@@ -103,7 +103,7 @@ class FileVerifier:
                         break
             except OSError as e:
                 if self._logger:
-                    self._logger.warn("清理验证文件失败: %s, error=%s", path, str(e))
+                    self._logger.warning("清理验证文件失败: %s, error=%s", os.path.basename(path), str(e))
 
     @staticmethod
     def _is_safe_path(rel_path):

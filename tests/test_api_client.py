@@ -2,7 +2,7 @@
 
 import json
 import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock
 from urllib.error import HTTPError
 from io import BytesIO
 
@@ -40,7 +40,9 @@ class TestBuildAPIURL:
 class TestAPIClient:
     @pytest.fixture
     def client(self):
-        return APIClient('https://api.example.com', 'a' * 32)
+        c = APIClient('https://api.example.com', 'a' * 32)
+        c._opener = MagicMock()
+        return c
 
     def test_init_empty_url(self):
         with pytest.raises(ValueError, match='URL'):
@@ -58,8 +60,22 @@ class TestAPIClient:
         with pytest.raises(ValueError, match='http'):
             APIClient('ftp://server.com', 'a' * 32)
 
-    @patch('lib.api_client.urlopen')
-    def test_query_order_success(self, mock_urlopen, client):
+    def test_init_http_non_loopback_rejected(self):
+        """非 loopback 地址必须使用 HTTPS（spec 10.1）"""
+        with pytest.raises(ValueError, match='HTTPS'):
+            APIClient('http://api.example.com', 'a' * 32)
+
+    def test_init_http_localhost_allowed(self):
+        """localhost 允许 HTTP"""
+        c = APIClient('http://localhost:8080', 'a' * 32)
+        assert c is not None
+
+    def test_init_http_127_allowed(self):
+        """127.0.0.1 允许 HTTP"""
+        c = APIClient('http://127.0.0.1:8080', 'a' * 32)
+        assert c is not None
+
+    def test_query_order_success(self, client):
         resp_data = json.dumps({
             'code': 1,
             'msg': 'success',
@@ -79,32 +95,29 @@ class TestAPIClient:
         }).encode()
         mock_resp = MagicMock()
         mock_resp.read.return_value = resp_data
-        mock_urlopen.return_value = mock_resp
+        client._opener.open.return_value = mock_resp
 
         result = client.query_order(12345)
         assert result['status'] == 'active'
         assert result['order_id'] == 12345
 
-    @patch('lib.api_client.urlopen')
-    def test_query_order_api_error(self, mock_urlopen, client):
+    def test_query_order_api_error(self, client):
         resp_data = json.dumps({'code': 0, 'msg': '订单不存在'}).encode()
         mock_resp = MagicMock()
         mock_resp.read.return_value = resp_data
-        mock_urlopen.return_value = mock_resp
+        client._opener.open.return_value = mock_resp
 
         with pytest.raises(APIError, match='订单不存在'):
             client.query_order(99999)
 
-    @patch('lib.api_client.urlopen')
-    def test_query_order_401(self, mock_urlopen, client):
-        mock_urlopen.side_effect = HTTPError(
+    def test_query_order_401(self, client):
+        client._opener.open.side_effect = HTTPError(
             'https://api.example.com', 401, 'Unauthorized', {}, BytesIO(b'')
         )
         with pytest.raises(APIError, match='认证失败'):
             client.query_order(12345)
 
-    @patch('lib.api_client.urlopen')
-    def test_query_order_empty_result(self, mock_urlopen, client):
+    def test_query_order_empty_result(self, client):
         """测试查询无结果时抛出异常"""
         resp_data = json.dumps({
             'code': 1,
@@ -118,17 +131,16 @@ class TestAPIClient:
         }).encode()
         mock_resp = MagicMock()
         mock_resp.read.return_value = resp_data
-        mock_urlopen.return_value = mock_resp
+        client._opener.open.return_value = mock_resp
 
         with pytest.raises(APIError, match='未找到订单数据'):
             client.query_order(99999)
 
-    @patch('lib.api_client.urlopen')
-    def test_callback(self, mock_urlopen, client):
+    def test_callback(self, client):
         resp_data = json.dumps({'code': 1, 'msg': 'success'}).encode()
         mock_resp = MagicMock()
         mock_resp.read.return_value = resp_data
-        mock_urlopen.return_value = mock_resp
+        client._opener.open.return_value = mock_resp
 
         result = client.callback(
             order_id=12345,
@@ -137,48 +149,127 @@ class TestAPIClient:
         )
         assert result['code'] == 1
 
-    @patch('lib.api_client.urlopen')
-    def test_test_connection_success(self, mock_urlopen, client):
+    def test_test_connection_success(self, client):
         resp_data = json.dumps({'code': 1, 'msg': 'ok', 'data': {}}).encode()
         mock_resp = MagicMock()
         mock_resp.read.return_value = resp_data
-        mock_urlopen.return_value = mock_resp
+        client._opener.open.return_value = mock_resp
 
         ok, msg = client.test_connection()
         assert ok is True
 
-    @patch('lib.api_client.urlopen')
-    def test_test_connection_auth_fail(self, mock_urlopen, client):
-        mock_urlopen.side_effect = HTTPError(
+    def test_test_connection_auth_fail(self, client):
+        client._opener.open.side_effect = HTTPError(
             'https://api.example.com', 401, 'Unauthorized', {}, BytesIO(b'')
         )
         ok, msg = client.test_connection()
         assert ok is False
         assert '认证失败' in msg
 
-    @patch('lib.api_client.urlopen')
-    def test_submit_csr_without_validation_method(self, mock_urlopen, client):
+    def test_submit_csr_without_validation_method(self, client):
         """submit_csr 不传 validation_method 时不包含该字段"""
         resp_data = json.dumps({'code': 1, 'data': {'status': 'processing'}}).encode()
         mock_resp = MagicMock()
         mock_resp.read.return_value = resp_data
-        mock_urlopen.return_value = mock_resp
+        client._opener.open.return_value = mock_resp
 
         client.submit_csr(123, 'csr-pem', ['a.com'])
-        call_args = mock_urlopen.call_args
+        call_args = client._opener.open.call_args
         body = json.loads(call_args[0][0].data.decode('utf-8'))
         assert 'validation_method' not in body
         assert body['order_id'] == 123
 
-    @patch('lib.api_client.urlopen')
-    def test_submit_csr_with_validation_method(self, mock_urlopen, client):
+    def test_submit_csr_with_validation_method(self, client):
         """submit_csr 传入 validation_method 时包含该字段"""
         resp_data = json.dumps({'code': 1, 'data': {'status': 'processing'}}).encode()
         mock_resp = MagicMock()
         mock_resp.read.return_value = resp_data
-        mock_urlopen.return_value = mock_resp
+        client._opener.open.return_value = mock_resp
 
         client.submit_csr(123, 'csr-pem', ['a.com'], validation_method='file')
-        call_args = mock_urlopen.call_args
+        call_args = client._opener.open.call_args
         body = json.loads(call_args[0][0].data.decode('utf-8'))
         assert body['validation_method'] == 'file'
+
+    def test_query_order_caches_renew_before_days(self, client):
+        """query_order 响应中 renew_before_days 被缓存到 last_renew_before_days"""
+        resp_data = json.dumps({
+            'code': 1,
+            'data': {
+                'total': 1,
+                'currentPage': 1,
+                'pageSize': 100,
+                'renew_before_days': 21,
+                'data': [{'order_id': 1, 'status': 'active'}],
+            }
+        }).encode()
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = resp_data
+        client._opener.open.return_value = mock_resp
+
+        client.query_order(1)
+        assert client.last_renew_before_days == 21
+
+    def test_query_order_no_renew_before_days(self, client):
+        """响应中没有 renew_before_days 时 last_renew_before_days 保持 0"""
+        resp_data = json.dumps({
+            'code': 1,
+            'data': {
+                'total': 1,
+                'data': [{'order_id': 1, 'status': 'active'}],
+            }
+        }).encode()
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = resp_data
+        client._opener.open.return_value = mock_resp
+
+        client.query_order(1)
+        assert client.last_renew_before_days == 0
+
+    def test_submit_csr_caches_renew_before_days(self, client):
+        """submit_csr 响应中 renew_before_days 被缓存"""
+        resp_data = json.dumps({
+            'code': 1,
+            'data': {'status': 'processing', 'renew_before_days': 30},
+        }).encode()
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = resp_data
+        client._opener.open.return_value = mock_resp
+
+        client.submit_csr(123, 'csr-pem', ['a.com'])
+        assert client.last_renew_before_days == 30
+
+    def test_callback_caches_renew_before_days(self, client):
+        """callback 响应中 renew_before_days 被缓存"""
+        resp_data = json.dumps({
+            'code': 1,
+            'data': {'renew_before_days': 14},
+        }).encode()
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = resp_data
+        client._opener.open.return_value = mock_resp
+
+        client.callback(123, 'success')
+        assert client.last_renew_before_days == 14
+
+    def test_toggle_auto_reissue_success(self, client):
+        """toggle_auto_reissue 成功调用并返回结果"""
+        resp_data = json.dumps({'code': 1, 'msg': 'ok'}).encode()
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = resp_data
+        client._opener.open.return_value = mock_resp
+
+        result = client.toggle_auto_reissue(123, True)
+        assert result is not None
+        call_args = client._opener.open.call_args
+        body = json.loads(call_args[0][0].data.decode('utf-8'))
+        assert body['order_id'] == 123
+        assert body['auto_reissue'] is True
+
+    def test_toggle_auto_reissue_failure_returns_none(self, client):
+        """toggle_auto_reissue 失败时返回 None，不抛异常"""
+        from urllib.error import URLError
+        client._opener.open.side_effect = URLError('connection refused')
+
+        result = client.toggle_auto_reissue(123, False)
+        assert result is None

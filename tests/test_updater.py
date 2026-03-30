@@ -2,10 +2,13 @@
 
 import os
 import json
+import stat
+import struct
 import tempfile
 import shutil
 import hashlib
 import zipfile
+from unittest.mock import patch, MagicMock
 import pytest
 
 
@@ -31,30 +34,27 @@ def updater_env(tmp_data_dir):
     shutil.rmtree(plugin_dir, ignore_errors=True)
 
 
+# spec 6.1: 通道做顶层 key，checksums 按文件名索引
 SAMPLE_RELEASES = {
-    'latest_main': 'v2.0.0',
-    'latest_dev': 'v2.1.0-beta',
-    'channels': {
-        'main': {
-            'latest': 'v2.0.0',
-            'versions': [{
-                'version': 'v2.0.0',
-                'date': '2026-03-18',
-                'path': 'main/v2.0.0',
-            }],
-        },
-        'dev': {
-            'latest': 'v2.1.0-beta',
-            'versions': [{
-                'version': 'v2.1.0-beta',
-                'date': '2026-03-18',
-                'path': 'dev/v2.1.0-beta',
-            }],
-        },
+    'main': {
+        'latest': '2.0.0',
+        'versions': [
+            {
+                'version': '2.0.0',
+                'released_at': '2026-03-20',
+                'checksums': {'sslbt.zip': 'sha256:abc123'},
+            },
+        ],
     },
-    'versions': {
-        'v2.0.0': {'checksums': {'sslbt.zip': 'sha256:abc123'}},
-        'v2.1.0-beta': {'checksums': {'sslbt.zip': 'sha256:def456'}},
+    'dev': {
+        'latest': '2.1.0-beta',
+        'versions': [
+            {
+                'version': '2.1.0-beta',
+                'released_at': '2026-03-28',
+                'checksums': {'sslbt.zip': 'sha256:def456'},
+            },
+        ],
     },
 }
 
@@ -66,7 +66,7 @@ class TestParseReleasesJson:
         result = u._parse_releases(SAMPLE_RELEASES, 'main')
         assert result['has_update'] is True
         assert result['latest_version'] == 'v2.0.0'
-        assert 'notes' not in result
+        assert result['checksum'] == 'sha256:abc123'
 
     def test_no_update_same_version(self, updater_env):
         from lib.updater import Updater
@@ -83,6 +83,14 @@ class TestParseReleasesJson:
         result = u._parse_releases(SAMPLE_RELEASES, 'dev')
         assert result['has_update'] is True
         assert result['latest_version'] == 'v2.1.0-beta'
+        assert result['checksum'] == 'sha256:def456'
+
+    def test_missing_channel(self, updater_env):
+        """不存在的通道返回 no update"""
+        from lib.updater import Updater
+        u = Updater(updater_env['plugin_dir'], updater_env['config'], updater_env['logger'])
+        result = u._parse_releases(SAMPLE_RELEASES, 'nope')
+        assert result['has_update'] is False
 
 
 class TestVersionCompare:
@@ -194,3 +202,133 @@ class TestVerifyChecksum:
         assert u._verify_checksum(test_file, None) is False
         content = updater_env['logger'].get_logs()
         assert '校验和' in content
+
+
+class TestHTTPSEnforcement:
+    """spec 10.5: 升级下载必须 HTTPS"""
+
+    def test_https_url_passes(self):
+        from lib.updater import _enforce_https
+        _enforce_https('https://release.example.com/releases.json')
+
+    def test_http_localhost_passes(self):
+        from lib.updater import _enforce_https
+        _enforce_https('http://localhost/releases.json')
+        _enforce_https('http://127.0.0.1/releases.json')
+        _enforce_https('http://[::1]/releases.json')
+
+    def test_http_remote_rejected(self):
+        from lib.updater import _enforce_https
+        with pytest.raises(ValueError, match='HTTPS'):
+            _enforce_https('http://release.example.com/releases.json')
+
+    def test_non_http_rejected(self):
+        from lib.updater import _enforce_https
+        with pytest.raises(ValueError, match='HTTPS'):
+            _enforce_https('ftp://release.example.com/file.zip')
+
+
+class TestChannelWhitelist:
+    """spec 10.5: 通道白名单"""
+
+    def test_main_dev_allowed(self):
+        from lib.updater import _validate_channel
+        _validate_channel('main')
+        _validate_channel('dev')
+
+    def test_invalid_channel_rejected(self):
+        from lib.updater import _validate_channel
+        with pytest.raises(ValueError, match='无效'):
+            _validate_channel('../../etc')
+
+    def test_empty_channel_rejected(self):
+        from lib.updater import _validate_channel
+        with pytest.raises(ValueError, match='无效'):
+            _validate_channel('')
+
+    def test_check_update_validates_channel(self, updater_env):
+        from lib.updater import Updater
+        u = Updater(updater_env['plugin_dir'], updater_env['config'], updater_env['logger'])
+        cfg = updater_env['config'].get_config()
+        cfg['release_url'] = 'https://release.example.com'
+        cfg['upgrade_channel'] = '../../etc'
+        updater_env['config'].save_config(cfg)
+        with pytest.raises(ValueError, match='无效'):
+            u.check_update()
+
+    def test_do_update_validates_channel_param(self, updater_env):
+        from lib.updater import Updater
+        u = Updater(updater_env['plugin_dir'], updater_env['config'], updater_env['logger'])
+        with pytest.raises(ValueError, match='无效'):
+            u.do_update('1.0.0', release_url='https://example.com', channel='../evil')
+
+
+class TestSSRFProtection:
+    """spec 10.1: SSRF/DNS Rebinding 防护"""
+
+    def test_opener_has_safe_handlers(self, updater_env):
+        from lib.updater import Updater
+        from lib.api_client import _SafeHTTPHandler, _SafeHTTPSHandler
+        u = Updater(updater_env['plugin_dir'], updater_env['config'], updater_env['logger'])
+        handler_types = [type(h) for h in u._opener.handlers]
+        assert _SafeHTTPHandler in handler_types
+        assert _SafeHTTPSHandler in handler_types
+
+    @patch('lib.updater.check_ssrf', return_value='禁止访问内网地址: 10.0.0.1 (evil.com)')
+    def test_fetch_releases_rejects_internal_ip(self, mock_ssrf, updater_env):
+        from lib.updater import Updater
+        u = Updater(updater_env['plugin_dir'], updater_env['config'], updater_env['logger'])
+        with pytest.raises(ValueError, match='不安全'):
+            u._fetch_releases('https://evil.com')
+
+    @patch('lib.updater.check_ssrf', return_value='禁止访问内网地址: 192.168.1.1')
+    def test_do_update_rejects_internal_ip(self, mock_ssrf, updater_env):
+        from lib.updater import Updater
+        u = Updater(updater_env['plugin_dir'], updater_env['config'], updater_env['logger'])
+        with pytest.raises(ValueError, match='不安全'):
+            u.do_update('2.0.0', release_url='https://evil.com', channel='main')
+
+
+class TestSafeExtractSecurity:
+    """spec 10.2: 符号链接防护 + 文件权限"""
+
+    def test_reject_symlink_in_zip(self, updater_env):
+        from lib.updater import Updater
+        u = Updater(updater_env['plugin_dir'], updater_env['config'], updater_env['logger'])
+
+        zip_path = os.path.join(updater_env['data_dir'], 'symlink.zip')
+        with zipfile.ZipFile(zip_path, 'w') as zf:
+            # 创建符号链接条目：external_attr 高 4 位 = 0xA
+            info = zipfile.ZipInfo('evil_link')
+            info.external_attr = 0xA0000000 | 0o777 << 16
+            zf.writestr(info, '/etc/passwd')
+
+        with pytest.raises(ValueError, match='符号链接'):
+            u._safe_extract(zip_path, updater_env['plugin_dir'])
+
+    def test_extracted_files_have_0600(self, updater_env):
+        from lib.updater import Updater
+        u = Updater(updater_env['plugin_dir'], updater_env['config'], updater_env['logger'])
+
+        zip_path = os.path.join(updater_env['data_dir'], 'perm.zip')
+        with zipfile.ZipFile(zip_path, 'w') as zf:
+            zf.writestr('test_file.py', 'pass')
+
+        u._safe_extract(zip_path, updater_env['plugin_dir'])
+        fpath = os.path.join(updater_env['plugin_dir'], 'test_file.py')
+        mode = stat.S_IMODE(os.stat(fpath).st_mode)
+        assert mode == 0o600
+
+    def test_extracted_dirs_have_0700(self, updater_env):
+        from lib.updater import Updater
+        u = Updater(updater_env['plugin_dir'], updater_env['config'], updater_env['logger'])
+
+        zip_path = os.path.join(updater_env['data_dir'], 'perm.zip')
+        with zipfile.ZipFile(zip_path, 'w') as zf:
+            zf.writestr('subdir/', '')
+            zf.writestr('subdir/file.py', 'pass')
+
+        u._safe_extract(zip_path, updater_env['plugin_dir'])
+        dpath = os.path.join(updater_env['plugin_dir'], 'subdir')
+        mode = stat.S_IMODE(os.stat(dpath).st_mode)
+        assert mode == 0o700

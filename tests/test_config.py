@@ -12,29 +12,33 @@ class TestConfigManager:
         cfg = config_manager.get_config()
         assert 'api_url' not in cfg
         assert 'api_token' not in cfg
-        assert cfg['check_interval_hours'] == 6
-        assert cfg['renew_before_days'] == 13
-        assert cfg['renew_mode'] == 'pull'
+        assert 'check_interval_hours' not in cfg
+        assert cfg['schedule']['renew_before_days'] == 14
+        assert cfg['schedule']['renew_mode'] == 'pull'
+        assert cfg['upgrade_channel'] == 'main'
 
     def test_save_and_get_config(self, config_manager):
         config_manager.save_config({
-            'check_interval_hours': 12,
-            'renew_before_days': 15,
-            'renew_mode': 'local',
+            'release_url': '',
+            'upgrade_channel': 'main',
+            'schedule': {
+                'renew_before_days': 10,
+                'renew_mode': 'local',
+            },
         })
         cfg = config_manager.get_config()
-        assert cfg['check_interval_hours'] == 12
-        assert cfg['renew_mode'] == 'local'
+        assert cfg['schedule']['renew_before_days'] == 10
+        assert cfg['schedule']['renew_mode'] == 'local'
 
     def test_config_deep_copy(self, config_manager):
         """确保返回深拷贝"""
         cfg1 = config_manager.get_config()
-        cfg1['check_interval_hours'] = 999
+        cfg1['schedule']['renew_before_days'] = 999
         cfg2 = config_manager.get_config()
-        assert cfg2['check_interval_hours'] == 6
+        assert cfg2['schedule']['renew_before_days'] == 14
 
     def test_config_file_permissions(self, config_manager):
-        config_manager.save_config({**DEFAULT_CONFIG, 'check_interval_hours': 12})
+        config_manager.save_config(copy.deepcopy(DEFAULT_CONFIG))
         path = config_manager._config_path
         mode = oct(os.stat(path).st_mode)[-3:]
         assert mode == '600'
@@ -105,28 +109,28 @@ class TestConfigManager:
         config_manager.add_cert(12345, 'test', ['a.com'])
         cert = config_manager.get_cert(12345)
         days = config_manager.get_renew_before_days(cert)
-        assert days == 13  # 全局默认 renew_before_days=13
+        assert days == 14  # 全局默认 schedule.renew_before_days=14
 
     def test_get_renew_before_days_fallback(self, config_manager):
-        """全局 renew_before_days=0 时，统一回退到 13"""
-        config_manager.save_config({
-            **config_manager.get_config(),
-            'renew_before_days': 0,
-        })
+        """全局 schedule.renew_before_days=0 时，统一回退到 14"""
+        cfg = config_manager.get_config()
+        cfg['schedule']['renew_before_days'] = 0
+        config_manager.save_config(cfg)
         config_manager.add_cert(12345, 'test', ['a.com'], renew_mode='local')
         cert = config_manager.get_cert(12345)
         days = config_manager.get_renew_before_days(cert)
-        assert days == 13  # RENEW_DEFAULT_DAYS
+        assert days == 14  # RENEW_DEFAULT_DAYS
 
     def test_default_config_has_release_url(self, config_manager):
         cfg = config_manager.get_config()
         assert 'release_url' in cfg
         assert cfg['release_url'] == ''
 
-    def test_default_config_has_update_channel(self, config_manager):
+    def test_default_config_has_upgrade_channel(self, config_manager):
         cfg = config_manager.get_config()
-        assert 'update_channel' in cfg
-        assert cfg['update_channel'] == 'main'
+        assert 'upgrade_channel' in cfg
+        assert cfg['upgrade_channel'] == 'main'
+        assert 'update_channel' not in cfg
 
     def test_site_name_migration_string_to_list(self, config_manager):
         """旧格式 site_name 字符串自动迁移为列表"""
@@ -195,7 +199,7 @@ class TestConfigManager:
         with open(config_manager._config_path, 'w') as f:
             f.write('{invalid json!!!')
         cfg = config_manager.get_config()
-        assert cfg['renew_before_days'] == 13
+        assert cfg['schedule']['renew_before_days'] == 14
 
     def test_corrupted_config_creates_backup(self, config_manager):
         """损坏的 JSON 创建 .bak 备份"""
@@ -285,4 +289,87 @@ class TestConfigManager:
         logger = MagicMock()
         cm = ConfigManager(tmp_data_dir, logger=logger)
         cfg = cm.get_config()
-        assert cfg['renew_before_days'] == 13
+        assert cfg['schedule']['renew_before_days'] == 14
+
+    # ==================== 迁移测试 ====================
+
+    def test_migrate_flat_renew_fields(self, config_manager):
+        """旧格式顶层 renew_before_days / renew_mode 迁移到 schedule"""
+        import json
+        with open(config_manager._config_path, 'w') as f:
+            json.dump({
+                'renew_before_days': 10,
+                'renew_mode': 'local',
+                'release_url': '',
+                'update_channel': 'main',
+            }, f)
+        # 重新初始化触发迁移
+        cm = ConfigManager(config_manager._data_dir)
+        cfg = cm.get_config()
+        assert cfg['schedule']['renew_before_days'] == 10
+        assert cfg['schedule']['renew_mode'] == 'local'
+        assert 'renew_before_days' not in cfg
+        assert 'renew_mode' not in cfg
+
+    def test_migrate_update_channel_to_upgrade_channel(self, config_manager):
+        """旧格式 update_channel 迁移为 upgrade_channel"""
+        import json
+        with open(config_manager._config_path, 'w') as f:
+            json.dump({
+                'release_url': 'https://example.com',
+                'update_channel': 'dev',
+            }, f)
+        cm = ConfigManager(config_manager._data_dir)
+        cfg = cm.get_config()
+        assert cfg['upgrade_channel'] == 'dev'
+        assert 'update_channel' not in cfg
+
+    def test_migrate_removes_check_interval_hours(self, config_manager):
+        """旧格式 check_interval_hours 静默移除"""
+        import json
+        with open(config_manager._config_path, 'w') as f:
+            json.dump({
+                'check_interval_hours': 6,
+                'release_url': '',
+            }, f)
+        cm = ConfigManager(config_manager._data_dir)
+        cfg = cm.get_config()
+        assert 'check_interval_hours' not in cfg
+
+    def test_migrate_persists_on_init(self, config_manager):
+        """初始化时迁移旧配置并持久化"""
+        import json
+        with open(config_manager._config_path, 'w') as f:
+            json.dump({
+                'renew_before_days': 7,
+                'renew_mode': 'pull',
+                'update_channel': 'main',
+            }, f)
+        # 重新初始化触发迁移并持久化
+        ConfigManager(config_manager._data_dir)
+        with open(config_manager._config_path, 'r') as f:
+            saved = json.load(f)
+        assert 'renew_before_days' not in saved
+        assert 'update_channel' not in saved
+        assert saved.get('schedule', {}).get('renew_before_days') == 7
+        assert saved.get('upgrade_channel') == 'main'
+
+    def test_new_format_config_works(self, config_manager):
+        """新格式配置（schedule 嵌套）直接正常工作"""
+        config_manager.save_config({
+            'release_url': 'https://example.com',
+            'upgrade_channel': 'dev',
+            'schedule': {
+                'renew_mode': 'local',
+                'renew_before_days': 7,
+            },
+        })
+        cfg = config_manager.get_config()
+        assert cfg['upgrade_channel'] == 'dev'
+        assert cfg['schedule']['renew_mode'] == 'local'
+        assert cfg['schedule']['renew_before_days'] == 7
+
+    def test_default_renew_before_days_is_14(self, config_manager):
+        """默认 renew_before_days 为 14"""
+        cfg = config_manager.get_config()
+        assert cfg['schedule']['renew_before_days'] == 14

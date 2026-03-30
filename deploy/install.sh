@@ -28,7 +28,7 @@ while [[ $# -gt 0 ]]; do
             echo "用法: curl -fsSL <url>/install.sh | bash -s -- [host] [选项]"
             echo ""
             echo "参数:"
-            echo "  [host]         发布服务器（域名或域名+路径）"
+            echo "  [host]         发布服务器域名（默认 release.cnssl.com）"
             echo ""
             echo "选项:"
             echo "  --dev          安装测试版"
@@ -54,15 +54,8 @@ for _py in python3 /www/server/panel/pyenv/bin/python3 python; do
 done
 
 RELEASE_PATH="/sslbt"
-FALLBACK_HOST="release.cnssl.com"
-if [ -n "$RELEASE_HOST" ]; then
-    RELEASE_URL="https://${RELEASE_HOST%/}${RELEASE_PATH}"
-elif [ -n "${SSLBT_RELEASE_URL:-}" ]; then
-    RELEASE_URL="${SSLBT_RELEASE_URL%/}"
-else
-    RELEASE_URL="https://${FALLBACK_HOST}${RELEASE_PATH}"
-    echo_warn "未指定服务器，使用默认: $RELEASE_URL"
-fi
+RELEASE_HOST="${RELEASE_HOST:-release.cnssl.com}"
+RELEASE_URL="https://${RELEASE_HOST%/}${RELEASE_PATH}"
 
 [ "$EUID" -ne 0 ] && { echo_error "请使用 root 权限运行"; exit 1; }
 
@@ -70,6 +63,7 @@ PANEL_DIR="/www/server/panel"
 PLUGIN_DIR="$PANEL_DIR/plugin/sslbt"
 [ ! -d "$PANEL_DIR" ] && { echo_error "未检测到宝塔面板: $PANEL_DIR"; exit 1; }
 echo_info "宝塔面板: $PANEL_DIR"
+echo_info "发布服务器: $RELEASE_HOST"
 
 normalize_version() {
     local ver="$1"
@@ -78,7 +72,7 @@ normalize_version() {
 
 # 下载 releases.json（缓存复用）
 echo_info "获取版本信息..."
-RELEASES_JSON=$(curl -s --connect-timeout 10 "$RELEASE_URL/releases.json" 2>/dev/null)
+RELEASES_JSON=$(curl -s --connect-timeout 10 --max-filesize 262144 "$RELEASE_URL/releases.json" 2>/dev/null)
 
 get_target_version() {
     if [ -n "$TARGET_VERSION" ]; then
@@ -90,13 +84,21 @@ get_target_version() {
     [ -z "$RELEASES_JSON" ] && { echo ""; return; }
     [ -z "$CHANNEL" ] && CHANNEL="main"
 
+    # spec 6.1: 通道做顶层 key，读取 [channel].latest
     local version=""
-    if [ "$CHANNEL" = "dev" ]; then
-        version=$(echo "$RELEASES_JSON" | grep -o '"latest_dev" *: *"[^"]*"' | cut -d'"' -f4)
+    if [ -n "$PYTHON3" ]; then
+        version=$($PYTHON3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    print(d.get('$CHANNEL', {}).get('latest', ''))
+except: pass
+" <<< "$RELEASES_JSON" 2>/dev/null)
     else
-        version=$(echo "$RELEASES_JSON" | grep -o '"latest_main" *: *"[^"]*"' | cut -d'"' -f4)
+        # 无 Python 时用 grep 粗略提取（仅适用于 main 通道）
+        version=$(echo "$RELEASES_JSON" | grep -o '"latest" *: *"[^"]*"' | head -1 | cut -d'"' -f4)
     fi
-    echo "$version"
+    [ -n "$version" ] && normalize_version "$version" || echo ""
 }
 
 VERSION=$(get_target_version)
@@ -125,28 +127,35 @@ if [ -n "$CURRENT_VERSION" ]; then
     fi
 fi
 
+# spec 6.3: GET {release_url}/{channel}/v{version}/{filename}
 DOWNLOAD_URL="$RELEASE_URL/$CHANNEL/$VERSION/sslbt.zip"
 TMP_FILE="/tmp/sslbt-$VERSION.zip"
 
 echo_info "下载 sslbt.zip..."
-if ! curl -fsSL --connect-timeout 30 "$DOWNLOAD_URL" -o "$TMP_FILE" 2>/dev/null; then
+if ! curl -fsSL --connect-timeout 30 --max-filesize 10485760 "$DOWNLOAD_URL" -o "$TMP_FILE" 2>/dev/null; then
     echo_error "下载失败: $DOWNLOAD_URL"
     rm -f "$TMP_FILE"
     exit 1
 fi
 
-# SHA256 校验（从缓存的 RELEASES_JSON 中提取，避免重复下载）
+# SHA256 校验（spec 6.1: checksums 按文件名索引）
 EXPECTED_HASH=""
 if [ -n "$RELEASES_JSON" ] && [ -n "$PYTHON3" ]; then
-    EXPECTED_HASH=$(echo "$RELEASES_JSON" | $PYTHON3 -c "
+    # spec 6.1: checksums 内嵌在版本条目中，version 不带 v 前缀
+    EXPECTED_HASH=$($PYTHON3 -c "
 import sys, json
 try:
     d = json.load(sys.stdin)
-    h = d.get('versions',{}).get('$VERSION',{}).get('checksums',{}).get('sslbt.zip','')
-    if h.startswith('sha256:'):
-        print(h[7:])
+    ch = d.get('$CHANNEL', {})
+    target = '${VERSION#v}'
+    for v in ch.get('versions', []):
+        if v.get('version', '') == target:
+            h = v.get('checksums', {}).get('sslbt.zip', '')
+            if h.startswith('sha256:'):
+                print(h[7:])
+            break
 except: pass
-" 2>/dev/null)
+" <<< "$RELEASES_JSON" 2>/dev/null)
 fi
 
 if [ -n "$EXPECTED_HASH" ]; then
@@ -170,6 +179,28 @@ else
 fi
 
 echo_info "安装中..."
+
+# spec 10.2: 符号链接防护 — 拒绝包含符号链接的 ZIP
+if [ -n "$PYTHON3" ]; then
+    if ! $PYTHON3 -c "
+import zipfile, sys
+with zipfile.ZipFile(sys.argv[1], 'r') as zf:
+    for info in zf.infolist():
+        if info.external_attr >> 28 == 0xA:
+            print('symlink: ' + info.filename, file=sys.stderr)
+            sys.exit(1)
+" "$TMP_FILE" 2>/dev/null; then
+        echo_error "ZIP 包含符号链接，拒绝安装"
+        rm -f "$TMP_FILE"
+        exit 1
+    fi
+elif command -v zipinfo &>/dev/null; then
+    if zipinfo "$TMP_FILE" 2>/dev/null | grep -q '^l'; then
+        echo_error "ZIP 包含符号链接，拒绝安装"
+        rm -f "$TMP_FILE"
+        exit 1
+    fi
+fi
 
 if [ "$FORCE" = true ] && [ -d "$PLUGIN_DIR" ]; then
     # --force 模式：备份旧目录到 /tmp，全新安装
@@ -257,4 +288,3 @@ echo_info "安装完成！$VERSION"
 echo ""
 echo "插件位置: $PLUGIN_DIR"
 echo "打开宝塔面板 → 软件商店 → 第三方应用 → sslbt 证书管理"
-echo "刷新面板页面即可使用，无需重启面板。"
