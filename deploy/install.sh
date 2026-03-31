@@ -235,7 +235,7 @@ for ICON_DIR in \
     "$PANEL_DIR/BTPanel/static/img/soft_ico" \
     "$PANEL_DIR/static/images/soft_ico"; do
     mkdir -p "$ICON_DIR" 2>/dev/null || continue
-    for ext in png svg; do
+    for ext in png; do
         if [ -f "$PLUGIN_DIR/icon.$ext" ]; then
             cp -f "$PLUGIN_DIR/icon.$ext" "$ICON_DIR/ico-sslbt.$ext"
             chmod 644 "$ICON_DIR/ico-sslbt.$ext"

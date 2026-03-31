@@ -3,9 +3,9 @@
 # 重要：设置文件权限 chmod 600 release.conf
 
 # 服务器配置
-# 格式: "名称,主机,端口,目录,URL"
+# 格式: "名称,主机,端口,目录"
 SERVERS=(
-    "cn,release-cn.example.com,22,/var/www/release/sslbt,https://release-cn.example.com/sslbt"
+    "cn,release-cn.example.com,22,/var/www/release/sslbt"
 )
 
 # SSH 认证

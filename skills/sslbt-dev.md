@@ -11,13 +11,15 @@ description: Use when developing sslbt baota panel plugin - modifying API client
 
 ```
 sslbt_main.py  ← 插件入口（控制器），宝塔面板调用
-  ├─ api_client.py      ← 部署 API 客户端（Bearer Token + 重试）
+  ├─ api_client.py      ← 部署 API 客户端（Bearer Token + 重试 + Safe Handler）
+  ├─ net_guard.py       ← 网络安全（SSRF/DNS Rebinding 防护，IP 黑名单）
   ├─ deployer.py        ← 证书部署（_BtParams + SetSSL + 回调）
   ├─ renew.py           ← 续签引擎（Pull/Local 两种模式 + 文件验证集成）
   ├─ file_verifier.py   ← 文件验证（ACME 验证文件放置/清理）
-  ├─ config.py          ← 配置读写（文件锁，证书级 API 配置，废弃字段过滤）
+  ├─ config.py          ← 配置读写（文件锁 + 数据驱动迁移引擎）
   ├─ cert_utils.py      ← 证书验证 + CSR 生成（支持 DNS/IP SAN）
   ├─ site_manager.py    ← 宝塔站点管理 + 域名匹配（兼容新旧数据库分片）
+  ├─ updater.py         ← 在线升级（releases.json 解析 + 安全下载 + 校验）
   ├─ cron.py            ← 宝塔计划任务（_BtParams + 直接查库 + 每天随机时间 + cron.log 轮转）
   └─ logger.py          ← 日志（敏感信息过滤，MAX_LOG_FILES=90 自动清理）
 index.html              ← 前端 UI（纯 JS，3 Tab: 证书管理/设置/日志）
@@ -118,7 +120,7 @@ Bearer Token 认证，部署链接格式：`https://domain/api/deploy?token=xxx&
 - callback：全部站点成功=success，任一失败=failure
 - 分散续签：`check_and_renew_all(spread=True)` 在证书间加动态延迟，根据需续签数量自动缩短间隔（总延迟上限 600s），仅 cron 调用启用
 - 汇总日志：续签完成后记录成功/等待/失败数量
-- 常量：RENEW_DEFAULT_DAYS=13, MAX_ISSUE_RETRY_COUNT=10, RENEW_SLEEP_MIN=5, RENEW_SLEEP_MAX=120, SPREAD_TOTAL_MAX=600
+- 常量：RENEW_DEFAULT_DAYS=14, MAX_ISSUE_RETRY_COUNT=10, RENEW_SLEEP_MIN=5, RENEW_SLEEP_MAX=120, SPREAD_TOTAL_MAX=600
 - 已过期证书（days_remaining < 0）不再触发续签
 - deploy_multi 全部站点失败时不更新 metadata（保留重试状态）
 - 单次续签上限 MAX_RENEW_BATCH=100，超出按配置文件顺序截断，剩余下次 cron 处理；紧急证书由用户手动触发
@@ -134,12 +136,14 @@ Bearer Token 认证，部署链接格式：`https://domain/api/deploy?token=xxx&
 
 ## 配置层级
 
-每个证书必须自带 `api_url`/`api_token`，无全局 API 配置。全局配置仅保留运行参数（renew_before_days、renew_mode、release_url、update_channel）。
+统一 config.json，结构见 deploy-spec.md §1。每个证书自带 `api`（url/token），全局仅保留运行参数。
 
-- `renew_before_days`：提前续签天数，全局生效，默认 13
-- 废弃字段（`api_url`、`api_token`、`version`）读写时自动过滤
+- `schedule.renew_before_days`：提前续签天数，默认 14，API 返回值覆写
+- `schedule.renew_mode`：全局续签模式（pull/local），证书级优先
+- `release_url` / `upgrade_channel`：升级地址和通道（main/dev）
 - `validation_method`：证书级验证方式（`delegation` 或 `file`），空值默认服务端决定
 - 站点唯一绑定：一个站点只能绑定一个证书，add_cert / update_cert / update_cert_config 均校验
+- 数据驱动迁移引擎：支持 delete/rename/move/spread 四种操作，升级后自动迁移旧字段
 - ConfigManager 支持可选 `logger` 参数，JSON 损坏时记录 error 并创建 .bak 备份
 - `add_cert` / `update_cert` / `remove_cert` / `update_order_id` 使用 `_update_json` 原子读-改-写（独立锁文件防止竞态）
 
@@ -164,4 +168,4 @@ make docker-test   # 容器集成测试
 ## 运行时路径
 
 - 插件目录：`/www/server/panel/plugin/sslbt/`
-- 数据目录：`data/`（config.json、certs.json、logs/、pending-keys/）
+- 数据目录：`data/`（config.json、certs/、logs/、pending-keys/）

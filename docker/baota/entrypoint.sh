@@ -40,12 +40,25 @@ cd "$PLUGIN_DIR" && bash install.sh install
 echo "[5/5] 配置插件..."
 cat > "$PLUGIN_DIR/data/config.json" << EOF
 {
-    "api_url": "$MOCK_API_URL",
-    "api_token": "$MOCK_TOKEN",
-    "check_interval_hours": 6,
-    "renew_before_days": 13,
-    "renew_mode": "pull",
-    "version": "1.0"
+    "release_url": "",
+    "upgrade_channel": "main",
+    "schedule": {
+        "renew_mode": "pull",
+        "renew_before_days": 14
+    },
+    "certificates": [
+        {
+            "cert_name": "test",
+            "order_id": 1,
+            "enabled": true,
+            "domains": [],
+            "renew_mode": "",
+            "validation_method": "",
+            "api": {"url": "$MOCK_API_URL", "token": "$MOCK_TOKEN"},
+            "site_name": [],
+            "metadata": {}
+        }
+    ]
 }
 EOF
 chmod 0600 "$PLUGIN_DIR/data/config.json"

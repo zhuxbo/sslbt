@@ -38,7 +38,7 @@ load_config() {
 
 parse_server() {
     local server_str="$1"
-    IFS=',' read -r SERVER_NAME SERVER_HOST SERVER_PORT SERVER_DIR SERVER_URL <<< "$server_str"
+    IFS=',' read -r SERVER_NAME SERVER_HOST SERVER_PORT SERVER_DIR <<< "$server_str"
     SERVER_PORT=${SERVER_PORT:-22}
 }
 
@@ -329,7 +329,7 @@ main() {
         for server in "${SERVERS[@]}"; do
             parse_server "$server"
             if [ -z "$target_server" ] || [ "$SERVER_NAME" = "$target_server" ]; then
-                echo "  curl $SERVER_URL/releases.json | jq ."
+                echo "  ssh $SSH_USER@$SERVER_HOST -p $SERVER_PORT \"cat $SERVER_DIR/releases.json\" | jq ."
             fi
         done
     fi
