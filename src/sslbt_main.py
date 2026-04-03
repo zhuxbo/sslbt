@@ -24,7 +24,7 @@ if hasattr(sys.modules.get('sslbt_main'), 'sslbt_main'):
 from lib.config import ConfigManager  # noqa: E402
 from lib.logger import Logger  # noqa: E402
 from lib.api_client import APIClient, APIError  # noqa: E402
-from lib.cert_utils import build_fullchain, parse_cert_info  # noqa: E402
+from lib.cert_utils import build_fullchain, parse_cert_info, verify_cert_key_match, validate_key_pem  # noqa: E402
 from lib.site_manager import SiteManager  # noqa: E402
 from lib.deployer import Deployer, DeployError  # noqa: E402
 from lib.renew import RenewEngine  # noqa: E402
@@ -97,6 +97,78 @@ class sslbt_main:
 
     def _get_deployer(self):
         return Deployer(self._config, None, self._logger)
+
+    def _resolve_private_key(self, cert_data, args, fullchain_pem, site_names):
+        """按优先级尝试获取与证书匹配的私钥（deploy-spec §5.3）
+
+        1. API 返回的 private_key
+        2. 调用参数指定的私钥路径
+        3. 绑定站点的已部署私钥
+        4. 调用参数直接传入的 PEM（前端弹窗粘贴）
+        """
+        candidates = []
+
+        # 1. API 返回
+        api_key = cert_data.get('private_key', '')
+        if api_key:
+            candidates.append(('API', api_key))
+
+        # 2. 参数指定路径
+        key_path = _get_param(args, 'private_key_path', '')
+        if key_path:
+            key_from_file = self._read_key_file(key_path)
+            if key_from_file:
+                candidates.append(('文件路径', key_from_file))
+
+        # 3. 站点已有私钥
+        for sn in site_names:
+            site_key = self._read_site_key(sn)
+            if site_key:
+                candidates.append(('站点 %s' % sn, site_key))
+                break  # 同一张证书的多个站点私钥相同，取第一个即可
+
+        # 4. 用户粘贴的 PEM（前端弹窗回传）
+        user_key = _get_param(args, 'private_key', '')
+        if user_key:
+            candidates.append(('用户提供', user_key))
+
+        for source, key_pem in candidates:
+            ok, _ = validate_key_pem(key_pem)
+            if not ok:
+                continue
+            if verify_cert_key_match(fullchain_pem, key_pem):
+                self._logger.info("私钥来源: %s", source)
+                return key_pem
+
+        return ''
+
+    @staticmethod
+    def _read_key_file(path):
+        """读取私钥文件，路径必须为绝对路径"""
+        try:
+            if not os.path.isabs(path):
+                return ''
+            if os.path.islink(path):
+                return ''
+            if not os.path.isfile(path):
+                return ''
+            with open(path, 'r') as f:
+                return f.read()
+        except Exception:
+            return ''
+
+    @staticmethod
+    def _read_site_key(site_name):
+        """通过 panelSite.GetSSL() 读取站点已有私钥"""
+        try:
+            import panelSite
+            params = type('_P', (), {'siteName': site_name})()
+            result = panelSite.panelSite().GetSSL(params)
+            if isinstance(result, dict):
+                return result.get('key', '')
+        except Exception:
+            pass
+        return ''
 
     # ==================== 配置管理 ====================
 
@@ -378,12 +450,17 @@ class sslbt_main:
 
             certificate = cert_data.get('certificate', '')
             ca_certificate = cert_data.get('ca_certificate', '')
-            private_key = cert_data.get('private_key', '')
 
             if not certificate:
                 return _err('证书内容为空')
 
             fullchain = build_fullchain(certificate, ca_certificate)
+
+            # 私钥回退链（deploy-spec §5.3）
+            private_key = self._resolve_private_key(
+                cert_data, args, fullchain, site_name)
+            if not private_key:
+                return {'status': False, 'msg': '未找到匹配的私钥，请提供私钥', 'need_key': True}
 
             # 从证书提取域名并更新配置
             domains = self._parse_cert_domains(cert_data)
@@ -446,9 +523,24 @@ class sslbt_main:
                 result = self.deploy_cert({'order_id': str(cert['order_id'])})
                 results.append({
                     'order_id': cert['order_id'],
+                    'cert_name': cert.get('cert_name', ''),
                     'result': result,
                 })
-            return _ok(results, msg='批量部署完成')
+
+            success = [r for r in results if r['result'].get('status')]
+            need_key = [r for r in results if r['result'].get('need_key')]
+            failed = [r for r in results if not r['result'].get('status') and not r['result'].get('need_key')]
+
+            parts = []
+            if success:
+                parts.append('%d 成功' % len(success))
+            if failed:
+                parts.append('%d 失败' % len(failed))
+            if need_key:
+                names = [r['cert_name'] or str(r['order_id']) for r in need_key]
+                parts.append('%d 需要私钥（%s）' % (len(need_key), ', '.join(names)))
+            msg = '批量部署：' + '，'.join(parts) if parts else '无可部署的证书'
+            return _ok(results, msg=msg)
         except Exception as e:
             return _err('批量部署失败: %s' % str(e))
 

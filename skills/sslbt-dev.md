@@ -115,6 +115,7 @@ Bearer Token 认证，部署链接格式：`https://domain/api/deploy?token=xxx&
 
 - Pull 模式：查询订单，active 且证书完整则直接部署
 - Local 模式：生成 CSR → 校验 validation_method 与域名兼容性 → 提交 → processing 状态轮询 → active 后部署
+- 私钥回退（deploy-spec §5.3）：deploy_cert 中按 API → 参数路径 → 站点已有私钥(GetSSL) → 弹窗粘贴 四级回退，所有来源均需 verify_cert_key_match 校验
 - 文件验证：CSR 提交返回 file 字段时自动放置，签发/超时/异常时自动清理
 - `_check_deploy_results()`：全部失败抛异常，部分失败记警告
 - callback：全部站点成功=success，任一失败=failure
@@ -153,6 +154,7 @@ Bearer Token 认证，部署链接格式：`https://domain/api/deploy?token=xxx&
 - 证书编辑用 `update_cert_config`（原子更新 site_name/renew_mode/validation_method，站点唯一绑定校验 + 验证方式域名兼容性校验）
 - `batch_set_validation_method`：批量设置验证方式，不兼容的证书自动跳过并报告
 - `_parse_cert_domains` 优先从证书 PEM 提取域名（DNS + IP SAN），未签发时回退 API 域名
+- 部署时若无匹配私钥，返回 `need_key: true`，前端弹窗让用户粘贴 PEM 后重新调用 `deploy_cert(private_key=...)`
 - 证书列表支持 checkbox 多选，顶部按钮（部署/删除）操作选中证书
 - 状态标签：未绑定 → 待部署 → 已部署（有 last_deploy_at 但无 cert_expires_at）→ 正常 → 即将过期 → 已过期
 - 添加证书后自动创建计划任务（如果尚未设置），失败不阻塞添加流程

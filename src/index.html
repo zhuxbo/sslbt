@@ -853,15 +853,39 @@
     },
 
     // ===== 证书操作 =====
-    deployCert: function (oid) {
-      layer.confirm('确定部署订单 ' + oid + ' 的证书到所有绑定站点？', { offset: 'auto' }, function (idx) {
-        layer.close(idx);
+    deployCert: function (oid, extraParams) {
+      var doIt = function () {
         var closeLoading = P._loading('部署中...');
-        P._call('deploy_cert', { order_id: oid }, function (r) {
+        var params = { order_id: oid };
+        if (extraParams) for (var k in extraParams) params[k] = extraParams[k];
+        P._call('deploy_cert', params, function (r) {
           closeLoading();
+          if (r.need_key) { sslbt._askPrivateKey(oid); return; }
           layer.msg(r.msg, { icon: r.status ? 1 : 2 });
           if (r.status) { delete P._certCache[oid]; P.loadCerts(); }
         });
+      };
+      if (extraParams) { doIt(); return; }
+      layer.confirm('确定部署订单 ' + oid + ' 的证书到所有绑定站点？', { offset: 'auto' }, function (idx) {
+        layer.close(idx);
+        doIt();
+      });
+    },
+
+    _askPrivateKey: function (oid) {
+      var ipt = 'style="width:100%;box-sizing:border-box"';
+      layer.open({
+        type: 1, title: '请提供私钥', area: ['500px', '340px'], offset: 'auto',
+        content: '<div style="padding:20px 30px">' +
+          '<p style="margin:0 0 10px;color:#909399;font-size:13px">API 和站点均未找到匹配的私钥，请粘贴 PEM 格式的私钥内容</p>' +
+          '<textarea id="deploy-private-key" rows="8" placeholder="-----BEGIN PRIVATE KEY-----&#10;...&#10;-----END PRIVATE KEY-----" ' + ipt + '></textarea></div>',
+        btn: ['部署', '取消'],
+        yes: function (idx) {
+          var key = $.trim($('#deploy-private-key').val());
+          if (!key) { layer.msg('请粘贴私钥内容', { icon: 0 }); return; }
+          layer.close(idx);
+          sslbt.deployCert(oid, { private_key: key });
+        }
       });
     },
 

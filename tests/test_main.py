@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 
 from lib.config import ConfigManager
 from lib.logger import Logger
+from sslbt_main import sslbt_main
 
 
 # 使用独立的 fixture 构造 sslbt_main 实例，避免依赖真实路径
@@ -808,10 +809,211 @@ class TestToggleAutoReissue:
 
         deployer_mock = MagicMock()
         deployer_mock.deploy_multi.return_value = [{'site_name': 'a.com', 'status': True, 'message': 'ok'}]
-        with patch('sslbt_main.Deployer', return_value=deployer_mock):
+        with patch('sslbt_main.Deployer', return_value=deployer_mock), \
+             patch.object(plugin, '_resolve_private_key', return_value='---KEY---'):
             plugin.deploy_cert({'order_id': '910'})
 
         mock_api.toggle_auto_reissue.assert_called_once_with(910, True)
+
+
+class TestResolvePrivateKey:
+    """_resolve_private_key 私钥回退链测试"""
+
+    def _make_plugin_with_key_match(self, plugin, match_sources):
+        """构造 plugin，mock verify_cert_key_match 使指定来源的 key 匹配"""
+        # match_sources: set of key_pem values that should "match"
+        def fake_verify(cert_pem, key_pem):
+            return key_pem in match_sources
+        plugin._verify_cert_key_match = fake_verify
+        return plugin
+
+    @patch('sslbt_main.verify_cert_key_match')
+    @patch('sslbt_main.validate_key_pem', return_value=(True, None))
+    def test_api_key_used_first(self, mock_validate, mock_verify, plugin):
+        """优先使用 API 返回的私钥"""
+        mock_verify.side_effect = lambda c, k: k == 'API-KEY'
+        cert_data = {'private_key': 'API-KEY'}
+        result = plugin._resolve_private_key(cert_data, {}, 'CERT', ['a.com'])
+        assert result == 'API-KEY'
+
+    @patch('sslbt_main.verify_cert_key_match')
+    @patch('sslbt_main.validate_key_pem', return_value=(True, None))
+    def test_user_key_as_fallback(self, mock_validate, mock_verify, plugin):
+        """API 无私钥时使用用户粘贴的 PEM"""
+        mock_verify.side_effect = lambda c, k: k == 'USER-KEY'
+        cert_data = {}
+        args = {'private_key': 'USER-KEY'}
+        result = plugin._resolve_private_key(cert_data, args, 'CERT', ['a.com'])
+        assert result == 'USER-KEY'
+
+    @patch('sslbt_main.verify_cert_key_match')
+    @patch('sslbt_main.validate_key_pem', return_value=(True, None))
+    @patch.object(sslbt_main, '_read_site_key', return_value='SITE-KEY')
+    def test_site_key_fallback(self, mock_site_key, mock_validate, mock_verify, plugin):
+        """API 无私钥时回退到站点已有私钥"""
+        mock_verify.side_effect = lambda c, k: k == 'SITE-KEY'
+        cert_data = {}
+        result = plugin._resolve_private_key(cert_data, {}, 'CERT', ['a.com'])
+        assert result == 'SITE-KEY'
+
+    @patch('sslbt_main.verify_cert_key_match', return_value=False)
+    @patch('sslbt_main.validate_key_pem', return_value=(True, None))
+    def test_no_match_returns_empty(self, mock_validate, mock_verify, plugin):
+        """所有来源的私钥均不匹配时返回空"""
+        cert_data = {'private_key': 'BAD-KEY'}
+        result = plugin._resolve_private_key(cert_data, {}, 'CERT', ['a.com'])
+        assert result == ''
+
+    @patch('sslbt_main.verify_cert_key_match')
+    @patch('sslbt_main.validate_key_pem', return_value=(True, None))
+    def test_key_path_param(self, mock_validate, mock_verify, plugin, tmp_data_dir):
+        """参数提供私钥绝对路径"""
+        mock_verify.side_effect = lambda c, k: k == 'FILE-KEY'
+        key_file = os.path.join(tmp_data_dir, 'test.key')
+        with open(key_file, 'w') as f:
+            f.write('FILE-KEY')
+        cert_data = {}
+        args = {'private_key_path': key_file}
+        result = plugin._resolve_private_key(cert_data, args, 'CERT', ['a.com'])
+        assert result == 'FILE-KEY'
+
+    def test_key_path_relative_rejected(self, plugin):
+        """相对路径被拒绝"""
+        result = plugin._read_key_file('relative/path.key')
+        assert result == ''
+
+    def test_key_path_symlink_rejected(self, plugin, tmp_data_dir):
+        """符号链接被拒绝"""
+        target = os.path.join(tmp_data_dir, 'real.key')
+        link = os.path.join(tmp_data_dir, 'link.key')
+        with open(target, 'w') as f:
+            f.write('KEY')
+        os.symlink(target, link)
+        result = plugin._read_key_file(link)
+        assert result == ''
+
+    @patch('sslbt_main.APIClient')
+    @patch('sslbt_main.verify_cert_key_match', return_value=False)
+    @patch('sslbt_main.validate_key_pem', return_value=(True, None))
+    def test_deploy_cert_returns_need_key(self, mock_validate, mock_verify, mock_api_cls, plugin):
+        """deploy_cert 无匹配私钥时返回 need_key"""
+        plugin._config.add_cert(
+            order_id=920, cert_name='test', domains=['a.com'],
+            site_names=['a.com'], api_url='https://api.example.com',
+            api_token=TOKEN,
+        )
+        mock_api = MagicMock()
+        mock_api.query_order.return_value = {
+            'status': 'active',
+            'certificate': '---CERT---',
+            'ca_certificate': '---CA---',
+        }
+        mock_api_cls.return_value = mock_api
+        result = plugin.deploy_cert({'order_id': '920'})
+        assert result['status'] is False
+        assert result.get('need_key') is True
+
+    @patch('sslbt_main.APIClient')
+    @patch('sslbt_main.verify_cert_key_match')
+    @patch('sslbt_main.validate_key_pem', return_value=(True, None))
+    def test_deploy_cert_with_user_key_succeeds(self, mock_validate, mock_verify, mock_api_cls, plugin):
+        """用户提供私钥后 deploy_cert 成功部署"""
+        mock_verify.side_effect = lambda c, k: k == 'USER-KEY'
+        plugin._config.add_cert(
+            order_id=921, cert_name='test', domains=['a.com'],
+            site_names=['a.com'], api_url='https://api.example.com',
+            api_token=TOKEN,
+        )
+        mock_api = MagicMock()
+        mock_api.query_order.return_value = {
+            'status': 'active',
+            'certificate': '---CERT---',
+            'ca_certificate': '---CA---',
+        }
+        mock_api_cls.return_value = mock_api
+        deployer_mock = MagicMock()
+        deployer_mock.deploy_multi.return_value = [{'site_name': 'a.com', 'status': True, 'message': 'ok'}]
+        with patch('sslbt_main.Deployer', return_value=deployer_mock):
+            result = plugin.deploy_cert({'order_id': '921', 'private_key': 'USER-KEY'})
+        assert result['status'] is True
+        deployer_mock.deploy_multi.assert_called_once()
+
+
+class TestDeployAll:
+    """deploy_all 汇总逻辑测试"""
+
+    def _add_cert(self, plugin, order_id, cert_name='test'):
+        site = '%s.example.com' % cert_name
+        plugin._config.add_cert(
+            order_id=order_id, cert_name=cert_name, domains=[site],
+            site_names=[site], api_url='https://api.example.com',
+            api_token=TOKEN,
+        )
+
+    def test_all_success(self, plugin):
+        """全部部署成功"""
+        self._add_cert(plugin, 930, 'cert-a')
+        self._add_cert(plugin, 931, 'cert-b')
+        with patch.object(plugin, 'deploy_cert', return_value={'status': True, 'msg': 'ok'}):
+            result = plugin.deploy_all()
+        assert result['status'] is True
+        assert '2 成功' in result['msg']
+        assert '失败' not in result['msg']
+        assert '私钥' not in result['msg']
+
+    def test_mixed_results(self, plugin):
+        """混合结果：成功 + 失败 + need_key"""
+        self._add_cert(plugin, 932, 'cert-ok')
+        self._add_cert(plugin, 933, 'cert-fail')
+        self._add_cert(plugin, 934, 'cert-nokey')
+
+        def fake_deploy(args):
+            oid = int(args['order_id'])
+            if oid == 932:
+                return {'status': True, 'msg': 'ok'}
+            if oid == 933:
+                return {'status': False, 'msg': 'error'}
+            return {'status': False, 'msg': '需要私钥', 'need_key': True}
+
+        with patch.object(plugin, 'deploy_cert', side_effect=fake_deploy):
+            result = plugin.deploy_all()
+        assert '1 成功' in result['msg']
+        assert '1 失败' in result['msg']
+        assert '1 需要私钥' in result['msg']
+        assert 'cert-nokey' in result['msg']
+
+    def test_all_need_key(self, plugin):
+        """全部需要私钥"""
+        self._add_cert(plugin, 935, 'cert-x')
+        self._add_cert(plugin, 936, 'cert-y')
+        with patch.object(plugin, 'deploy_cert',
+                          return_value={'status': False, 'msg': '需要私钥', 'need_key': True}):
+            result = plugin.deploy_all()
+        assert '2 需要私钥' in result['msg']
+        assert 'cert-x' in result['msg']
+        assert 'cert-y' in result['msg']
+        assert '成功' not in result['msg']
+
+    def test_no_deployable_certs(self, plugin):
+        """无可部署的证书（全部未绑定站点）"""
+        plugin._config.add_cert(order_id=937, cert_name='no-site', domains=['a.example.com'])
+        result = plugin.deploy_all()
+        assert '无可部署' in result['msg']
+
+    def test_filter_by_order_ids(self, plugin):
+        """order_ids 过滤只部署选中的证书"""
+        self._add_cert(plugin, 938, 'cert-p')
+        self._add_cert(plugin, 939, 'cert-q')
+        calls = []
+
+        def fake_deploy(args):
+            calls.append(int(args['order_id']))
+            return {'status': True, 'msg': 'ok'}
+
+        with patch.object(plugin, 'deploy_cert', side_effect=fake_deploy):
+            result = plugin.deploy_all({'order_ids': '938'})
+        assert result['status'] is True
+        assert calls == [938]
 
 
 class TestBatchSetValidationMethod:
