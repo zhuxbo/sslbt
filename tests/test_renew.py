@@ -196,6 +196,44 @@ class TestRenewEngine:
         with open(key_path, 'r') as f:
             assert f.read() == 'NEW-KEY'
 
+    @patch('lib.renew.cert_utils.generate_csr')
+    def test_local_submit_csr_validation_method_incompatible(self, mock_csr, engine, tmp_data_dir):
+        """Local 模式：验证方式与域名不兼容时清理 pending key 并抛异常"""
+        mock_csr.return_value = ('CSR-PEM', 'KEY-PEM', 'hash123')
+        cert = _make_cert_entry(10, renew_mode='local')
+        cert['domains'] = ['*.example.com']
+        cert['validation_method'] = 'file'
+        engine._config.add_cert(
+            order_id=cert['order_id'],
+            cert_name=cert['cert_name'],
+            domains=cert['domains'],
+            site_names=cert['site_name'],
+        )
+        with pytest.raises(RuntimeError, match='通配符'):
+            engine._submit_new_csr(cert, engine._mock_api)
+        # pending key 应已被清理
+        key_path = engine._pending_key_path(cert)
+        assert not os.path.exists(key_path)
+        # API 不应被调用
+        engine._mock_api.submit_csr.assert_not_called()
+
+    @patch('lib.renew.cert_utils.generate_csr')
+    def test_local_submit_csr_ip_rejects_delegation(self, mock_csr, engine, tmp_data_dir):
+        """Local 模式：IP 域名拒绝 delegation 验证"""
+        mock_csr.return_value = ('CSR-PEM', 'KEY-PEM', 'hash123')
+        cert = _make_cert_entry(10, renew_mode='local')
+        cert['domains'] = ['1.2.3.4']
+        cert['validation_method'] = 'delegation'
+        engine._config.add_cert(
+            order_id=cert['order_id'],
+            cert_name=cert['cert_name'],
+            domains=cert['domains'],
+            site_names=cert['site_name'],
+        )
+        with pytest.raises(RuntimeError, match='IP'):
+            engine._submit_new_csr(cert, engine._mock_api)
+        assert not os.path.exists(engine._pending_key_path(cert))
+
     def test_local_handle_processing_active(self, engine, tmp_data_dir):
         """Local 模式：processing → active → 部署"""
         cert = _make_cert_entry(10, renew_mode='local', issue_state='processing')

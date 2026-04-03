@@ -25,3 +25,4 @@ make docker-test        # 容器集成测试
 - 升级模块复用 api_client 的 Safe Handler，HTTPS 强制 + SSRF/DNS Rebinding 防护 + 通道白名单
 - 安全解压：符号链接拒绝、目录 0700、文件 0600
 - 安装脚本：curl --max-filesize 限制、解压前符号链接检查
+- validation_method 受域名类型约束：IP 不可选 delegation、通配符不可选 file（add/update/renew 三层校验）

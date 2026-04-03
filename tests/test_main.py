@@ -384,6 +384,41 @@ class TestUpdateCertConfig:
         })
         assert result['status'] is False
 
+    def test_update_validation_method_ok(self, plugin):
+        """普通域名可设置 file 验证方式"""
+        plugin._config.add_cert(order_id=504, cert_name='test', domains=['a.example.com'],
+                                api_url='https://api.example.com', api_token=TOKEN)
+        result = plugin.update_cert_config({
+            'order_id': '504',
+            'renew_mode': 'local',
+            'validation_method': 'file',
+        })
+        assert result['status'] is True
+        cert = plugin._config.get_cert(504)
+        assert cert['validation_method'] == 'file'
+
+    def test_update_validation_method_wildcard_rejects_file(self, plugin):
+        """通配符域名拒绝 file 验证"""
+        plugin._config.add_cert(order_id=505, cert_name='test', domains=['*.example.com'],
+                                api_url='https://api.example.com', api_token=TOKEN)
+        result = plugin.update_cert_config({
+            'order_id': '505',
+            'renew_mode': 'local',
+            'validation_method': 'file',
+        })
+        assert result['status'] is False
+
+    def test_update_validation_method_ip_rejects_delegation(self, plugin):
+        """IP 域名拒绝 delegation 验证"""
+        plugin._config.add_cert(order_id=506, cert_name='test', domains=['1.2.3.4'],
+                                api_url='https://api.example.com', api_token=TOKEN)
+        result = plugin.update_cert_config({
+            'order_id': '506',
+            'renew_mode': 'local',
+            'validation_method': 'delegation',
+        })
+        assert result['status'] is False
+
 
 class TestGetSiteMatches:
     def test_missing_order_id(self, plugin):
@@ -777,3 +812,44 @@ class TestToggleAutoReissue:
             plugin.deploy_cert({'order_id': '910'})
 
         mock_api.toggle_auto_reissue.assert_called_once_with(910, True)
+
+
+class TestBatchSetValidationMethod:
+    def test_batch_set_delegation(self, plugin):
+        """批量设置委托验证"""
+        plugin._config.add_cert(order_id=950, cert_name='test1', domains=['a.example.com'],
+                                api_url='https://api.example.com', api_token=TOKEN)
+        plugin._config.add_cert(order_id=951, cert_name='test2', domains=['b.example.com'],
+                                api_url='https://api.example.com', api_token=TOKEN)
+        result = plugin.batch_set_validation_method({'validation_method': 'delegation'})
+        assert result['status'] is True
+        assert '2' in result['msg']
+        assert plugin._config.get_cert(950)['validation_method'] == 'delegation'
+        assert plugin._config.get_cert(951)['validation_method'] == 'delegation'
+
+    def test_batch_set_file(self, plugin):
+        """批量设置文件验证"""
+        plugin._config.add_cert(order_id=952, cert_name='test', domains=['a.example.com'],
+                                api_url='https://api.example.com', api_token=TOKEN)
+        result = plugin.batch_set_validation_method({'validation_method': 'file'})
+        assert result['status'] is True
+        assert plugin._config.get_cert(952)['validation_method'] == 'file'
+
+    def test_batch_skip_incompatible(self, plugin):
+        """批量设置 file 时跳过通配符域名证书"""
+        plugin._config.add_cert(order_id=953, cert_name='normal', domains=['a.example.com'],
+                                api_url='https://api.example.com', api_token=TOKEN)
+        plugin._config.add_cert(order_id=954, cert_name='wildcard', domains=['*.example.com'],
+                                api_url='https://api.example.com', api_token=TOKEN)
+        result = plugin.batch_set_validation_method({'validation_method': 'file'})
+        assert result['status'] is True
+        assert '1' in result['msg']  # 1 个成功
+        assert '跳过' in result['msg']
+        assert plugin._config.get_cert(953)['validation_method'] == 'file'
+        # 通配符证书未被修改
+        assert plugin._config.get_cert(954).get('validation_method', '') != 'file'
+
+    def test_batch_invalid_method(self, plugin):
+        """无效验证方式被拒绝"""
+        result = plugin.batch_set_validation_method({'validation_method': 'invalid'})
+        assert result['status'] is False

@@ -155,6 +155,7 @@ class sslbt_main:
                 if token:
                     api['token_masked'] = token[:6] + '***' + token[-4:] if len(token) > 10 else '***'
                     api['token'] = ''
+                c['_effective_renew_mode'] = self._config.get_renew_mode(c)
             return _ok(certs)
         except Exception as e:
             return _err('获取证书列表失败: %s' % str(e))
@@ -181,6 +182,12 @@ class sslbt_main:
 
             cert_data = api.query_order(order_id)
             domains = self._parse_cert_domains(cert_data)
+
+            if validation_method:
+                from lib.config import validate_validation_method
+                err_msg = validate_validation_method(domains, validation_method)
+                if err_msg:
+                    return _err(err_msg)
 
             cert_name = 'order-%d' % order_id
             entry = self._config.add_cert(
@@ -265,6 +272,16 @@ class sslbt_main:
             renew_mode = _get_param(args, 'renew_mode', '')
             if renew_mode in ('pull', 'local', ''):
                 updates['renew_mode'] = renew_mode
+
+            validation_method = _get_param(args, 'validation_method', '')
+            if validation_method in ('file', 'delegation'):
+                cert = self._config.get_cert(order_id)
+                if cert:
+                    from lib.config import validate_validation_method
+                    err_msg = validate_validation_method(cert.get('domains', []), validation_method)
+                    if err_msg:
+                        return _err(err_msg)
+                updates['validation_method'] = validation_method
 
             api_url = _get_param(args, 'api_url', '')
             api_token = _get_param(args, 'api_token', '')
@@ -659,6 +676,32 @@ class sslbt_main:
                 self._config.update_cert(c['order_id'], {'renew_mode': mode})
                 count += 1
             return _ok(msg='已将 %d 个证书设为 %s' % (count, '自动签发' if mode == 'pull' else '本机提交'))
+        except Exception as e:
+            return _err('批量设置失败: %s' % str(e))
+
+    def batch_set_validation_method(self, args=None):
+        """批量设置所有证书的验证方式"""
+        try:
+            method = _get_param(args, 'validation_method', '')
+            if method not in ('file', 'delegation'):
+                return _err('无效的验证方式')
+            from lib.config import validate_validation_method
+            certs = self._config.get_certs()
+            count = 0
+            skipped = []
+            for c in certs:
+                err_msg = validate_validation_method(c.get('domains', []), method)
+                if err_msg:
+                    name = c.get('cert_name') or str(c.get('order_id', ''))
+                    skipped.append(name)
+                    continue
+                self._config.update_cert(c['order_id'], {'validation_method': method})
+                count += 1
+            label = '委托验证' if method == 'delegation' else '文件验证'
+            msg = '已将 %d 个证书设为%s' % (count, label)
+            if skipped:
+                msg += '，%d 个因域名限制跳过：%s' % (len(skipped), ', '.join(skipped))
+            return _ok(msg=msg)
         except Exception as e:
             return _err('批量设置失败: %s' % str(e))
 

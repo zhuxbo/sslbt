@@ -57,6 +57,11 @@
 | `api`               | object   | 证书级 API 配置                                        |
 | `metadata`          | object   | 证书元数据                                             |
 
+`validation_method` 受域名类型限制（仅 local 模式需要选择）：
+
+- IP 域名不可选 `delegation`（IP 无 DNS 记录，无法完成委托验证）
+- 通配符域名不可选 `file`（通配符无法指向具体站点放置验证文件）
+
 ### 1.4 api
 
 | 字段    | 类型   | 说明         |
@@ -229,6 +234,8 @@ Content-Type: application/json
 | `csr`               | string | CSR PEM               |
 | `domains`           | string | 域名（逗号分隔）      |
 | `validation_method` | string | `file` / `delegation` |
+
+`validation_method` 限制见 §1.3。
 
 响应 data：单个 CertData + `renew_before_days`。
 

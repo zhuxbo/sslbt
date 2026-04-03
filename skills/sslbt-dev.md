@@ -114,7 +114,7 @@ Bearer Token 认证，部署链接格式：`https://domain/api/deploy?token=xxx&
 ## 续签引擎关键逻辑
 
 - Pull 模式：查询订单，active 且证书完整则直接部署
-- Local 模式：生成 CSR → 提交（含 validation_method） → processing 状态轮询 → active 后部署
+- Local 模式：生成 CSR → 校验 validation_method 与域名兼容性 → 提交 → processing 状态轮询 → active 后部署
 - 文件验证：CSR 提交返回 file 字段时自动放置，签发/超时/异常时自动清理
 - `_check_deploy_results()`：全部失败抛异常，部分失败记警告
 - callback：全部站点成功=success，任一失败=failure
@@ -141,7 +141,7 @@ Bearer Token 认证，部署链接格式：`https://domain/api/deploy?token=xxx&
 - `schedule.renew_before_days`：提前续签天数，默认 14，API 返回值覆写
 - `schedule.renew_mode`：全局续签模式（pull/local），证书级优先
 - `release_url` / `upgrade_channel`：升级地址和通道（main/dev）
-- `validation_method`：证书级验证方式（`delegation` 或 `file`），空值默认服务端决定
+- `validation_method`：证书级验证方式（`delegation` 或 `file`），空值默认服务端决定；受域名类型约束（IP 不可 delegation，通配符不可 file），由 `validate_validation_method()` 统一校验
 - 站点唯一绑定：一个站点只能绑定一个证书，add_cert / update_cert / update_cert_config 均校验
 - 数据驱动迁移引擎：支持 delete/rename/move/spread 四种操作，升级后自动迁移旧字段
 - ConfigManager 支持可选 `logger` 参数，JSON 损坏时记录 error 并创建 .bak 备份
@@ -150,7 +150,8 @@ Bearer Token 认证，部署链接格式：`https://domain/api/deploy?token=xxx&
 ## 前端约定
 
 - `sslbt_main.py` 方法名 = 前端 `P._call('method_name', params, callback)` 的 method_name
-- 证书编辑用 `update_cert_config`（原子更新 site_name/renew_mode，站点唯一绑定校验）
+- 证书编辑用 `update_cert_config`（原子更新 site_name/renew_mode/validation_method，站点唯一绑定校验 + 验证方式域名兼容性校验）
+- `batch_set_validation_method`：批量设置验证方式，不兼容的证书自动跳过并报告
 - `_parse_cert_domains` 优先从证书 PEM 提取域名（DNS + IP SAN），未签发时回退 API 域名
 - 证书列表支持 checkbox 多选，顶部按钮（部署/删除）操作选中证书
 - 状态标签：未绑定 → 待部署 → 已部署（有 last_deploy_at 但无 cert_expires_at）→ 正常 → 即将过期 → 已过期
