@@ -402,6 +402,12 @@ class RenewEngine:
 
         # 提交 CSR
         validation_method = cert_entry.get('validation_method', '')
+        if validation_method:
+            from .config import validate_validation_method
+            err_msg = validate_validation_method(domains, validation_method)
+            if err_msg:
+                self._cleanup_pending_key(cert_entry)
+                raise RuntimeError(err_msg)
         try:
             cert_data = api.submit_csr(order_id, csr_pem, domains,
                                        validation_method=validation_method)

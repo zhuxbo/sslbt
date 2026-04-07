@@ -57,6 +57,11 @@
 | `api`               | object   | 证书级 API 配置                                        |
 | `metadata`          | object   | 证书元数据                                             |
 
+`validation_method` 受域名类型限制（仅 local 模式需要选择）：
+
+- IP 域名不可选 `delegation`（IP 无 DNS 记录，无法完成委托验证）
+- 通配符域名不可选 `file`（通配符无法指向具体站点放置验证文件）
+
 ### 1.4 api
 
 | 字段    | 类型   | 说明         |
@@ -229,6 +234,8 @@ Content-Type: application/json
 | `csr`               | string | CSR PEM               |
 | `domains`           | string | 域名（逗号分隔）      |
 | `validation_method` | string | `file` / `delegation` |
+
+`validation_method` 限制见 §1.3。
 
 响应 data：单个 CertData + `renew_before_days`。
 
@@ -420,10 +427,13 @@ effective_mode = cert.renew_mode || schedule.renew_mode
 按优先级依次尝试：
 
 1. API 返回的 `private_key`
-2. 本地存储的私钥（pending-keys/ 或证书目录）
-3. 提示用户输入 PEM 私钥内容
+2. 调用参数指定的私钥路径
+3. 本地已有的私钥（绑定站点的已部署私钥）
+4. 交互提示用户提供私钥
 
-三个来源均需验证与证书匹配后才使用。
+所有来源均需验证与证书匹配后才使用。
+
+批量部署时不逐个交互，部署结束后汇总三类结果：成功、失败、需要私钥。需要私钥的证书列出名称，由用户逐个手动部署触发交互提示。
 
 ### 5.4 订单号变更处理
 

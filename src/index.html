@@ -469,8 +469,7 @@
       h += '已过期 <span class="ssl-stat-num" style="color:' + (stats.expired > 0 ? '#f56c6c' : '') + '">' + stats.expired + '</span>';
       h += '</div>';
       h += '<div class="ssl-stats-right">';
-      h += '<button class="ssl-btn ssl-btn-success ssl-btn-sm" onclick="sslbt.addCert()">添加</button>';
-      h += '<button class="ssl-btn ssl-btn-sm" onclick="sslbt.deployAll()">部署</button>';
+      h += '<button class="ssl-btn ssl-btn-success ssl-btn-sm" onclick="sslbt.addCert()">一键部署</button>';
       h += '<button class="ssl-btn ssl-btn-sm" onclick="sslbt.runRenew()">续签</button>';
       h += '<button class="ssl-btn ssl-btn-danger ssl-btn-sm" onclick="sslbt.batchRemove()">删除</button>';
       h += '</div>';
@@ -599,6 +598,10 @@
       h += '<div class="ssl-detail-item"><span class="ssl-detail-label">域名</span><span class="ssl-detail-val">' + P._e(domains) + '</span></div>';
       h += '<div class="ssl-detail-item"><span class="ssl-detail-label">过期时间</span><span class="ssl-detail-val">' + P._fmtTime(expFull) + ' ' + daysLeft + '</span></div>';
       h += '<div class="ssl-detail-item"><span class="ssl-detail-label">续签模式</span><span class="ssl-detail-val">' + renewLabel + '</span></div>';
+      if (renewMode === 'local') {
+        var vmLabel = d.validation_method === 'file' ? '文件验证' : '委托验证';
+        h += '<div class="ssl-detail-item"><span class="ssl-detail-label">验证方式</span><span class="ssl-detail-val">' + vmLabel + '</span></div>';
+      }
       h += '<div class="ssl-detail-item"><span class="ssl-detail-label">API 配置</span><span class="ssl-detail-val">' + apiInfo + '</span></div>';
       h += '<div class="ssl-detail-item"><span class="ssl-detail-label">上次部署</span><span class="ssl-detail-val">' + P._fmtTime(lastDeploy) + '</span></div>';
       h += '</div>';
@@ -634,7 +637,7 @@
 
       // 操作按钮
       h += '<div class="ssl-detail-actions">';
-      h += '<button class="ssl-btn ssl-btn-success ssl-btn-sm" onclick="sslbt.deployCert(' + oid + ')">部署全部站点</button>';
+      h += '<button class="ssl-btn ssl-btn-success ssl-btn-sm" onclick="sslbt.deployCert(' + oid + ')">部署</button>';
       h += '<button class="ssl-btn ssl-btn-sm" onclick="sslbt.checkCert(' + oid + ')">检查</button>';
       h += '<button class="ssl-btn ssl-btn-sm" onclick="sslbt.editCert(' + oid + ')">编辑</button>';
       h += '<button class="ssl-btn ssl-btn-danger ssl-btn-sm" onclick="sslbt.removeCert(' + oid + ')">删除</button>';
@@ -850,15 +853,39 @@
     },
 
     // ===== 证书操作 =====
-    deployCert: function (oid) {
-      layer.confirm('确定部署订单 ' + oid + ' 的证书到所有绑定站点？', { offset: 'auto' }, function (idx) {
-        layer.close(idx);
+    deployCert: function (oid, extraParams) {
+      var doIt = function () {
         var closeLoading = P._loading('部署中...');
-        P._call('deploy_cert', { order_id: oid }, function (r) {
+        var params = { order_id: oid };
+        if (extraParams) for (var k in extraParams) params[k] = extraParams[k];
+        P._call('deploy_cert', params, function (r) {
           closeLoading();
+          if (r.need_key) { sslbt._askPrivateKey(oid); return; }
           layer.msg(r.msg, { icon: r.status ? 1 : 2 });
           if (r.status) { delete P._certCache[oid]; P.loadCerts(); }
         });
+      };
+      if (extraParams) { doIt(); return; }
+      layer.confirm('确定部署订单 ' + oid + ' 的证书到所有绑定站点？', { offset: 'auto' }, function (idx) {
+        layer.close(idx);
+        doIt();
+      });
+    },
+
+    _askPrivateKey: function (oid) {
+      var ipt = 'style="width:100%;box-sizing:border-box"';
+      layer.open({
+        type: 1, title: '请提供私钥', area: ['500px', '340px'], offset: 'auto',
+        content: '<div style="padding:20px 30px">' +
+          '<p style="margin:0 0 10px;color:#909399;font-size:13px">API 和站点均未找到匹配的私钥，请粘贴 PEM 格式的私钥内容</p>' +
+          '<textarea id="deploy-private-key" rows="8" placeholder="-----BEGIN PRIVATE KEY-----&#10;...&#10;-----END PRIVATE KEY-----" ' + ipt + '></textarea></div>',
+        btn: ['部署', '取消'],
+        yes: function (idx) {
+          var key = $.trim($('#deploy-private-key').val());
+          if (!key) { layer.msg('请粘贴私钥内容', { icon: 0 }); return; }
+          layer.close(idx);
+          sslbt.deployCert(oid, { private_key: key });
+        }
       });
     },
 
@@ -947,9 +974,20 @@
       if (!cert) { layer.msg('证书数据未加载', { icon: 2 }); return; }
 
       var renewMode = cert.renew_mode || '';
+      var effectiveMode = cert._effective_renew_mode || renewMode || 'pull';
+      var validationMethod = cert.validation_method || 'delegation';
       var certApi = cert.api || {};
       var apiUrl = certApi.url || '';
       var apiTokenMasked = certApi.token_masked || '';
+
+      // 检测域名类型限制
+      var domains = cert.domains || [];
+      var hasIP = false, hasWildcard = false;
+      for (var di = 0; di < domains.length; di++) {
+        var dd = domains[di];
+        if (/^\d{1,3}(\.\d{1,3}){3}$/.test(dd) || dd.indexOf(':') !== -1) hasIP = true;
+        if (dd.indexOf('*.') === 0) hasWildcard = true;
+      }
 
       P._call('get_site_matches', { order_id: oid }, function (r) {
         var allSites = (r.status && r.data) ? r.data : [];
@@ -988,9 +1026,13 @@
           content:
             '<div style="padding:20px 30px">' +
             '<div ' + row + '><label ' + lbl + '>绑定站点</label>' + sitesHtml + '</div>' +
-            '<div ' + row + '><label ' + lbl + '>续签模式</label><select id="edit-renew-mode" ' + ipt + '>' +
-            '<option value="pull"' + (renewMode !== 'local' ? ' selected' : '') + '>自动签发</option>' +
-            '<option value="local"' + (renewMode === 'local' ? ' selected' : '') + '>本机提交</option></select></div>' +
+            '<div ' + row + '><label ' + lbl + '>续签模式</label><select id="edit-renew-mode" ' + ipt + ' onchange="sslbt._toggleVmRow()">' +
+            '<option value="pull"' + (effectiveMode !== 'local' ? ' selected' : '') + '>自动签发</option>' +
+            '<option value="local"' + (effectiveMode === 'local' ? ' selected' : '') + '>本机提交</option></select></div>' +
+            '<div id="edit-vm-row" style="margin-bottom:14px;display:' + (effectiveMode === 'local' ? 'block' : 'none') + '"><label ' + lbl + '>验证方式</label><select id="edit-validation-method" ' + ipt + '>' +
+            '<option value="delegation"' + (hasIP ? ' disabled' : '') + (validationMethod !== 'file' && !hasIP ? ' selected' : '') + '>委托验证</option>' +
+            '<option value="file"' + (hasWildcard ? ' disabled' : '') + (validationMethod === 'file' && !hasWildcard ? ' selected' : '') + '>文件验证</option>' +
+            '</select></div>' +
             '<div ' + row + '><label ' + lbl + '>API URL</label><input id="edit-api-url" value="' + P._e(apiUrl) + '" placeholder="https://..." ' + ipt + ' /></div>' +
             '<div ' + row + '><label ' + lbl + '>API Token' + (apiTokenMasked ? ' <span style="color:#c0c4cc;font-weight:400">当前: ' + P._e(apiTokenMasked) + '</span>' : '') + '</label><input id="edit-api-token" value="" placeholder="留空则不修改" ' + ipt + ' /></div>' +
             '</div>',
@@ -1008,6 +1050,7 @@
               site_names: newSites.join(','),
               renew_mode: newMode
             };
+            if (newMode === 'local') params.validation_method = $('#edit-validation-method').val();
             if (newApiUrl) params.api_url = newApiUrl;
             if (newApiToken) params.api_token = newApiToken;
             P._call('update_cert_config', params, function (r) {
@@ -1018,6 +1061,11 @@
           },
         });
       });
+    },
+
+    _toggleVmRow: function () {
+      var show = $('#edit-renew-mode').val() === 'local';
+      $('#edit-vm-row').toggle(show);
     },
 
     removeCert: function (oid) {
@@ -1069,19 +1117,23 @@
         // Section 3: 批量操作
         h += '<div class="ssl-settings-section"><table>';
         h += '<tr><td>续签模式</td><td>';
-        h += '<select id="batch-renew-mode" style="width:120px"><option value="pull">自动签发</option><option value="local">本机提交</option></select> ';
+        h += '<select id="batch-renew-mode" style="width:94px" onchange="sslbt._toggleBatchVm()">';
+        h += '<option value="pull">自动签发</option><option value="local">本机提交</option></select> ';
+        h += '<span id="batch-vm-wrap" style="display:none">';
+        h += '<select id="batch-validation-method" style="width:94px"><option value="delegation">委托验证</option><option value="file">文件验证</option></select> ';
+        h += '</span>';
         h += '<button class="ssl-btn ssl-btn-sm" onclick="sslbt.batchSetRenewMode()">应用到全部证书</button>';
         h += '</td></tr>';
         h += '</table></div>';
 
         // Section 4: 插件升级
         h += '<div class="ssl-settings-section"><table>';
-        h += '<tr><td>当前版本</td><td style="text-align:left !important"><span style="display:inline-block;padding-left:2px;color:#303133;font-weight:500">' + P._e(c.plugin_version || '0.0.0') + '</span></td></tr>';
-        h += '<tr><td>更新通道</td><td>';
-        h += '<select id="update-channel" style="width:120px" onchange="sslbt.saveUpdateChannel()">';
+        h += '<tr><td>插件更新</td><td>';
+        h += '<select id="update-channel" style="width:94px" onchange="sslbt.saveUpdateChannel()">';
         h += '<option value="main"' + ((c.upgrade_channel || 'main') === 'main' ? ' selected' : '') + '>稳定版</option>';
         h += '<option value="dev"' + (c.upgrade_channel === 'dev' ? ' selected' : '') + '>测试版</option></select> ';
         h += '<button class="ssl-btn ssl-btn-sm" onclick="sslbt.checkUpdate()">检查更新</button>';
+        h += ' <span style="color:#909399;font-size:12px;margin-left:8px">当前: ' + P._e(c.plugin_version || '0.0.0') + '</span>';
         h += '<span id="update-result" style="margin-left:10px"></span>';
         h += '</td></tr>';
         h += '</table></div>';
@@ -1118,13 +1170,29 @@
       });
     },
 
+    _toggleBatchVm: function () {
+      var show = $('#batch-renew-mode').val() === 'local';
+      $('#batch-vm-wrap').toggle(show);
+    },
+
     batchSetRenewMode: function () {
       var mode = $('#batch-renew-mode').val();
-      layer.confirm('确定将所有证书的续签模式设为「' + (mode === 'local' ? '本机提交' : '自动签发') + '」？', { offset: 'auto' }, function (idx) {
+      var label = mode === 'local' ? '本机提交' : '自动签发';
+      var confirmMsg = '确定将所有证书的续签模式设为「' + label + '」？';
+      if (mode === 'local') {
+        var vmLabel = $('#batch-validation-method').val() === 'file' ? '文件验证' : '委托验证';
+        confirmMsg += '\n验证方式：' + vmLabel + '（不兼容的证书将跳过）';
+      }
+      layer.confirm(confirmMsg, { offset: 'auto' }, function (idx) {
         layer.close(idx);
         P._call('batch_set_renew_mode', { renew_mode: mode }, function (r) {
           layer.msg(r.msg, { icon: r.status ? 1 : 2 });
           if (r.status) P._certCache = {};
+          if (r.status && mode === 'local') {
+            P._call('batch_set_validation_method', { validation_method: $('#batch-validation-method').val() }, function (r2) {
+              if (r2.msg) layer.msg(r2.msg, { icon: r2.status ? 1 : 2 });
+            });
+          }
         });
       });
     },

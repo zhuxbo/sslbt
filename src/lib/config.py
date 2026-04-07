@@ -5,6 +5,26 @@ import json
 import copy
 import fcntl
 import shutil
+import ipaddress
+
+
+def validate_validation_method(domains, method):
+    """校验域名列表与验证方式的兼容性，返回错误信息或空串"""
+    if not method:
+        return ''
+    for d in domains:
+        try:
+            ipaddress.ip_address(d)
+            is_ip = True
+        except ValueError:
+            is_ip = False
+        is_wildcard = len(d) > 2 and d[:2] == '*.'
+        if is_ip and method == 'delegation':
+            return 'IP 地址不支持委托验证'
+        if is_wildcard and method == 'file':
+            return '通配符域名不支持文件验证'
+    return ''
+
 
 DEFAULT_CONFIG = {
     'release_url': '',

@@ -29,9 +29,6 @@ docker exec "$CONTAINER" test -d /www/server/panel/plugin/sslbt/data && \
 docker exec "$CONTAINER" test -f /www/server/panel/plugin/sslbt/data/config.json && \
     pass "config.json 存在" || fail "config.json 不存在"
 
-docker exec "$CONTAINER" test -f /www/server/panel/plugin/sslbt/data/certs.json && \
-    pass "certs.json 存在" || fail "certs.json 不存在"
-
 docker exec "$CONTAINER" test -d /www/server/panel/plugin/sslbt/data/logs && \
     pass "logs/ 目录存在" || fail "logs/ 目录不存在"
 

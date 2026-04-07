@@ -4,7 +4,7 @@ import os
 import json
 import copy
 import pytest
-from lib.config import ConfigManager, DEFAULT_CONFIG, DEFAULT_CERT_ENTRY
+from lib.config import ConfigManager, DEFAULT_CONFIG, DEFAULT_CERT_ENTRY, validate_validation_method
 
 
 class TestConfigManager:
@@ -373,3 +373,41 @@ class TestConfigManager:
         """默认 renew_before_days 为 14"""
         cfg = config_manager.get_config()
         assert cfg['schedule']['renew_before_days'] == 14
+
+
+class TestValidateValidationMethod:
+    def test_empty_method_always_passes(self):
+        assert validate_validation_method(['example.com'], '') == ''
+        assert validate_validation_method(['*.example.com'], '') == ''
+        assert validate_validation_method(['1.2.3.4'], '') == ''
+
+    def test_normal_domain_allows_both(self):
+        assert validate_validation_method(['example.com'], 'file') == ''
+        assert validate_validation_method(['example.com'], 'delegation') == ''
+
+    def test_wildcard_allows_delegation(self):
+        assert validate_validation_method(['*.example.com'], 'delegation') == ''
+
+    def test_wildcard_rejects_file(self):
+        assert validate_validation_method(['*.example.com'], 'file') != ''
+
+    def test_ipv4_allows_file(self):
+        assert validate_validation_method(['192.168.1.1'], 'file') == ''
+
+    def test_ipv4_rejects_delegation(self):
+        assert validate_validation_method(['192.168.1.1'], 'delegation') != ''
+
+    def test_ipv6_rejects_delegation(self):
+        assert validate_validation_method(['::1'], 'delegation') != ''
+        assert validate_validation_method(['2001:db8::1'], 'delegation') != ''
+
+    def test_ipv6_allows_file(self):
+        assert validate_validation_method(['::1'], 'file') == ''
+
+    def test_mixed_domains_with_ip_rejects_delegation(self):
+        """混合域名列表中含 IP 时，delegation 应被拒绝"""
+        assert validate_validation_method(['example.com', '1.2.3.4'], 'delegation') != ''
+
+    def test_mixed_domains_with_wildcard_rejects_file(self):
+        """混合域名列表中含通配符时，file 应被拒绝"""
+        assert validate_validation_method(['example.com', '*.example.com'], 'file') != ''
