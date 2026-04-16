@@ -2,11 +2,11 @@
 
 跨平台 SSL 证书自动部署工具的共通行为规范。定义配置文件结构、API 接口、续签状态机、一键部署、部署流程、升级协议、安装/卸载、安全规范和共享常量。
 
-适用项目：sslctl（Linux Nginx/Apache）、sslctlw（Windows IIS）、sslbt（宝塔面板）及未来新平台实现。
+适用项目：sslctl（Linux Nginx/Apache）、sslctlw（Windows IIS）、sslbt（宝塔面板）、sslnas（NAS 系统）及未来新平台实现。
 
 ## 定位
 
-- **开发参考**：维护现有三个项目时保持行为一致
+- **开发参考**：维护现有项目时保持行为一致
 - **新项目蓝图**：新平台实现时的快速指导
 - **范围**：仅定义所有项目共有的交集行为，各项目独有特性自行处理
 
@@ -94,6 +94,7 @@
 | Nginx/Apache | 1:N       | 1:1       | `bindings[]`（按站点）        |
 | IIS          | 1:N       | 1:N       | `bind_rules[]`（按域名:端口） |
 | 宝塔         | 1:N       | 1:1       | `site_name[]`（站点名列表）   |
+| NAS          | 1:1       | 1:1       | 无（直接部署到 NAS 证书存储） |
 
 ### 1.7 配置文件迁移
 
@@ -355,6 +356,8 @@ effective_mode = cert.renew_mode || schedule.renew_mode
 4. 记录已放置的文件路径到 metadata
 5. 部署成功后自动清理所有验证文件
 ```
+
+**平台豁免**：NAS 平台（sslnas）豁免此流程。NAS 通常部署在家庭宽带环境，80/443 端口不通，无法完成 HTTP 文件验证。遇到 `file` 字段时记录警告日志并跳过。NAS 的 local 模式应使用 `delegation`（DNS 委托）验证。
 
 ### 3.7 并发执行保护
 
