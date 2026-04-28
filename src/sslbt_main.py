@@ -16,7 +16,7 @@ sys.path.insert(0, PLUGIN_DIR)
 # 热更新：宝塔面板每次请求调用 reload(sslbt_main)，但不会递归 reload 子模块，
 # 导致升级后 lib/ 下的模块仍是旧版本。检测到 reload 时清除缓存，重新 import 即可。
 # 判断方式：首次 import 时 sslbt_main 类尚未定义，reload 时已存在。
-# 副作用：reload 会重置类变量（如 _pending_tokens），升级瞬间进行中的操作需重试。
+# 注意：reload 会重置类变量；session 已改为磁盘持久化（data/sessions.json），不受影响。
 if hasattr(sys.modules.get('sslbt_main'), 'sslbt_main'):
     for _mod in [k for k in sys.modules if k == 'lib' or k.startswith('lib.')]:
         del sys.modules[_mod]
@@ -51,19 +51,51 @@ def _err(msg='操作失败'):
 
 
 SESSION_EXPIRE_SECONDS = 600  # 10 分钟
+SESSION_FILE_NAME = 'sessions.json'
 
 
 class sslbt_main:
     """SSL 自动部署插件"""
 
-    _setup_done = False
-    _pending_tokens = {}  # 类变量，跨实例保持 session
-
     def __init__(self):
         os.makedirs(DATA_DIR, exist_ok=True)
+        self._data_dir = DATA_DIR
         self._logger = Logger(os.path.join(DATA_DIR, 'logs'))
         self._config = ConfigManager(DATA_DIR, logger=self._logger)
         self._site_mgr = SiteManager(self._logger)
+
+    def _session_file(self):
+        return os.path.join(self._data_dir, SESSION_FILE_NAME)
+
+    def _load_sessions(self):
+        """从磁盘加载 session 并丢弃过期项。读失败返回空 dict。"""
+        path = self._session_file()
+        if not os.path.exists(path):
+            return {}
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f) or {}
+        except (OSError, ValueError):
+            return {}
+        now = time.time()
+        return {
+            k: v for k, v in data.items()
+            if isinstance(v, dict) and v.get('created_at')
+            and now - v['created_at'] <= SESSION_EXPIRE_SECONDS
+        }
+
+    def _save_sessions(self, tokens):
+        """原子写入 session 文件，权限 0600。"""
+        os.makedirs(self._data_dir, exist_ok=True)
+        path = self._session_file()
+        tmp = path + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(tokens, f)
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp, path)
 
     def _get_api_for_cert(self, cert_entry):
         """获取证书级别的 API 客户端"""
@@ -72,20 +104,12 @@ class sslbt_main:
             return None
         return APIClient(url, token, self._logger)
 
-    def _cleanup_sessions(self):
-        """清理过期的 pending token 会话"""
-        now = time.time()
-        expired = [k for k, v in self._pending_tokens.items()
-                   if now - v['created_at'] > SESSION_EXPIRE_SECONDS]
-        for k in expired:
-            del self._pending_tokens[k]
-
     def _resolve_api_params(self, args):
         """从 session_id 或直接参数中解析 api_url/api_token，返回 (api_url, api_token) 或 (None, error_msg)"""
         session_id = _get_param(args, 'session_id', '').strip()
         if session_id:
-            self._cleanup_sessions()
-            session = self._pending_tokens.get(session_id)
+            tokens = self._load_sessions()
+            session = tokens.get(session_id)
             if not session:
                 return None, '会话已过期，请重新解析部署链接'
             return (session['api_url'], session['api_token']), None
@@ -234,6 +258,7 @@ class sslbt_main:
 
     def add_cert(self, args=None):
         """添加证书订单"""
+        self._logger.info("add_cert 调用: args=%s", args)
         try:
             order_id = _get_param(args, 'order_id', '')
             site_names_str = _get_param(args, 'site_names', '')
@@ -242,12 +267,14 @@ class sslbt_main:
             validation_method = _get_param(args, 'validation_method', '')
 
             if not order_id:
+                self._logger.warning("add_cert 早返回: 缺少 order_id")
                 return _err('请提供订单 ID')
 
             order_id = int(order_id)
 
             result, err = self._resolve_api_params(args)
             if err:
+                self._logger.warning("add_cert 早返回: _resolve_api_params 失败 order_id=%s err=%s", order_id, err)
                 return _err(err)
             api_url, api_token = result
             api = APIClient(api_url, api_token, self._logger)
@@ -259,6 +286,7 @@ class sslbt_main:
                 from lib.config import validate_validation_method
                 err_msg = validate_validation_method(domains, validation_method)
                 if err_msg:
+                    self._logger.warning("add_cert 早返回: validation_method 校验失败 order_id=%s err=%s", order_id, err_msg)
                     return _err(err_msg)
 
             cert_name = 'order-%d' % order_id
@@ -291,11 +319,14 @@ class sslbt_main:
 
             return _ok(entry, msg='证书添加成功')
         except ValueError as e:
+            self._logger.warning("add_cert ValueError: %s", str(e))
             return _err(str(e))
         except APIError as e:
+            self._logger.error("add_cert APIError: %s", str(e))
             return _err('API 错误: %s' % str(e))
         except Exception as e:
-            self._logger.error("添加证书失败: %s", str(e))
+            import traceback
+            self._logger.error("add_cert 异常: %s\n%s", str(e), traceback.format_exc())
             return _err('添加失败: %s' % str(e))
 
     @staticmethod
@@ -394,14 +425,17 @@ class sslbt_main:
 
     def deploy_cert(self, args=None):
         """部署指定证书到多个站点"""
+        self._logger.info("deploy_cert 调用: args=%s", args)
         try:
             order_id = _get_param(args, 'order_id', '')
             if not order_id:
+                self._logger.warning("deploy_cert 早返回: 缺少 order_id")
                 return _err('请提供订单 ID')
 
             order_id = int(order_id)
             cert_entry = self._config.get_cert(order_id)
             if not cert_entry:
+                self._logger.warning("deploy_cert 早返回: 订单 %d 不存在", order_id)
                 return _err('订单 %d 不存在' % order_id)
 
             # site_name 为列表（兼容字符串）
@@ -409,10 +443,12 @@ class sslbt_main:
             if isinstance(site_name, str):
                 site_name = [site_name] if site_name else []
             if not site_name:
+                self._logger.warning("deploy_cert 早返回: order_id=%s 未绑定站点", order_id)
                 return _err('该证书未绑定站点')
 
             api = self._get_api_for_cert(cert_entry)
             if not api:
+                self._logger.warning("deploy_cert 早返回: order_id=%s API 未配置", order_id)
                 return _err('请先配置 API 连接')
 
             # 查询证书
@@ -442,16 +478,20 @@ class sslbt_main:
                             'last_issue_state': 'processing',
                         })
                         return _ok(msg='验证文件已放置，等待 CA 验证后签发')
+                    self._logger.warning("deploy_cert 早返回: order_id=%s 验证文件放置失败", order_id)
                     return _err('验证文件放置失败')
+                self._logger.warning("deploy_cert 早返回: order_id=%s processing 但无 file_info", order_id)
                 return _err('证书处理中，请稍后再试')
 
             if status != 'active':
+                self._logger.warning("deploy_cert 早返回: order_id=%s 状态为 %s 非 active", order_id, status)
                 return _err('证书状态为 %s，无法部署' % status)
 
             certificate = cert_data.get('certificate', '')
             ca_certificate = cert_data.get('ca_certificate', '')
 
             if not certificate:
+                self._logger.warning("deploy_cert 早返回: order_id=%s 证书内容为空", order_id)
                 return _err('证书内容为空')
 
             fullchain = build_fullchain(certificate, ca_certificate)
@@ -460,6 +500,7 @@ class sslbt_main:
             private_key = self._resolve_private_key(
                 cert_data, args, fullchain, site_name)
             if not private_key:
+                self._logger.warning("deploy_cert 早返回: order_id=%s 私钥回退链未命中，need_key", order_id)
                 return {'status': False, 'msg': '未找到匹配的私钥，请提供私钥', 'need_key': True}
 
             # 从证书提取域名并更新配置
@@ -495,6 +536,7 @@ class sslbt_main:
             self._logger.error("部署失败: %s", str(e))
             return _err('部署失败: %s' % str(e))
         except APIError as e:
+            self._logger.error("deploy_cert API 错误: %s", str(e))
             return _err('API 错误: %s' % str(e))
         except Exception as e:
             self._logger.error("部署失败: %s", str(e))
@@ -660,14 +702,15 @@ class sslbt_main:
                 c['_domains'] = domains
                 c['_matches'] = SiteManager.match_sites_for_cert(domains, available_sites)
 
-            # 暂存 token，前端仅持有 session_id
-            self._cleanup_sessions()
+            # 暂存 token，前端仅持有 session_id（持久化到磁盘，避免 reload 丢失）
+            tokens = self._load_sessions()
             session_id = secrets.token_urlsafe(32)
-            self._pending_tokens[session_id] = {
+            tokens[session_id] = {
                 'api_url': api_url,
                 'api_token': token,
                 'created_at': time.time(),
             }
+            self._save_sessions(tokens)
             return _ok({
                 'api': {
                     'url': api_url,
@@ -903,3 +946,62 @@ class sslbt_main:
         except Exception as e:
             self._logger.error("更新失败: %s", str(e))
             return _err('更新失败: %s' % str(e))
+
+
+# ===== 命令行调试入口 =====
+# 用法:
+#   btpython /www/server/panel/plugin/sslbt/sslbt_main.py <method> [json_args]
+# 示例:
+#   btpython sslbt_main.py get_cert_list
+#   btpython sslbt_main.py add_cert '{"order_id":"<ID>","site_names":"www.example.com",
+#     "api_url":"https://api.example.com","api_token":"<TOKEN>"}'
+#   btpython sslbt_main.py deploy_cert '{"order_id":"<ID>"}'
+# 输出: 调用结果 JSON + 异常堆栈直接打到 stderr，同时仍写入日志文件
+if __name__ == '__main__':
+    import json as _json
+    import traceback as _tb
+
+    # 让 CLI 行为对齐面板进程：补上宝塔的 class 目录，使 crontab/panelSite 等可 import
+    _BT_CLASS_DIR = '/www/server/panel/class'
+    if os.path.isdir(_BT_CLASS_DIR) and _BT_CLASS_DIR not in sys.path:
+        sys.path.insert(0, _BT_CLASS_DIR)
+
+    if len(sys.argv) < 2:
+        print('用法: python sslbt_main.py <method> [json_args]', file=sys.stderr)
+        print('可用方法见类 sslbt_main 中以非下划线开头的函数', file=sys.stderr)
+        sys.exit(2)
+
+    _method = sys.argv[1]
+    _raw = sys.argv[2] if len(sys.argv) >= 3 else ''
+    _args = None
+    if _raw:
+        try:
+            _args = _json.loads(_raw)
+        except ValueError as _e:
+            print('JSON 参数解析失败: %s' % _e, file=sys.stderr)
+            sys.exit(2)
+
+    try:
+        _instance = sslbt_main()
+    except Exception as _e:
+        print('初始化失败: %s' % _e, file=sys.stderr)
+        _tb.print_exc()
+        sys.exit(1)
+
+    _fn = getattr(_instance, _method, None)
+    if not callable(_fn) or _method.startswith('_'):
+        print('方法不存在或不可调用: %s' % _method, file=sys.stderr)
+        sys.exit(2)
+
+    print('[debug] 调用 %s(%s)' % (_method, _args), file=sys.stderr)
+    try:
+        _result = _fn(_args)
+    except Exception as _e:
+        print('方法执行抛出异常: %s' % _e, file=sys.stderr)
+        _tb.print_exc()
+        sys.exit(1)
+
+    try:
+        print(_json.dumps(_result, ensure_ascii=False, indent=2, default=str))
+    except Exception:
+        print(repr(_result))

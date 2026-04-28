@@ -817,13 +817,28 @@
       var total = certs.length;
       var done = 0;
       var results = [];
+      var deployResults = [];
 
       var deployPending = 0;
       var finishAll = function () {
         closeLoading();
-        var okCount = 0;
-        for (var k = 0; k < results.length; k++) if (results[k].status) okCount++;
-        layer.msg('添加完成: ' + okCount + ' 成功 / ' + (total - okCount) + ' 失败', { icon: okCount > 0 ? 1 : 2 });
+        var addOk = 0, addFail = [];
+        for (var k = 0; k < results.length; k++) {
+          if (results[k].status) addOk++;
+          else addFail.push('订单 ' + results[k].order_id + ' 添加失败: ' + (results[k].msg || '未知错误'));
+        }
+        var deployFail = [];
+        for (var m = 0; m < deployResults.length; m++) {
+          if (!deployResults[m].status) {
+            deployFail.push('订单 ' + deployResults[m].order_id + ' 部署失败: ' + (deployResults[m].msg || '未知错误'));
+          }
+        }
+        var msgs = addFail.concat(deployFail);
+        if (msgs.length) {
+          layer.alert(msgs.join('<br>'), { icon: 2, title: '操作完成（含失败）', offset: 'auto' });
+        } else {
+          layer.msg('添加并部署成功（' + addOk + ' 个证书）', { icon: 1 });
+        }
         P._certCache = {};
         P.loadCerts();
       };
@@ -840,7 +855,8 @@
             results.push({ order_id: c.order_id, status: r.status, msg: r.msg });
             if (r.status && sites.length) {
               deployPending++;
-              P._call('deploy_cert', { order_id: c.order_id }, function () {
+              P._call('deploy_cert', { order_id: c.order_id }, function (dr) {
+                deployResults.push({ order_id: c.order_id, status: dr && dr.status, msg: dr && dr.msg });
                 deployPending--;
                 if (done === total && deployPending === 0) finishAll();
               });

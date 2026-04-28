@@ -18,10 +18,10 @@ def plugin(tmp_data_dir):
     from sslbt_main import sslbt_main
 
     inst = sslbt_main.__new__(sslbt_main)
+    inst._data_dir = tmp_data_dir
     inst._config = ConfigManager(tmp_data_dir)
     inst._logger = Logger(os.path.join(tmp_data_dir, 'logs'))
     inst._site_mgr = MagicMock()
-    inst._pending_tokens = {}
     return inst
 
 
@@ -581,14 +581,99 @@ class TestFetchDeployUrl:
 
     def test_expired_session(self, plugin):
         """过期 session_id 被拒绝"""
-        plugin._pending_tokens['old-session'] = {
-            'api_url': 'https://api.example.com',
-            'api_token': TOKEN,
-            'created_at': time.time() - 700,  # 超过 10 分钟
-        }
+        plugin._save_sessions({
+            'old-session': {
+                'api_url': 'https://api.example.com',
+                'api_token': TOKEN,
+                'created_at': time.time() - 700,  # 超过 10 分钟
+            }
+        })
         result = plugin.add_cert({'order_id': '100', 'session_id': 'old-session'})
         assert result['status'] is False
         assert '过期' in result['msg']
+
+    def test_load_sessions_missing_file(self, plugin):
+        """session 文件不存在时 _load_sessions 返回空 dict"""
+        path = plugin._session_file()
+        assert not os.path.exists(path)
+        assert plugin._load_sessions() == {}
+
+    def test_load_sessions_corrupted_json(self, plugin):
+        """session 文件 JSON 损坏时 _load_sessions 安全降级返回空 dict"""
+        path = plugin._session_file()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write('{not valid json')
+        assert plugin._load_sessions() == {}
+
+    def test_load_sessions_filters_expired_and_invalid(self, plugin):
+        """_load_sessions 过滤过期项与缺 created_at 的脏数据"""
+        plugin._save_sessions({
+            'fresh': {
+                'api_url': 'https://api.example.com',
+                'api_token': TOKEN,
+                'created_at': time.time(),
+            },
+            'expired': {
+                'api_url': 'https://api.example.com',
+                'api_token': TOKEN,
+                'created_at': time.time() - 700,
+            },
+            'malformed': 'not-a-dict',
+            'no_timestamp': {'api_url': 'x', 'api_token': 'y'},
+        })
+        loaded = plugin._load_sessions()
+        assert 'fresh' in loaded
+        assert 'expired' not in loaded
+        assert 'malformed' not in loaded
+        assert 'no_timestamp' not in loaded
+
+    def test_save_sessions_permission_0600(self, plugin):
+        """session 文件落盘后权限为 0600"""
+        plugin._save_sessions({
+            's1': {'api_url': 'https://api.example.com', 'api_token': TOKEN, 'created_at': time.time()},
+        })
+        path = plugin._session_file()
+        assert os.path.exists(path)
+        mode = os.stat(path).st_mode & 0o777
+        assert mode == 0o600, 'session file mode should be 0600, got %o' % mode
+
+    def test_save_sessions_no_tmp_residue(self, plugin):
+        """save 完成后不应残留 .tmp 文件（os.replace 是原子的）"""
+        plugin._save_sessions({
+            's1': {'api_url': 'https://api.example.com', 'api_token': TOKEN, 'created_at': time.time()},
+        })
+        tmp_path = plugin._session_file() + '.tmp'
+        assert not os.path.exists(tmp_path)
+
+    def test_session_persists_across_instances(self, tmp_data_dir):
+        """模拟宝塔 reload：同一 data_dir 下新建实例仍能读到 session（核心回归测试）"""
+        from sslbt_main import sslbt_main as _SM
+
+        # 第一个实例写入 session
+        inst1 = _SM.__new__(_SM)
+        inst1._data_dir = tmp_data_dir
+        inst1._config = ConfigManager(tmp_data_dir)
+        inst1._logger = Logger(os.path.join(tmp_data_dir, 'logs'))
+        inst1._site_mgr = MagicMock()
+        inst1._save_sessions({
+            'sid-A': {
+                'api_url': 'https://api.example.com',
+                'api_token': TOKEN,
+                'created_at': time.time(),
+            },
+        })
+
+        # 第二个实例（模拟 reload 后新建）——类变量已重置，但磁盘还在
+        inst2 = _SM.__new__(_SM)
+        inst2._data_dir = tmp_data_dir
+        inst2._config = ConfigManager(tmp_data_dir)
+        inst2._logger = Logger(os.path.join(tmp_data_dir, 'logs'))
+        inst2._site_mgr = MagicMock()
+
+        loaded = inst2._load_sessions()
+        assert 'sid-A' in loaded
+        assert loaded['sid-A']['api_token'] == TOKEN
 
     @patch('urllib.request.urlopen')
     def test_api_error(self, mock_urlopen, plugin):
