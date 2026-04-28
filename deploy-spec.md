@@ -2,11 +2,11 @@
 
 跨平台 SSL 证书自动部署工具的共通行为规范。定义配置文件结构、API 接口、续签状态机、一键部署、部署流程、升级协议、安装/卸载、安全规范和共享常量。
 
-适用项目：sslctl（Linux Nginx/Apache）、sslctlw（Windows IIS）、sslbt（宝塔面板）及未来新平台实现。
+适用项目：sslctl（Linux Nginx/Apache）、sslctlw（Windows IIS）、sslbt（宝塔面板）、sslnas（NAS 系统）及未来新平台实现。
 
 ## 定位
 
-- **开发参考**：维护现有三个项目时保持行为一致
+- **开发参考**：维护现有项目时保持行为一致
 - **新项目蓝图**：新平台实现时的快速指导
 - **范围**：仅定义所有项目共有的交集行为，各项目独有特性自行处理
 
@@ -94,6 +94,7 @@
 | Nginx/Apache | 1:N       | 1:1       | `bindings[]`（按站点）        |
 | IIS          | 1:N       | 1:N       | `bind_rules[]`（按域名:端口） |
 | 宝塔         | 1:N       | 1:1       | `site_name[]`（站点名列表）   |
+| NAS          | 1:1       | 1:1       | 无（直接部署到 NAS 证书存储） |
 
 ### 1.7 配置文件迁移
 
@@ -356,6 +357,8 @@ effective_mode = cert.renew_mode || schedule.renew_mode
 5. 部署成功后自动清理所有验证文件
 ```
 
+**平台豁免**：NAS 平台（sslnas）豁免此流程。NAS 通常部署在家庭宽带环境，80/443 端口不通，无法完成 HTTP 文件验证。遇到 `file` 字段时记录警告日志并跳过。NAS 的 local 模式应使用 `delegation`（DNS 委托）验证。
+
 ### 3.7 并发执行保护
 
 防止多个进程同时执行续签（cron 重叠、手动与自动并发）：
@@ -580,19 +583,33 @@ GET {release_url}/releases.json
 | `--dev`                 | 安装测试通道版本                       |
 | `--force`               | 强制重新安装（即使已安装相同版本）     |
 
-### 7.2 安装流程
+`releaseDomain` 省略时使用内置默认域名。参数可带子路径段（如 `cdn.example.com/mirror`），在该路径上继续探测。
+
+### 7.2 发布目录探测
+
+按以下顺序探测产品发布目录，首个返回有效 `releases.json` 的候选作为 `release_url` 基础 URL，后续下载、升级均沿用：
+
+1. `https://{releaseDomain}/{product}/releases.json`（根目录布局）
+2. `https://{releaseDomain}/release/{product}/releases.json`（`/release/` 回落布局）
+
+判定标准：HTTP 2xx 且响应可解析为包含通道 key 的 JSON。两种布局均不可达时按网络错误退出，不静默使用默认值。
+
+若 `releaseDomain` 已含路径段，相对路径在该段之上追加（`{host}/{path}/{product}/…` 与 `{host}/{path}/release/{product}/…`）。
+
+### 7.3 安装流程
 
 ```
 1. 解析参数，确定通道（main/dev）和版本
-2. 获取 {release_url}/releases.json，从对应通道确定目标版本
-3. 下载安装包
-4. SHA256 校验
-5. 解压安装到目标目录
-6. 写入 release_url、upgrade_channel 到配置文件（已有配置和证书数据不覆盖）
-7. 注册守护服务/计划任务（平台特定扩展点）
+2. 探测发布目录（§7.2），确定 release_url
+3. 获取 {release_url}/releases.json，从对应通道确定目标版本
+4. 下载安装包
+5. SHA256 校验
+6. 解压安装到目标目录
+7. 写入 release_url、upgrade_channel 到配置文件（已有配置和证书数据不覆盖）
+8. 注册守护服务/计划任务（平台特定扩展点）
 ```
 
-### 7.3 幂等性
+### 7.4 幂等性
 
 - 重复执行 = 升级
 - 已有配置文件（`config.json`）和证书数据目录不覆盖

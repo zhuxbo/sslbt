@@ -53,9 +53,30 @@ for _py in python3 /www/server/panel/pyenv/bin/python3 python; do
     fi
 done
 
-RELEASE_PATH="/sslbt"
 RELEASE_HOST="${RELEASE_HOST:-release.cnssl.com}"
-RELEASE_URL="https://${RELEASE_HOST%/}${RELEASE_PATH}"
+RELEASE_HOST="${RELEASE_HOST%/}"
+
+# 发布目录探测
+probe_release_url() {
+    local host="$1"
+    local candidate body
+    for suffix in "/sslbt" "/release/sslbt"; do
+        candidate="https://${host}${suffix}"
+        body=$(curl -s --connect-timeout 5 --max-time 10 "${candidate}/releases.json" 2>/dev/null || echo "")
+        if echo "$body" | grep -q '"latest"'; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+echo_info "探测发布目录..."
+RELEASE_URL=$(probe_release_url "$RELEASE_HOST")
+if [ -z "$RELEASE_URL" ]; then
+    echo_error "发布目录不可达: https://${RELEASE_HOST}/sslbt/releases.json 与 https://${RELEASE_HOST}/release/sslbt/releases.json 均无响应"
+    exit 1
+fi
 
 [ "$EUID" -ne 0 ] && { echo_error "请使用 root 权限运行"; exit 1; }
 
@@ -63,7 +84,7 @@ PANEL_DIR="/www/server/panel"
 PLUGIN_DIR="$PANEL_DIR/plugin/sslbt"
 [ ! -d "$PANEL_DIR" ] && { echo_error "未检测到宝塔面板: $PANEL_DIR"; exit 1; }
 echo_info "宝塔面板: $PANEL_DIR"
-echo_info "发布服务器: $RELEASE_HOST"
+echo_info "使用发布地址: $RELEASE_URL"
 
 normalize_version() {
     local ver="$1"
