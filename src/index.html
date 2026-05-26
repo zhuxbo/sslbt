@@ -651,6 +651,7 @@
       var ipt = 'style="width:100%;padding:8px 10px;border:1px solid #dcdfe6;border-radius:3px;font-size:13px;box-sizing:border-box;font-family:inherit;resize:vertical"';
       layer.open({
         type: 1,
+        closeBtn: 2,
         title: '添加证书',
         area: ['560px', '340px'],
         offset: 'auto',
@@ -835,7 +836,7 @@
         }
         var msgs = addFail.concat(deployFail);
         if (msgs.length) {
-          layer.alert(msgs.join('<br>'), { icon: 2, title: '操作完成（含失败）', offset: 'auto' });
+          layer.alert(msgs.join('<br>'), { icon: 2, closeBtn: 2, title: '操作完成（含失败）', offset: 'auto' });
         } else {
           layer.msg('添加并部署成功（' + addOk + ' 个证书）', { icon: 1 });
         }
@@ -882,7 +883,7 @@
         });
       };
       if (extraParams) { doIt(); return; }
-      layer.confirm('确定部署订单 ' + oid + ' 的证书到所有绑定站点？', { offset: 'auto' }, function (idx) {
+      layer.confirm('确定部署订单 ' + oid + ' 的证书到所有绑定站点？', { offset: 'auto', closeBtn: 2 }, function (idx) {
         layer.close(idx);
         doIt();
       });
@@ -891,7 +892,7 @@
     _askPrivateKey: function (oid) {
       var ipt = 'style="width:100%;box-sizing:border-box"';
       layer.open({
-        type: 1, title: '请提供私钥', area: ['500px', '340px'], offset: 'auto',
+        type: 1, closeBtn: 2, title: '请提供私钥', area: ['500px', '340px'], offset: 'auto',
         content: '<div style="padding:20px 30px">' +
           '<p style="margin:0 0 10px;color:#909399;font-size:13px">API 和站点均未找到匹配的私钥，请粘贴 PEM 格式的私钥内容</p>' +
           '<textarea id="deploy-private-key" rows="8" placeholder="-----BEGIN PRIVATE KEY-----&#10;...&#10;-----END PRIVATE KEY-----" ' + ipt + '></textarea></div>',
@@ -914,7 +915,7 @@
     deployAll: function () {
       var oids = sslbt._getSelectedOids();
       var msg = oids.length ? '部署选中的 ' + oids.length + ' 个证书？' : '部署所有已启用的证书？';
-      layer.confirm(msg, { offset: 'auto' }, function (idx) {
+      layer.confirm(msg, { offset: 'auto', closeBtn: 2 }, function (idx) {
         layer.close(idx);
         var closeLoading = P._loading('批量部署中...');
         var params = oids.length ? { order_ids: oids.join(',') } : null;
@@ -929,7 +930,7 @@
     batchRemove: function () {
       var oids = sslbt._getSelectedOids();
       if (!oids.length) { layer.msg('请先选择证书', { icon: 0 }); return; }
-      layer.confirm('确定删除选中的 ' + oids.length + ' 个证书？', { offset: 'auto' }, function (idx) {
+      layer.confirm('确定删除选中的 ' + oids.length + ' 个证书？', { offset: 'auto', closeBtn: 2 }, function (idx) {
         layer.close(idx);
         var done = 0, fail = 0, total = oids.length;
         var closeLoading = P._loading('批量删除中...');
@@ -969,6 +970,7 @@
         h += '</div>';
         layer.open({
           type: 1,
+          closeBtn: 2,
           title: '证书状态',
           area: ['420px', updated ? '290px' : '270px'],
           offset: 'auto',
@@ -1036,6 +1038,7 @@
 
         layer.open({
           type: 1,
+          closeBtn: 2,
           title: '编辑证书 #' + oid,
           area: ['480px', '460px'],
           offset: 'auto',
@@ -1085,7 +1088,7 @@
     },
 
     removeCert: function (oid) {
-      layer.confirm('确定删除订单 ' + oid + '？（不会影响已部署的证书）', { offset: 'auto' }, function (idx) {
+      layer.confirm('确定删除订单 ' + oid + '？（不会影响已部署的证书）', { offset: 'auto', closeBtn: 2 }, function (idx) {
         layer.close(idx);
         P._call('remove_cert', { order_id: oid }, function (r) {
           layer.msg(r.msg, { icon: r.status ? 1 : 2 });
@@ -1105,7 +1108,7 @@
         for (var i = 0; i < rs.length; i++)
           h += '<tr><td>' + rs[i].order_id + '</td><td>' + rs[i].status + '</td><td>' + rs[i].message + '</td></tr>';
         h += '</tbody></table></div>';
-        layer.open({ type: 1, title: '续签结果', area: ['560px', '400px'], offset: 'auto', content: h });
+        layer.open({ type: 1, closeBtn: 2, title: '续签结果', area: ['560px', '400px'], offset: 'auto', content: h });
         P._certCache = {};
         P.loadCerts();
       });
@@ -1177,7 +1180,7 @@
     },
 
     removeCron: function () {
-      layer.confirm('确定删除计划任务？', { offset: 'auto' }, function (idx) {
+      layer.confirm('确定删除计划任务？', { offset: 'auto', closeBtn: 2 }, function (idx) {
         layer.close(idx);
         P._call('remove_cron', null, function (r) {
           layer.msg(r.msg, { icon: r.status ? 1 : 2 });
@@ -1199,7 +1202,7 @@
         var vmLabel = $('#batch-validation-method').val() === 'file' ? '文件验证' : '委托验证';
         confirmMsg += '\n验证方式：' + vmLabel + '（不兼容的证书将跳过）';
       }
-      layer.confirm(confirmMsg, { offset: 'auto' }, function (idx) {
+      layer.confirm(confirmMsg, { offset: 'auto', closeBtn: 2 }, function (idx) {
         layer.close(idx);
         P._call('batch_set_renew_mode', { renew_mode: mode }, function (r) {
           layer.msg(r.msg, { icon: r.status ? 1 : 2 });
@@ -1223,6 +1226,7 @@
     _promptReleaseUrl: function () {
       layer.open({
         type: 1,
+        closeBtn: 2,
         title: '设置升级服务器',
         area: ['400px', '200px'],
         offset: 'auto',
@@ -1283,6 +1287,7 @@
         if (r.status) {
           sp.innerHTML = '<span style="color:#67c23a">更新成功！</span>';
           layer.alert('插件更新成功。刷新页面即可加载新版本，若遇到异常请重启面板（bt restart）。', {
+            closeBtn: 2,
             title: '更新完成',
             icon: 1,
             offset: 'auto',
@@ -1311,7 +1316,7 @@
     },
 
     clearLogs: function () {
-      layer.confirm('确定清除所有日志？', { offset: 'auto' }, function (idx) {
+      layer.confirm('确定清除所有日志？', { offset: 'auto', closeBtn: 2 }, function (idx) {
         layer.close(idx);
         P._call('clear_logs', null, function (r) {
           layer.msg(r.msg, { icon: r.status ? 1 : 2 });

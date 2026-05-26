@@ -44,14 +44,15 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# 检测 Python3 路径（宝塔自带 Python 可能不在系统 PATH 中）
+# 检测 Python3 路径（宝塔自带 Python 不在系统 PATH 中，需查找已知位置）
 PYTHON3=""
-for _py in python3 /www/server/panel/pyenv/bin/python3 python; do
+for _py in python3 /www/server/panel/pyenv/bin/python3; do
     if command -v "$_py" &>/dev/null && "$_py" -c "import json" &>/dev/null; then
         PYTHON3="$_py"
         break
     fi
 done
+[ -z "$PYTHON3" ] && { echo_error "未找到 Python3（宝塔环境应内置 /www/server/panel/pyenv/bin/python3）"; exit 1; }
 
 RELEASE_HOST="${RELEASE_HOST:-release.cnssl.com}"
 RELEASE_HOST="${RELEASE_HOST%/}"
@@ -106,19 +107,14 @@ get_target_version() {
     [ -z "$CHANNEL" ] && CHANNEL="main"
 
     # spec 6.1: 通道做顶层 key，读取 [channel].latest
-    local version=""
-    if [ -n "$PYTHON3" ]; then
-        version=$($PYTHON3 -c "
+    local version
+    version=$($PYTHON3 -c "
 import sys, json
 try:
     d = json.load(sys.stdin)
     print(d.get('$CHANNEL', {}).get('latest', ''))
 except: pass
 " <<< "$RELEASES_JSON" 2>/dev/null)
-    else
-        # 无 Python 时用 grep 粗略提取（仅适用于 main 通道）
-        version=$(echo "$RELEASES_JSON" | grep -o '"latest" *: *"[^"]*"' | head -1 | cut -d'"' -f4)
-    fi
     [ -n "$version" ] && normalize_version "$version" || echo ""
 }
 
@@ -129,7 +125,7 @@ VERSION=$(get_target_version)
 
 # 检测已安装版本
 CURRENT_VERSION=""
-if [ -f "$PLUGIN_DIR/info.json" ] && [ -n "$PYTHON3" ]; then
+if [ -f "$PLUGIN_DIR/info.json" ]; then
     CURRENT_VERSION=$($PYTHON3 -c "
 import json
 try:
@@ -144,7 +140,7 @@ if [ -n "$CURRENT_VERSION" ]; then
     if [ "$CURRENT_VERSION" = "$VERSION" ]; then
         [ "$FORCE" = true ] && echo_info "当前版本: $CURRENT_VERSION，强制重新安装" || { echo_info "当前版本 $CURRENT_VERSION 已是目标版本，使用 --force 强制重新安装"; exit 0; }
     else
-        echo_info "升级: $CURRENT_VERSION → $VERSION"
+        echo_info "安装: $CURRENT_VERSION → $VERSION"
     fi
 fi
 
@@ -161,7 +157,7 @@ fi
 
 # SHA256 校验（spec 6.1: checksums 按文件名索引）
 EXPECTED_HASH=""
-if [ -n "$RELEASES_JSON" ] && [ -n "$PYTHON3" ]; then
+if [ -n "$RELEASES_JSON" ]; then
     # spec 6.1: checksums 内嵌在版本条目中，version 不带 v 前缀
     EXPECTED_HASH=$($PYTHON3 -c "
 import sys, json
@@ -202,25 +198,17 @@ fi
 echo_info "安装中..."
 
 # spec 10.2: 符号链接防护 — 拒绝包含符号链接的 ZIP
-if [ -n "$PYTHON3" ]; then
-    if ! $PYTHON3 -c "
+if ! $PYTHON3 -c "
 import zipfile, sys
 with zipfile.ZipFile(sys.argv[1], 'r') as zf:
     for info in zf.infolist():
         if info.external_attr >> 28 == 0xA:
-            print('symlink: ' + info.filename, file=sys.stderr)
+            sys.stderr.write('symlink: ' + info.filename + '\n')
             sys.exit(1)
 " "$TMP_FILE" 2>/dev/null; then
-        echo_error "ZIP 包含符号链接，拒绝安装"
-        rm -f "$TMP_FILE"
-        exit 1
-    fi
-elif command -v zipinfo &>/dev/null; then
-    if zipinfo "$TMP_FILE" 2>/dev/null | grep -q '^l'; then
-        echo_error "ZIP 包含符号链接，拒绝安装"
-        rm -f "$TMP_FILE"
-        exit 1
-    fi
+    echo_error "ZIP 包含符号链接，拒绝安装"
+    rm -f "$TMP_FILE"
+    exit 1
 fi
 
 if [ "$FORCE" = true ] && [ -d "$PLUGIN_DIR" ]; then
@@ -272,7 +260,7 @@ DATA_DIR="$PLUGIN_DIR/data"
 mkdir -p "$DATA_DIR"
 CONFIG_FILE="$DATA_DIR/config.json"
 
-if [ -f "$CONFIG_FILE" ] && [ -n "$PYTHON3" ]; then
+if [ -f "$CONFIG_FILE" ]; then
     $PYTHON3 -c "
 import json, os, tempfile
 path = '$CONFIG_FILE'
@@ -290,15 +278,6 @@ with os.fdopen(fd, 'w', encoding='utf-8') as f:
 os.replace(tmp, path)
 os.chmod(path, 0o600)
 " 2>/dev/null || echo_warn "写入 release_url 失败"
-elif [ -f "$CONFIG_FILE" ]; then
-    # Python 不可用时用 sed 更新已有配置
-    if grep -q '"release_url"' "$CONFIG_FILE"; then
-        sed -i 's|"release_url" *: *"[^"]*"|"release_url": "'"$RELEASE_URL"'"|' "$CONFIG_FILE"
-    else
-        # 在最后的 } 前插入 release_url
-        sed -i 's|}$|,\n  "release_url": "'"$RELEASE_URL"'"\n}|' "$CONFIG_FILE"
-    fi
-    chmod 600 "$CONFIG_FILE"
 else
     printf '{\n  "release_url": "%s"\n}\n' "$RELEASE_URL" > "$CONFIG_FILE"
     chmod 600 "$CONFIG_FILE"

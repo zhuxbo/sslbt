@@ -110,6 +110,32 @@ class TestVersionCompare:
         from lib.updater import compare_versions
         assert compare_versions('v1.0.1', 'v1.0.0') > 0
 
+    def test_prerelease_numeric_order(self):
+        # pre-release 内数字段按数值比较（修复 beta.9 > beta.10 的字典序错误）
+        from lib.updater import compare_versions
+        assert compare_versions('v0.4.1-beta.9', 'v0.4.1-beta.10') < 0
+        assert compare_versions('v0.4.1-beta.10', 'v0.4.1-beta.9') > 0
+        assert compare_versions('v1.0.0-beta.2', 'v1.0.0-beta.10') < 0
+        assert compare_versions('v1.0.0-rc.10', 'v1.0.0-rc.9') > 0
+
+    def test_prerelease_field_count(self):
+        # 共同前缀相等时，字段更多者更高
+        from lib.updater import compare_versions
+        assert compare_versions('v1.0.0-alpha', 'v1.0.0-alpha.1') < 0
+        assert compare_versions('v1.0.0-alpha.1', 'v1.0.0-alpha') > 0
+
+    def test_prerelease_numeric_vs_alpha(self):
+        # 数字段低于字母数字段；标签字典序
+        from lib.updater import compare_versions
+        assert compare_versions('v1.0.0-alpha.1', 'v1.0.0-alpha.beta') < 0
+        assert compare_versions('v0.4.1-beta.1', 'v0.4.1-rc.1') < 0
+
+    def test_build_metadata_ignored(self):
+        # build metadata 不参与排序
+        from lib.updater import compare_versions
+        assert compare_versions('v1.0.0+build1', 'v1.0.0+build2') == 0
+        assert compare_versions('v1.0.0-beta.1+abc', 'v1.0.0-beta.1+xyz') == 0
+
 
 class TestSafeExtract:
     def test_skip_data_dir(self, updater_env):
