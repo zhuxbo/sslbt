@@ -37,10 +37,35 @@ def _validate_channel(channel):
         raise ValueError("无效的升级通道: %s" % channel)
 
 
+def _compare_prerelease(pre1, pre2):
+    """按 semver 规范比较 pre-release 字段。
+
+    按 `.` 拆段逐段比较：纯数字段走数值比较，数字段低于字母数字段，
+    共同前缀相等时字段更多者更高（如 alpha < alpha.1）。
+    """
+    parts1 = pre1.split('.')
+    parts2 = pre2.split('.')
+    for a, b in zip(parts1, parts2):
+        a_num, b_num = a.isdigit(), b.isdigit()
+        if a_num and b_num:
+            if int(a) != int(b):
+                return int(a) - int(b)
+        elif a_num:
+            return -1
+        elif b_num:
+            return 1
+        elif a != b:
+            return -1 if a < b else 1
+    return len(parts1) - len(parts2)
+
+
 def compare_versions(v1, v2):
     """semver 比较，返回 <0, 0, >0。pre-release 低于同号正式版"""
     def parse(v):
         v = v.lstrip('v')
+        # 剥离 build metadata（semver: +xxx 不参与排序）
+        if '+' in v:
+            v = v.split('+', 1)[0]
         if '-' in v:
             base, pre = v.split('-', 1)
         else:
@@ -63,11 +88,7 @@ def compare_versions(v1, v2):
         return 1
     if pre2 is None:
         return -1
-    if pre1 < pre2:
-        return -1
-    if pre1 > pre2:
-        return 1
-    return 0
+    return _compare_prerelease(pre1, pre2)
 
 
 class Updater:
