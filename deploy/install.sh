@@ -140,7 +140,7 @@ if [ -n "$CURRENT_VERSION" ]; then
     if [ "$CURRENT_VERSION" = "$VERSION" ]; then
         [ "$FORCE" = true ] && echo_info "当前版本: $CURRENT_VERSION，强制重新安装" || { echo_info "当前版本 $CURRENT_VERSION 已是目标版本，使用 --force 强制重新安装"; exit 0; }
     else
-        echo_info "升级: $CURRENT_VERSION → $VERSION"
+        echo_info "安装: $CURRENT_VERSION → $VERSION"
     fi
 fi
 
