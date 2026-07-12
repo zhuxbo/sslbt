@@ -182,6 +182,162 @@ class TestDeployer:
         assert cert['metadata']['last_deploy_at'] != ''
 
 
+class TestSetSSLResultWhitelist:
+    """SetSSL 结果白名单判定（P1-13）：仅 dict 且 status is True 视为成功，其余形态一律判失败"""
+
+    @pytest.fixture
+    def deployer(self, tmp_data_dir):
+        config = ConfigManager(tmp_data_dir)
+        return Deployer(config, MagicMock(), MagicMock())
+
+    @staticmethod
+    def _patch_result(monkeypatch, result):
+        import panelSite
+        monkeypatch.setattr(panelSite.panelSite, 'SetSSL', lambda self, params: result)
+
+    def test_none_result_fails(self, deployer, monkeypatch):
+        self._patch_result(monkeypatch, None)
+        with pytest.raises(DeployError):
+            deployer._set_ssl('test.example.com', 'cert', 'key')
+
+    def test_string_result_fails(self, deployer, monkeypatch):
+        self._patch_result(monkeypatch, 'unexpected error text')
+        with pytest.raises(DeployError):
+            deployer._set_ssl('test.example.com', 'cert', 'key')
+
+    def test_missing_status_key_fails(self, deployer, monkeypatch):
+        self._patch_result(monkeypatch, {'msg': '设置成功'})
+        with pytest.raises(DeployError):
+            deployer._set_ssl('test.example.com', 'cert', 'key')
+
+    def test_truthy_non_bool_status_fails(self, deployer, monkeypatch):
+        # 宝塔 returnMsg 恒为 bool，非 bool 真值属异常形态，按白名单判失败
+        self._patch_result(monkeypatch, {'status': 1, 'msg': '设置成功'})
+        with pytest.raises(DeployError):
+            deployer._set_ssl('test.example.com', 'cert', 'key')
+
+    def test_status_false_fails_with_msg(self, deployer, monkeypatch):
+        self._patch_result(monkeypatch, {'status': False, 'msg': '指定站点不存在'})
+        with pytest.raises(DeployError, match='指定站点不存在'):
+            deployer._set_ssl('test.example.com', 'cert', 'key')
+
+    def test_status_true_succeeds(self, deployer, monkeypatch):
+        self._patch_result(monkeypatch, {'status': True, 'msg': '设置成功'})
+        result = deployer._set_ssl('test.example.com', 'cert', 'key')
+        assert result['status'] is True
+
+
+class TestReloadJudgment:
+    """reload 结果纳入部署成败判定（P1-13）"""
+
+    @pytest.fixture
+    def deployer(self, tmp_data_dir):
+        config = ConfigManager(tmp_data_dir)
+        return Deployer(config, MagicMock(), MagicMock())
+
+    @pytest.fixture(autouse=True)
+    def _set_ssl_ok(self, monkeypatch):
+        import panelSite
+        monkeypatch.setattr(panelSite.panelSite, 'SetSSL',
+                            lambda self, params: {'status': True, 'msg': '设置成功'})
+
+    def test_web_config_error_fails(self, deployer, monkeypatch):
+        import public
+        monkeypatch.setattr(public, 'checkWebConfig',
+                            lambda: 'nginx: [emerg] invalid parameter')
+        with pytest.raises(DeployError, match='配置'):
+            deployer._set_ssl('test.example.com', 'cert', 'key')
+
+    def test_web_config_error_phase_is_reload(self, deployer, monkeypatch):
+        import public
+        monkeypatch.setattr(public, 'checkWebConfig', lambda: 'nginx: [emerg] boom')
+        with pytest.raises(DeployError) as exc_info:
+            deployer._set_ssl('test.example.com', 'cert', 'key')
+        assert exc_info.value.phase == 'reload'
+
+    def test_reload_stderr_error_fails(self, deployer, monkeypatch):
+        import public
+        monkeypatch.setattr(public, 'serviceReload',
+                            lambda: ('', 'Job for nginx.service failed'))
+        with pytest.raises(DeployError, match='重载'):
+            deployer._set_ssl('test.example.com', 'cert', 'key')
+
+    def test_reload_warning_passes(self, deployer, monkeypatch):
+        # stderr 中的 warn 不应误判为失败
+        import public
+        monkeypatch.setattr(public, 'serviceReload',
+                            lambda: ('', 'nginx: [warn] conflicting server name "a.com"'))
+        result = deployer._set_ssl('test.example.com', 'cert', 'key')
+        assert result['status'] is True
+
+    def test_reload_clean_passes(self, deployer):
+        result = deployer._set_ssl('test.example.com', 'cert', 'key')
+        assert result['status'] is True
+
+
+class TestFailureCallback:
+    """失败必须回调 failure 并携带原因（P1-13）"""
+
+    @staticmethod
+    def _make(tmp_data_dir):
+        config = ConfigManager(tmp_data_dir)
+        api = MagicMock()
+        api.callback.return_value = {'code': 1}
+        return Deployer(config, api, MagicMock()), api, config
+
+    @patch('lib.deployer.cert_utils')
+    @patch('lib.deployer.Deployer._set_ssl')
+    def test_deploy_multi_failure_callback_with_message(self, mock_set_ssl, mock_cert_utils, tmp_data_dir):
+        deployer, api, config = self._make(tmp_data_dir)
+        mock_cert_utils.validate_cert_pem.return_value = (True, '')
+        mock_cert_utils.validate_key_pem.return_value = (True, '')
+        mock_cert_utils.verify_cert_key_match.return_value = True
+        mock_cert_utils.parse_cert_info.return_value = {}
+        mock_set_ssl.side_effect = [{'status': True}, DeployError('nginx 配置校验失败')]
+        config.add_cert(12345, 'test', ['a.com'], site_names=['s1', 's2'])
+
+        deployer.deploy_multi(['s1', 's2'], 'cert', 'key', order_id=12345)
+
+        kwargs = api.callback.call_args.kwargs
+        assert kwargs['status'] == 'failure'
+        assert 's2' in kwargs.get('message', '')
+        assert 'nginx 配置校验失败' in kwargs.get('message', '')
+
+    @patch('lib.deployer.cert_utils')
+    @patch('lib.deployer.Deployer._set_ssl')
+    def test_deploy_multi_success_callback_no_message(self, mock_set_ssl, mock_cert_utils, tmp_data_dir):
+        deployer, api, config = self._make(tmp_data_dir)
+        mock_cert_utils.validate_cert_pem.return_value = (True, '')
+        mock_cert_utils.validate_key_pem.return_value = (True, '')
+        mock_cert_utils.verify_cert_key_match.return_value = True
+        mock_cert_utils.parse_cert_info.return_value = {}
+        mock_set_ssl.return_value = {'status': True}
+        config.add_cert(12345, 'test', ['a.com'], site_names=['s1'])
+
+        deployer.deploy_multi(['s1'], 'cert', 'key', order_id=12345)
+
+        kwargs = api.callback.call_args.kwargs
+        assert kwargs['status'] == 'success'
+        assert not kwargs.get('message')
+
+    @patch('lib.deployer.cert_utils')
+    @patch('lib.deployer.Deployer._set_ssl')
+    def test_deploy_single_failure_sends_failure_callback(self, mock_set_ssl, mock_cert_utils, tmp_data_dir):
+        deployer, api, config = self._make(tmp_data_dir)
+        mock_cert_utils.validate_cert_pem.return_value = (True, '')
+        mock_cert_utils.validate_key_pem.return_value = (True, '')
+        mock_cert_utils.verify_cert_key_match.return_value = True
+        mock_set_ssl.side_effect = DeployError('SetSSL 返回异常形态: None')
+        config.add_cert(12345, 'test', ['a.com'], site_name='s1')
+
+        with pytest.raises(DeployError):
+            deployer.deploy('s1', 'cert', 'key', order_id=12345)
+
+        kwargs = api.callback.call_args.kwargs
+        assert kwargs['status'] == 'failure'
+        assert 'SetSSL 返回异常形态' in kwargs.get('message', '')
+
+
 class TestDeployError:
     def test_error_attributes(self):
         err = DeployError('test error', phase='validate', retryable=True)

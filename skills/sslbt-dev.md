@@ -84,7 +84,7 @@ Bearer Token 认证，部署链接格式：`https://domain/api/deploy?token=xxx&
 ### POST /api/deploy/callback — 部署回调
 
 ```json
-{"order_id": 123, "status": "success|failure", "deployed_at": "2026-01-01T00:00:00Z"}
+{"order_id": 123, "status": "success|failure", "deployed_at": "2026-01-01T00:00:00Z", "message": "失败原因（可选，仅失败时携带，≤500 字符）"}
 ```
 
 ## 部署流程
@@ -94,7 +94,10 @@ Bearer Token 认证，部署链接格式：`https://domain/api/deploy?token=xxx&
   fetch_deploy_url → 提取 token/order → GET ?order=xxx → 解析 domains（DNS+IP SAN） → 匹配站点 → add_cert
 
 部署证书
-  query_order → 检查 order_id 变更 → active: 取 cert/key/ca → 校验匹配 → panelSite.SetSSL() → callback
+  query_order → 检查 order_id 变更 → active: 取 cert/key/ca → 校验匹配 → panelSite.SetSSL() → reload 校验 → callback
+
+SetSSL 结果白名单判定：仅「dict 且 status is True」算成功，非 dict/缺 status 键等异常形态一律判失败；
+成功后再经 public.checkWebConfig() + serviceReload() 校验重载，reload 失败同样视为部署失败（phase='reload'）。
              → processing + file: FileVerifier.place_file() → 等待 CA 验证
 
 自动续签（定时任务）
@@ -118,7 +121,7 @@ Bearer Token 认证，部署链接格式：`https://domain/api/deploy?token=xxx&
 - 私钥回退（deploy-spec §5.3）：deploy_cert 中按 API → 参数路径 → 站点已有私钥(GetSSL) → 弹窗粘贴 四级回退，所有来源均需 verify_cert_key_match 校验
 - 文件验证：CSR 提交返回 file 字段时自动放置，签发/超时/异常时自动清理
 - `_check_deploy_results()`：全部失败抛异常，部分失败记警告
-- callback：全部站点成功=success，任一失败=failure
+- callback：全部站点成功=success，任一失败=failure（message 附各站点失败原因，超长按 500 字符截断）
 - 分散续签：`check_and_renew_all(spread=True)` 在证书间加动态延迟，根据需续签数量自动缩短间隔（总延迟上限 600s），仅 cron 调用启用
 - 汇总日志：续签完成后记录成功/等待/失败数量
 - 常量：RENEW_DEFAULT_DAYS=14, MAX_ISSUE_RETRY_COUNT=10, RENEW_SLEEP_MIN=5, RENEW_SLEEP_MAX=120, SPREAD_TOTAL_MAX=600

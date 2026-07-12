@@ -15,6 +15,7 @@ TIMEOUT_GET = 30
 TIMEOUT_POST = 60
 MAX_RESPONSE_SIZE = 512 * 1024  # 512KB
 MAX_CALLBACK_RESPONSE_SIZE = 64 * 1024  # 64KB
+CALLBACK_MESSAGE_MAX = 500  # 回调 message 字段长度上限（与服务端校验一致）
 BATCH_MAX_RESPONSE_SIZE = 5 * 1024 * 1024  # 5MB
 TOKEN_PATTERN = re.compile(r'^[A-Za-z0-9\-_\.]+$')
 
@@ -201,8 +202,8 @@ class APIClient:
             self.last_renew_before_days = int(renew_before_days)
         return cert_data
 
-    def callback(self, order_id, status, deployed_at=''):
-        """部署结果回调"""
+    def callback(self, order_id, status, deployed_at='', message=''):
+        """部署结果回调，message 携带失败原因（可选，超长按服务端上限截断）"""
         url = _build_api_url(self._base_url, '/callback')
         if self._logger:
             self._logger.info("部署回调: order_id=%s, status=%s", order_id, status)
@@ -211,6 +212,8 @@ class APIClient:
             'status': status,
             'deployed_at': deployed_at,
         }
+        if message:
+            data['message'] = str(message)[:CALLBACK_MESSAGE_MAX]
         result = self._request('POST', url, data=data, max_size=MAX_CALLBACK_RESPONSE_SIZE)
         if isinstance(result, dict) and result.get('code') == API_CODE_SUCCESS:
             resp_data = result.get('data') or {}

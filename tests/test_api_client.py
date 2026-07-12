@@ -149,6 +149,58 @@ class TestAPIClient:
         )
         assert result['code'] == 1
 
+    @staticmethod
+    def _sent_payload(client):
+        """提取 mock opener 收到的请求体 JSON"""
+        req = client._opener.open.call_args.args[0]
+        return json.loads(req.data.decode('utf-8'))
+
+    def test_callback_failure_with_message(self, client):
+        resp_data = json.dumps({'code': 1, 'msg': 'success'}).encode()
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = resp_data
+        client._opener.open.return_value = mock_resp
+
+        client.callback(
+            order_id=12345,
+            status='failure',
+            deployed_at='2026-01-01T00:00:00Z',
+            message='s1: nginx 重载失败',
+        )
+        payload = self._sent_payload(client)
+        assert payload['status'] == 'failure'
+        assert payload['message'] == 's1: nginx 重载失败'
+
+    def test_callback_without_message_omits_field(self, client):
+        resp_data = json.dumps({'code': 1, 'msg': 'success'}).encode()
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = resp_data
+        client._opener.open.return_value = mock_resp
+
+        client.callback(
+            order_id=12345,
+            status='success',
+            deployed_at='2026-01-01T00:00:00Z',
+        )
+        payload = self._sent_payload(client)
+        assert 'message' not in payload
+
+    def test_callback_message_truncated_to_server_limit(self, client):
+        # 服务端校验 message 最长 500 字符，超长须客户端截断而非整个回调被拒
+        resp_data = json.dumps({'code': 1, 'msg': 'success'}).encode()
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = resp_data
+        client._opener.open.return_value = mock_resp
+
+        client.callback(
+            order_id=12345,
+            status='failure',
+            deployed_at='2026-01-01T00:00:00Z',
+            message='错' * 600,
+        )
+        payload = self._sent_payload(client)
+        assert len(payload['message']) == 500
+
     def test_test_connection_success(self, client):
         resp_data = json.dumps({'code': 1, 'msg': 'ok', 'data': {}}).encode()
         mock_resp = MagicMock()

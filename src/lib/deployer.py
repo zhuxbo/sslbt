@@ -28,6 +28,24 @@ class DeployError(Exception):
         self.retryable = retryable
 
 
+# serviceReload 返回 ExecShell 的 (stdout, stderr)，stderr 含以下特征视为重载失败
+_RELOAD_ERROR_MARKERS = ('emerg', 'alert', 'crit', 'fatal', 'error', 'failed', 'not running')
+
+
+def _extract_reload_error(result):
+    """从 serviceReload 返回值提取错误信息；stderr 无错误特征或形态无法识别时返回 ''"""
+    if not isinstance(result, (tuple, list)) or len(result) < 2:
+        return ''
+    stderr = str(result[1] or '').strip()
+    if not stderr:
+        return ''
+    lowered = stderr.lower()
+    for marker in _RELOAD_ERROR_MARKERS:
+        if marker in lowered:
+            return stderr[:300]
+    return ''
+
+
 class Deployer:
     """证书部署器"""
 
@@ -65,10 +83,20 @@ class Deployer:
         if not cert_utils.verify_cert_key_match(fullchain_pem, key_pem):
             raise DeployError("证书和私钥不匹配", phase='validate')
 
-        # 通过宝塔 API 部署
+        # 通过宝塔 API 部署，失败时回调 failure（附原因）后抛出
         try:
             self._set_ssl(site_name, fullchain_pem, key_pem)
         except Exception as e:
+            now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+            cb_api = api_client or self._api
+            if order_id and cb_api:
+                self._send_callback(
+                    order_id=order_id,
+                    status='failure',
+                    deployed_at=now,
+                    api_client=cb_api,
+                    message='%s: %s' % (site_name, str(e)),
+                )
             raise DeployError("部署失败: %s" % str(e), phase='deploy', retryable=True)
 
         # 解析证书信息
@@ -168,21 +196,30 @@ class Deployer:
                 if self._logger:
                     self._logger.warning("更新证书配置失败: %s", str(e))
 
-        # 发送部署回调（任一站点失败即 failure）
+        # 发送部署回调（任一站点失败即 failure，附各站点失败原因）
         cb_api = api_client or self._api
         if order_id and cb_api:
             all_success = all(r['status'] for r in results)
+            fail_msgs = '; '.join(
+                '%s: %s' % (r['site_name'], r['message'])
+                for r in results if not r['status']
+            )
             self._send_callback(
                 order_id=order_id,
                 status='success' if all_success else 'failure',
                 deployed_at=now,
                 api_client=cb_api,
+                message=fail_msgs,
             )
 
         return results
 
     def _set_ssl(self, site_name, cert_pem, key_pem):
-        """调用宝塔 panelSite.SetSSL()"""
+        """调用宝塔 panelSite.SetSSL()，白名单判定结果并校验服务重载
+
+        仅「dict 且 status is True」（宝塔 returnMsg 的固定成功形态）视为成功，
+        非 dict、缺 status 键等异常形态一律判失败，避免失败被误报为成功。
+        """
         import panelSite
 
         params = _BtParams(
@@ -195,18 +232,47 @@ class Deployer:
         site_obj = panelSite.panelSite()
         result = site_obj.SetSSL(params)
 
-        if isinstance(result, dict) and result.get('status') is False:
-            raise DeployError(result.get('msg', '部署失败'), phase='deploy', retryable=True)
+        if not (isinstance(result, dict) and result.get('status') is True):
+            msg = ''
+            if isinstance(result, dict):
+                msg = str(result.get('msg') or '')
+            if not msg:
+                msg = 'SetSSL 返回异常形态: %r' % (result,)
+            raise DeployError(msg, phase='deploy', retryable=True)
 
+        self._verify_web_service()
         return result
 
-    def _send_callback(self, order_id, status, deployed_at, api_client=None):
+    def _verify_web_service(self):
+        """SetSSL 后校验 Web 配置并重载，失败视为部署失败
+
+        宝塔 SetSSL 内部虽会调用 serviceReload()，但丢弃其结果；此处显式复核：
+        checkWebConfig 校验配置有效性，serviceReload 幂等重载并检查错误输出。
+        """
+        import public
+
+        check = getattr(public, 'checkWebConfig', None)
+        if callable(check):
+            check_result = check()
+            if check_result is not True:
+                raise DeployError('Web 服务配置校验失败: %s' % check_result,
+                                  phase='reload', retryable=True)
+
+        reload_fn = getattr(public, 'serviceReload', None)
+        if callable(reload_fn):
+            err = _extract_reload_error(reload_fn())
+            if err:
+                raise DeployError('Web 服务重载失败: %s' % err,
+                                  phase='reload', retryable=True)
+
+    def _send_callback(self, order_id, status, deployed_at, api_client=None, message=''):
         """发送部署结果回调（非关键路径，失败仅记录日志）"""
         try:
             api_client.callback(
                 order_id=order_id,
                 status=status,
                 deployed_at=deployed_at,
+                message=message,
             )
         except Exception as e:
             if self._logger:

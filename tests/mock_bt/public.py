@@ -9,6 +9,16 @@ def getMsg(key, args=None):
     return key
 
 
+def checkWebConfig():
+    """真实宝塔返回 True 或错误字符串"""
+    return True
+
+
+def serviceReload():
+    """真实宝塔返回 ExecShell 的 (stdout, stderr) 元组"""
+    return ('', '')
+
+
 def M(table):
     """Mock 数据库操作"""
     return MockDB(table)

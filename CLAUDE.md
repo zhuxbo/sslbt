@@ -27,3 +27,4 @@ make docker-test        # 容器集成测试
 - 安装脚本：curl --max-filesize 限制、解压前符号链接检查
 - validation_method 受域名类型约束：IP 不可选 delegation、通配符不可选 file（add/update/renew 三层校验）
 - deploy_cert 私钥四级回退：API → 参数路径 → 站点已有私钥(GetSSL) → 返回 need_key 由前端弹窗收集
+- SetSSL 结果白名单判定：仅 dict 且 status is True 算成功；reload（checkWebConfig + serviceReload）纳入成败判定；失败回调 failure 并经 message 字段携带原因
