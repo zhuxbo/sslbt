@@ -20,7 +20,7 @@ sslbt_main.py  ← 插件入口（控制器），宝塔面板调用
   ├─ cert_utils.py      ← 证书验证 + CSR 生成（支持 DNS/IP SAN）
   ├─ site_manager.py    ← 宝塔站点管理 + 域名匹配（兼容新旧数据库分片）
   ├─ updater.py         ← 在线升级（releases.json 解析 + 安全下载 + 校验）
-  ├─ cron.py            ← 宝塔计划任务（_BtParams + 直接查库 + 每天随机时间 + cron.log 轮转）
+  ├─ cron.py            ← 宝塔计划任务（_BtParams + 直接查库 + 每天随机时间 + cron.log 轮转；AddCrontab 结果按「显式 False 判失败 + 入库反查」双重校验）
   └─ logger.py          ← 日志（敏感信息过滤，MAX_LOG_FILES=90 自动清理）
 index.html              ← 前端 UI（纯 JS，3 Tab: 证书管理/设置/日志）
 ```

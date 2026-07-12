@@ -86,8 +86,23 @@ class CronManager:
                 urladdress='',
             )
 
-            cron_obj.AddCrontab(params)
+            result = cron_obj.AddCrontab(params)
             self._dedup(cron_obj)
+
+            # 结果判定：显式 status False 直接判失败（面板可能知道入库之外的失败，
+            # 如 crontab 文件同步）；其余形态以任务是否入库为准，防止失败被误报成功
+            if isinstance(result, dict) and result.get('status') is False:
+                msg = str(result.get('msg') or '') or repr(result)
+                if self._logger:
+                    self._logger.error("创建计划任务失败: %s", msg)
+                return {'status': False, 'message': '创建失败: %s' % msg}
+
+            if not _find_cron_ids():
+                if self._logger:
+                    self._logger.error("创建计划任务失败: AddCrontab 返回 %r 且任务未入库", result)
+                return {'status': False,
+                        'message': '创建失败: AddCrontab 返回 %r 且任务未入库' % (result,)}
+
             if self._logger:
                 self._logger.info("计划任务创建成功: 每天 %d:%02d", run_hour, run_minute)
             return {'status': True, 'message': '计划任务已创建'}

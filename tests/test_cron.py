@@ -22,17 +22,102 @@ class TestCronManager:
         assert 'sslbt_main' in script
         assert 'run_renew_cron' in script
 
-    def test_setup_success(self, cron_mgr):
-        """创建计划任务（mock crontab 模块）"""
+    @staticmethod
+    def _make_cron_db(tmp_path, with_task=False):
+        """创建临时 crontab 数据库，可选预置一条本插件任务"""
+        db_path = str(tmp_path / 'crontab.db')
+        conn = sqlite3.connect(db_path)
+        conn.execute('CREATE TABLE crontab (id INTEGER PRIMARY KEY, name TEXT, status INTEGER, sBody TEXT)')
+        if with_task:
+            script = 'cd %s && echo test' % PLUGIN_DIR
+            conn.execute('INSERT INTO crontab (id, name, status, sBody) VALUES (7, ?, 1, ?)',
+                         (CRON_NAME, script))
+        conn.commit()
+        conn.close()
+        return db_path
+
+    @staticmethod
+    def _make_mock_crontab(add_result, db_path=None):
+        """构造 crontab mock；db_path 给定时 AddCrontab 会真实插入任务行"""
         mock_crontab_module = types.ModuleType('crontab')
         mock_cron_obj = MagicMock()
-        mock_crontab_class = MagicMock(return_value=mock_cron_obj)
-        mock_crontab_module.crontab = mock_crontab_class
 
-        with patch.dict(sys.modules, {'crontab': mock_crontab_module}):
+        def _add(params):
+            if db_path:
+                conn = sqlite3.connect(db_path)
+                conn.execute('INSERT INTO crontab (name, status, sBody) VALUES (?, 1, ?)',
+                             (params['name'], params['sBody']))
+                conn.commit()
+                conn.close()
+            return add_result
+
+        mock_cron_obj.AddCrontab.side_effect = _add
+        mock_crontab_module.crontab = MagicMock(return_value=mock_cron_obj)
+        return mock_crontab_module, mock_cron_obj
+
+    def test_setup_success(self, cron_mgr, tmp_path):
+        """创建计划任务：宝塔返回成功形态且任务入库"""
+        db_path = self._make_cron_db(tmp_path)
+        module, mock_cron_obj = self._make_mock_crontab(
+            {'status': True, 'msg': '添加成功'}, db_path=db_path)
+
+        with patch('lib.cron._cron_db_path', return_value=db_path), \
+             patch.dict(sys.modules, {'crontab': module}):
             result = cron_mgr.setup()
         assert result['status'] is True
         mock_cron_obj.AddCrontab.assert_called_once()
+
+    def test_setup_status_false_returns_failure(self, cron_mgr, tmp_path):
+        """宝塔显式返回 status False 时判失败并透传原因"""
+        db_path = self._make_cron_db(tmp_path)
+        module, _ = self._make_mock_crontab({'status': False, 'msg': '任务名称不能为空'})
+
+        with patch('lib.cron._cron_db_path', return_value=db_path), \
+             patch.dict(sys.modules, {'crontab': module}):
+            result = cron_mgr.setup()
+        assert result['status'] is False
+        assert '任务名称不能为空' in result['message']
+
+    def test_setup_status_false_wins_over_db(self, cron_mgr, tmp_path):
+        """显式失败优先于数据库反查（面板可能知道入库之外的失败）"""
+        db_path = self._make_cron_db(tmp_path, with_task=True)
+        module, _ = self._make_mock_crontab({'status': False, 'msg': '写入 crontab 文件失败'})
+
+        with patch('lib.cron._cron_db_path', return_value=db_path), \
+             patch.dict(sys.modules, {'crontab': module}):
+            result = cron_mgr.setup()
+        assert result['status'] is False
+        assert '写入 crontab 文件失败' in result['message']
+
+    def test_setup_none_result_not_in_db_fails(self, cron_mgr, tmp_path):
+        """返回 None 且任务未入库时判失败"""
+        db_path = self._make_cron_db(tmp_path)
+        module, _ = self._make_mock_crontab(None)
+
+        with patch('lib.cron._cron_db_path', return_value=db_path), \
+             patch.dict(sys.modules, {'crontab': module}):
+            result = cron_mgr.setup()
+        assert result['status'] is False
+
+    def test_setup_true_result_but_not_in_db_fails(self, cron_mgr, tmp_path):
+        """返回 status True 但任务未入库时判失败（谎报成功）"""
+        db_path = self._make_cron_db(tmp_path)
+        module, _ = self._make_mock_crontab({'status': True, 'msg': '添加成功'})
+
+        with patch('lib.cron._cron_db_path', return_value=db_path), \
+             patch.dict(sys.modules, {'crontab': module}):
+            result = cron_mgr.setup()
+        assert result['status'] is False
+
+    def test_setup_odd_shape_but_in_db_succeeds(self, cron_mgr, tmp_path):
+        """返回形态异常（如缺 status 键）但任务已入库时以入库为准判成功"""
+        db_path = self._make_cron_db(tmp_path)
+        module, _ = self._make_mock_crontab({'id': 9}, db_path=db_path)
+
+        with patch('lib.cron._cron_db_path', return_value=db_path), \
+             patch.dict(sys.modules, {'crontab': module}):
+            result = cron_mgr.setup()
+        assert result['status'] is True
 
     def test_remove(self, cron_mgr, tmp_path):
         """删除计划任务（通过临时数据库）"""
