@@ -26,7 +26,8 @@ services:
       - ../src:/plugin-src:ro
       - ./reports:/reports
     environment:
-      - MOCK_API_URL=http://mock-api:8080
+      - MOCK_API_HOST=mock-api
+      - MOCK_API_PORT=8080
       - TEST_DOMAIN=test.example.com
     depends_on:
       mock-api:
@@ -49,7 +50,8 @@ services:
       - ../src:/plugin-src:ro
       - ./reports:/reports
     environment:
-      - MOCK_API_URL=http://mock-api:8080
+      - MOCK_API_HOST=mock-api
+      - MOCK_API_PORT=8080
       - TEST_DOMAIN=test.example.com
     depends_on:
       mock-api:

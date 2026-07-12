@@ -168,8 +168,13 @@ SetSSL 结果白名单判定：仅「dict 且 status is True」算成功，非 d
 ```bash
 make test          # pytest 单元测试
 make build         # 构建 ZIP
-make docker-test   # 容器集成测试
+make docker-test   # 容器集成测试（nginx/apache 双环境，安装/部署/续签三段）
 ```
+
+docker-test 说明：mock-api 从同级仓 `../sslctl/docker/test/mock-api` 构建；宝塔容器由官方镜像
+`/www.tar.gz` 离线还原面板，entrypoint 注册测试站点并起 loopback 转发（插件经
+`http://127.0.0.1:18080` 访问 mock-api，满足「非 loopback 强制 HTTPS」约束）；
+容器内插件一律用面板 pyenv（Python 3.7）执行，系统 python3 缺面板依赖。
 
 ## 运行时路径
 
