@@ -379,6 +379,43 @@ class TestPreflightAndRollback:
         prev = deployer._capture_current_ssl(site_obj, 'nonexist-site-xyz.example.com')
         assert prev is None
 
+    def test_read_cert_files_rejects_traversal_site_name(self, deployer, tmp_path, monkeypatch):
+        """恶意 site_name（穿越/绝对路径/分隔符）拼路径前即被拒，绝不读到目录外证书"""
+        import lib.deployer as deployer_mod
+        outside = tmp_path / 'secret'
+        outside.mkdir(parents=True)
+        (outside / 'fullchain.pem').write_text('LEAK-CERT')
+        (outside / 'privkey.pem').write_text('LEAK-KEY')
+        monkeypatch.setattr(deployer_mod, '_BT_CERT_DIRS',
+                            (str(tmp_path / 'base' / '%s'),))
+        for bad in ('../secret', '/etc/passwd', 'a/b', '..'):
+            assert deployer._read_site_cert_files(bad) is None
+
+    def test_read_cert_files_rejects_symlink_target(self, deployer, tmp_path, monkeypatch):
+        """证书文件为符号链接时拒绝读取，避免经预置软链读到目录外文件"""
+        import os
+        import lib.deployer as deployer_mod
+        secret = tmp_path / 'secret.pem'
+        secret.write_text('LEAK')
+        cert_dir = tmp_path / 'base' / 'evil.example.com'
+        cert_dir.mkdir(parents=True)
+        os.symlink(str(secret), str(cert_dir / 'fullchain.pem'))
+        (cert_dir / 'privkey.pem').write_text('KEY')
+        monkeypatch.setattr(deployer_mod, '_BT_CERT_DIRS',
+                            (str(tmp_path / 'base' / '%s'),))
+        assert deployer._read_site_cert_files('evil.example.com') is None
+
+    def test_read_cert_files_normal_site_ok(self, deployer, tmp_path, monkeypatch):
+        """正常域名不受加固影响，仍能读取宝塔证书目录文件"""
+        import lib.deployer as deployer_mod
+        cert_dir = tmp_path / 'base' / 'good.example.com'
+        cert_dir.mkdir(parents=True)
+        (cert_dir / 'fullchain.pem').write_text('CERT')
+        (cert_dir / 'privkey.pem').write_text('KEY')
+        monkeypatch.setattr(deployer_mod, '_BT_CERT_DIRS',
+                            (str(tmp_path / 'base' / '%s'),))
+        assert deployer._read_site_cert_files('good.example.com') == {'key': 'KEY', 'cert': 'CERT'}
+
     def test_setssl_writes_then_returns_false_rolls_back(self, deployer, monkeypatch):
         """SetSSL 写入后返回非成功状态 → 回滚到原证书（而非直接失败留下坏证书）"""
         import panelSite

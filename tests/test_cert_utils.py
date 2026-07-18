@@ -1,7 +1,10 @@
 """证书工具测试"""
 
+import pytest
+
 from lib.cert_utils import (
     validate_cert_pem, validate_key_pem, build_fullchain,
+    validate_site_name_component,
     PEM_CERT_RE, PEM_KEY_RE,
 )
 
@@ -132,3 +135,26 @@ issuer=CN = Test CA
         ip_entries = re.findall(r'IP Address:([^\s,]+)', output)
         assert dns_entries == []
         assert ip_entries == ['192.168.1.1']
+
+
+class TestValidateSiteNameComponent:
+    """site_name 用作路径组件时的穿越防护：拒绝空/分隔符/../绝对路径"""
+
+    @pytest.mark.parametrize('bad', [
+        '../x', '..', '/etc/passwd', 'a/b', 'a\\b',
+        '../../etc/passwd', 'foo/..', '/', '\\', 'C:\\Windows',
+    ])
+    def test_rejects_malicious(self, bad):
+        assert validate_site_name_component(bad) is not None
+
+    @pytest.mark.parametrize('good', [
+        'www.example.com', 'example.com', 'sub.example.com',
+        'a.b.c.example.com', 'my-site_01.example.com',
+    ])
+    def test_accepts_normal_domain(self, good):
+        assert validate_site_name_component(good) is None
+
+    def test_rejects_empty_and_non_str(self):
+        assert validate_site_name_component('') is not None
+        assert validate_site_name_component(None) is not None
+        assert validate_site_name_component(123) is not None

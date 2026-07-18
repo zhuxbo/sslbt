@@ -3,6 +3,8 @@
 import os
 import sqlite3
 
+from . import cert_utils
+
 
 # 新版宝塔将 sites/domain 表迁移到 data/db/site.db
 DB_PATH_NEW = '/www/server/panel/data/db/site.db'
@@ -101,8 +103,12 @@ class SiteManager:
         return []
 
     def _check_ssl(self, site_name):
-        """检查站点是否已启用 SSL"""
-        if not site_name:
+        """检查站点是否已启用 SSL
+
+        site_name 直接拼入证书路径，先校验其作为路径组件的安全性，非法取值
+        （空/穿越/绝对路径/分隔符）一律视为未启用，避免探测证书目录外的路径。
+        """
+        if cert_utils.validate_site_name_component(site_name):
             return False
         # 检查 nginx SSL 证书文件
         cert_paths = [

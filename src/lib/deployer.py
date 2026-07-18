@@ -455,7 +455,14 @@ class Deployer:
 
     @staticmethod
     def _read_site_cert_files(site_name):
-        """回退：从宝塔证书目录读取站点当前证书/私钥文件"""
+        """回退：从宝塔证书目录读取站点当前证书/私钥文件
+
+        site_name 直接拼入证书目录路径，读取前校验其作为路径组件的安全性
+        （拒绝穿越/绝对路径/分隔符），并在打开前对目标文件做符号链接检查，
+        避免经构造站点名或预置符号链接读到证书目录外的任意文件。
+        """
+        if cert_utils.validate_site_name_component(site_name):
+            return None
         for dir_tpl in _BT_CERT_DIRS:
             cert_dir = dir_tpl % site_name
             cert_path = os.path.join(cert_dir, 'fullchain.pem')
@@ -463,6 +470,8 @@ class Deployer:
             try:
                 if not (os.path.isfile(cert_path) and os.path.isfile(key_path)):
                     continue
+                if os.path.islink(cert_path) or os.path.islink(key_path):
+                    continue  # 拒绝符号链接，避免读到目录外文件
                 with open(cert_path, 'r') as f:
                     cert = f.read()
                 with open(key_path, 'r') as f:

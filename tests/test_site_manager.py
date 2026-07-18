@@ -146,3 +146,20 @@ class TestMatchSitesForCert:
         # site3: not in results
         site3_names = [r['site_name'] for r in results]
         assert 'site3' not in site3_names
+
+
+class TestCheckSslPathGuard:
+    """_check_ssl 的 site_name 穿越防护：非法名视为未启用，不探测目录外路径"""
+
+    @pytest.mark.parametrize('bad', ['../x', '/etc/passwd', 'a/b', '..', '', 'a\\b'])
+    def test_malicious_site_name_returns_false(self, bad):
+        mgr = SiteManager()
+        with patch('os.path.exists') as mock_exists:
+            assert mgr._check_ssl(bad) is False
+            mock_exists.assert_not_called()
+
+    def test_normal_site_name_probes_paths(self):
+        mgr = SiteManager()
+        with patch('os.path.exists', return_value=True) as mock_exists:
+            assert mgr._check_ssl('www.example.com') is True
+            assert mock_exists.called
