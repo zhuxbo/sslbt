@@ -7,7 +7,7 @@
 1. `python3 -m pytest tests/ -v -W error`：全部通过；测试钩子令任何 skip 失败，警告按错误处理。发布脚本测试同时解包核对必要文件、`info.json.versions` 和运行时 `--version`。
 2. `python3 -m flake8 src/ --max-line-length=120 --exclude=__pycache__`。
 3. `python3 -m flake8 tests/ --max-line-length=120 --exclude=__pycache__`。
-4. `python3 scripts/check-agent-config.py`：Codex 根路由、固定 `CLAUDE.md`、扁平 Skill 元数据与路由、薄工具模板、旧路径引用及 Make/CI 接线全部通过。
+4. `python3 scripts/check-agent-config.py`：Codex 原生薄 Skill、固定 `CLAUDE.md`、Claude 薄命令、扁平领域 Skill 路由、旧路径引用及 Make/CI 接线全部通过。
 5. `bash build/release.sh --dry-run 0.0.0-finish-check`：确定性 ZIP、单资产 manifest、候选索引和 SHA256 通过且无网络操作。
 6. `git diff --check`。
 

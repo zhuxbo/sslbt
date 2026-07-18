@@ -17,10 +17,6 @@ EXPECTED_CLAUDE = """# 项目智能体规则
 """
 
 EXPECTED_COMMANDS = {
-    'build-release.md': """读取并严格遵循 `skills/build-release.md`。
-
-将用户参数 `$ARGUMENTS` 原样作为构建版本或 bundle 参数传入。
-""",
     'finish-check.md': """读取并严格遵循 `skills/finish-check.md`。
 
 将用户参数 `$ARGUMENTS` 原样作为检查范围或附加要求传入。
@@ -31,7 +27,28 @@ EXPECTED_COMMANDS = {
 """,
 }
 
-CODEX_ROUTING_RULE = '先读取 `skills/SKILL.md`，再按路由读取对应叶子资源。'
+EXPECTED_CODEX_SKILLS = {
+    'finish-check': """---
+name: finish-check
+description: Use when the user asks to run finish-check, simulate CI, or verify the repository before completion.
+---
+
+读取并严格遵循仓库根目录的 `skills/finish-check.md`。
+
+将用户请求中的检查范围及附加要求原样作为完成检查参数传入。
+""",
+    'remote-release': """---
+name: remote-release
+description: Use when the user asks to publish an sslbt dev or main release, resume an interrupted release, or verify release completion.
+---
+
+读取并严格遵循仓库根目录的 `skills/remote-release.md`。
+
+将用户请求中的版本、bundle 路径及附加要求原样作为发布流程参数传入。
+""",
+}
+
+CODEX_ROUTING_RULE = '无对应入口时先读取 `skills/SKILL.md`，再按路由读取对应叶子资源。'
 
 
 def fail(errors, message):
@@ -93,6 +110,19 @@ def main():
         path = command_dir / name
         if path.exists() and path.read_text(encoding='utf-8') != expected:
             fail(errors, str(path.relative_to(ROOT)) + ' 不符合固定薄模板')
+
+    codex_dir = ROOT / '.agents' / 'skills'
+    actual_codex_skills = {path.name for path in codex_dir.iterdir() if path.is_dir()}
+    if actual_codex_skills != set(EXPECTED_CODEX_SKILLS):
+        fail(errors, 'Codex 原生薄 Skill 集合发生漂移')
+    for name, expected in EXPECTED_CODEX_SKILLS.items():
+        skill_dir = codex_dir / name
+        files = {path.name for path in skill_dir.iterdir()} if skill_dir.exists() else set()
+        if files != {'SKILL.md'}:
+            fail(errors, str(skill_dir.relative_to(ROOT)) + ' 只能包含 SKILL.md')
+            continue
+        if (skill_dir / 'SKILL.md').read_text(encoding='utf-8') != expected:
+            fail(errors, str((skill_dir / 'SKILL.md').relative_to(ROOT)) + ' 不符合固定薄模板')
 
     makefile = (ROOT / 'Makefile').read_text(encoding='utf-8')
     target = re.search(r'^check-agent-config:\n(?P<body>(?:\t.*\n)+)', makefile, re.MULTILINE)
