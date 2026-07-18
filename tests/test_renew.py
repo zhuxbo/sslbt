@@ -1167,3 +1167,46 @@ class TestDeployFailureRetainsPendingKey:
         result = engine._submit_new_csr(cert, engine._mock_api)
         assert result is True
         assert not os.path.exists(key_path)
+
+
+class TestRenewStatusFileHardening:
+    """续签状态临时文件加固：随机名 + 原子替换，抵御预置符号链接覆盖任意文件"""
+
+    def _make_engine(self, tmp_data_dir):
+        config = ConfigManager(tmp_data_dir)
+        return RenewEngine(config, MagicMock(), MagicMock(), MagicMock())
+
+    def test_symlink_tmp_not_followed(self, tmp_data_dir):
+        """预置 renew_status.json.tmp 符号链接 → 目标文件不被覆盖"""
+        engine = self._make_engine(tmp_data_dir)
+        victim = os.path.join(tmp_data_dir, 'victim.json')
+        with open(victim, 'w') as f:
+            f.write('IMPORTANT-DATA')
+        # 预置固定名 .tmp 符号链接指向 victim（旧实现会经 O_TRUNC 覆盖）
+        os.symlink(victim, os.path.join(tmp_data_dir, 'renew_status.json.tmp'))
+
+        engine._write_renew_status([{'status': 'success'}])
+
+        # victim 未被覆盖
+        with open(victim) as f:
+            assert f.read() == 'IMPORTANT-DATA'
+        # 状态文件正常写入且为常规文件（非符号链接）
+        status_path = os.path.join(tmp_data_dir, 'renew_status.json')
+        assert not os.path.islink(status_path)
+        with open(status_path) as f:
+            data = json.load(f)
+        assert data['total'] == 1 and data['success'] == 1
+        assert (os.stat(status_path).st_mode & 0o777) == 0o600
+
+    def test_normal_write_still_works(self, tmp_data_dir):
+        """无攻击场景下正常写入状态文件"""
+        engine = self._make_engine(tmp_data_dir)
+        engine._write_renew_status([
+            {'status': 'success'}, {'status': 'failure'}, {'status': 'pending'}])
+        with open(os.path.join(tmp_data_dir, 'renew_status.json')) as f:
+            data = json.load(f)
+        assert data['total'] == 3
+        assert data['success'] == 1 and data['failure'] == 1 and data['pending'] == 1
+        # 不残留临时文件
+        leftovers = [n for n in os.listdir(tmp_data_dir) if n.endswith('.tmp')]
+        assert leftovers == []

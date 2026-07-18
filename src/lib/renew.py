@@ -5,6 +5,7 @@ import json
 import time
 import random
 import fcntl
+import tempfile
 from datetime import datetime, timezone
 
 from . import cert_utils
@@ -204,15 +205,27 @@ class RenewEngine:
             'failure': sum(1 for r in results if r.get('status') == 'failure'),
         }
         path = os.path.join(self._data_dir, 'renew_status.json')
-        tmp = path + '.tmp'
+        data = json.dumps(status, ensure_ascii=False).encode('utf-8')
+        # 随机名临时文件（mkstemp 以 O_EXCL|O_CREAT 创建，不跟随符号链接）+ 原子替换，
+        # 避免固定名 .tmp 被预置为符号链接时经 O_TRUNC 覆盖任意目标文件
         try:
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            fd, tmp = tempfile.mkstemp(dir=self._data_dir, prefix='.renew_status-', suffix='.tmp')
+        except OSError as e:
+            if self._logger:
+                self._logger.warning("写入续签状态文件失败: %s", str(e))
+            return
+        try:
             try:
-                os.write(fd, json.dumps(status, ensure_ascii=False).encode('utf-8'))
+                os.write(fd, data)
             finally:
                 os.close(fd)
+            os.chmod(tmp, 0o600)
             os.replace(tmp, path)
         except OSError as e:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
             if self._logger:
                 self._logger.warning("写入续签状态文件失败: %s", str(e))
 

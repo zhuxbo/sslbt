@@ -395,6 +395,57 @@ class TestPreflightAndRollback:
         prev = deployer._capture_current_ssl(site_obj, 'nonexist-site-xyz.example.com')
         assert prev is None
 
+    def test_setssl_writes_then_returns_false_rolls_back(self, deployer, monkeypatch):
+        """SetSSL 写入后返回非成功状态 → 回滚到原证书（而非直接失败留下坏证书）"""
+        import panelSite
+        panelSite.panelSite._ssl_data['test.example.com'] = {'key': 'OLD-KEY', 'cert': 'OLD-CERT'}
+
+        calls = {'n': 0}
+
+        def write_then_false(self, params):
+            calls['n'] += 1
+            site = params['siteName']
+            # 模拟宝塔 SetSSL 已写入证书但返回失败状态；回滚调用（第 2 次）返回成功
+            panelSite.panelSite._ssl_data[site] = {'key': params['key'], 'cert': params['csr']}
+            return {'status': False, 'msg': 'boom'} if calls['n'] == 1 else {'status': True}
+
+        monkeypatch.setattr(panelSite.panelSite, 'SetSSL', write_then_false)
+        with pytest.raises(DeployError, match='boom'):
+            deployer._set_ssl('test.example.com', 'NEW-CERT', 'NEW-KEY')
+        # 已回滚到原证书，站点不残留失败写入的新证书
+        assert panelSite.panelSite._ssl_data['test.example.com'] == {'key': 'OLD-KEY', 'cert': 'OLD-CERT'}
+
+    def test_setssl_raises_rolls_back(self, deployer, monkeypatch):
+        """SetSSL 抛异常（可能已部分写入）→ 尝试回滚到原证书"""
+        import panelSite
+        panelSite.panelSite._ssl_data['test.example.com'] = {'key': 'OLD-KEY', 'cert': 'OLD-CERT'}
+
+        calls = {'n': 0}
+
+        def raise_after_write(self, params):
+            calls['n'] += 1
+            site = params['siteName']
+            panelSite.panelSite._ssl_data[site] = {'key': params['key'], 'cert': params['csr']}
+            if calls['n'] == 1:
+                raise RuntimeError('SetSSL 内部异常')
+            return {'status': True}  # 回滚调用返回成功
+
+        monkeypatch.setattr(panelSite.panelSite, 'SetSSL', raise_after_write)
+        with pytest.raises(DeployError, match='SetSSL 写入异常'):
+            deployer._set_ssl('test.example.com', 'NEW-CERT', 'NEW-KEY')
+        assert panelSite.panelSite._ssl_data['test.example.com'] == {'key': 'OLD-KEY', 'cert': 'OLD-CERT'}
+
+    def test_setssl_false_no_prev_preserves_original_error(self, deployer, monkeypatch):
+        """SetSSL 返回 False 且站点无原证书 → 回滚 no-op，保留原始错误信息"""
+        import panelSite
+
+        def just_false(self, params):
+            return {'status': False, 'msg': '指定站点不存在'}
+
+        monkeypatch.setattr(panelSite.panelSite, 'SetSSL', just_false)
+        with pytest.raises(DeployError, match='指定站点不存在'):
+            deployer._set_ssl('nonexist-xyz.example.com', 'NEW-CERT', 'NEW-KEY')
+
 
 class TestFailureCallback:
     """失败必须回调 failure 并携带原因（P1-13）"""

@@ -337,13 +337,19 @@ class Deployer:
             key=key_pem,
             csr=cert_pem,  # 宝塔的 csr 参数实际是证书
         )
-        result = site_obj.SetSSL(params)
+        # SetSSL 抛异常或返回非成功状态时，都可能已部分写入证书，尝试回滚到原证书
+        try:
+            result = site_obj.SetSSL(params)
+        except Exception as e:
+            self._rollback_after_setssl_failure(site_obj, site_name, prev)
+            raise DeployError('SetSSL 写入异常: %s' % str(e), phase='deploy', retryable=True)
         if not (isinstance(result, dict) and result.get('status') is True):
             msg = ''
             if isinstance(result, dict):
                 msg = str(result.get('msg') or '')
             if not msg:
                 msg = 'SetSSL 返回异常形态: %r' % (result,)
+            self._rollback_after_setssl_failure(site_obj, site_name, prev)
             raise DeployError(msg, phase='deploy', retryable=True)
 
         # 4. 写入后校验并重载，失败则回滚原证书
@@ -427,6 +433,22 @@ class Deployer:
             except OSError:
                 continue
         return None
+
+    def _rollback_after_setssl_failure(self, site_obj, site_name, prev):
+        """SetSSL 写入失败（返回非成功状态或抛异常）后尝试回滚到原证书
+
+        prev 为空（站点此前无有效证书）时为 no-op；回滚自身的异常仅记日志，
+        不掩盖 SetSSL 的原始错误（原始错误由调用方抛出）。
+        """
+        if not prev:
+            return
+        try:
+            note = self._rollback_ssl(site_obj, site_name, prev)
+            if self._logger:
+                self._logger.warning("SetSSL 写入失败，已尝试回滚原证书: site=%s, %s", site_name, note)
+        except Exception as e:
+            if self._logger:
+                self._logger.error("SetSSL 写入失败后回滚异常: site=%s, error=%s", site_name, str(e))
 
     def _rollback_ssl(self, site_obj, site_name, prev):
         """写入验证失败后恢复站点原证书，返回状态说明（供错误信息与回调）"""
