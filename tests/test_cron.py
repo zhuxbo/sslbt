@@ -1,6 +1,5 @@
 """计划任务模块测试"""
 
-import os
 import sys
 import sqlite3
 import types
@@ -152,7 +151,8 @@ class TestCronManager:
         """未找到任务返回 exists=False"""
         db_path = str(tmp_path / 'crontab.db')
         conn = sqlite3.connect(db_path)
-        conn.execute('CREATE TABLE crontab (id INTEGER PRIMARY KEY, name TEXT, status INTEGER, type TEXT, where1 TEXT, addtime TEXT, sBody TEXT)')
+        conn.execute('CREATE TABLE crontab (id INTEGER PRIMARY KEY, name TEXT, status INTEGER,'
+                     ' type TEXT, where1 TEXT, addtime TEXT, sBody TEXT)')
         conn.commit()
         conn.close()
 
@@ -165,7 +165,8 @@ class TestCronManager:
         db_path = str(tmp_path / 'crontab.db')
         script = 'cd %s && echo test' % PLUGIN_DIR
         conn = sqlite3.connect(db_path)
-        conn.execute('CREATE TABLE crontab (id INTEGER PRIMARY KEY, name TEXT, status INTEGER, type TEXT, where1 TEXT, where_hour TEXT, where_minute TEXT, addtime TEXT, sBody TEXT)')
+        conn.execute('CREATE TABLE crontab (id INTEGER PRIMARY KEY, name TEXT, status INTEGER,'
+                     ' type TEXT, where1 TEXT, where_hour TEXT, where_minute TEXT, addtime TEXT, sBody TEXT)')
         conn.execute("INSERT INTO crontab VALUES (5, ?, 1, 'day', '', '3', '15', '2025-01-01', ?)", (CRON_NAME, script))
         conn.commit()
         conn.close()

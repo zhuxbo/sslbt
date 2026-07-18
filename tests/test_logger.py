@@ -4,8 +4,6 @@ import os
 import time
 import glob
 import logging
-import pytest
-from unittest.mock import patch
 
 from lib.logger import Logger, sanitize, MAX_LOG_FILES
 
@@ -139,7 +137,7 @@ class TestLogger:
             path = os.path.join(log_dir, 'sslbt-2020-01-%02d.log' % (i + 1))
             with open(path, 'w') as f:
                 f.write('test')
-        logger = Logger(log_dir)
+        Logger(log_dir)
         files = glob.glob(os.path.join(log_dir, 'sslbt-*.log'))
         assert len(files) <= MAX_LOG_FILES + 1  # +1 for today's log
 

@@ -1,8 +1,15 @@
 """证书部署模块。通过宝塔 panelSite.SetSSL() 部署证书。"""
 
+import os
 from datetime import datetime, timezone
 
 from . import cert_utils
+
+# 宝塔站点证书文件目录（与 site_manager._check_ssl 的路径约定一致）
+_BT_CERT_DIRS = (
+    '/www/server/panel/vhost/cert/%s',
+    '/www/server/panel/vhost/ssl/%s',
+)
 
 
 class _BtParams(dict):
@@ -382,19 +389,43 @@ class Deployer:
                 return 'Web 服务重载失败: %s' % rerr
         return None
 
-    @staticmethod
-    def _capture_current_ssl(site_obj, site_name):
-        """读取站点当前证书/私钥，用于回滚。无有效证书或读取失败时返回 None"""
+    @classmethod
+    def _capture_current_ssl(cls, site_obj, site_name):
+        """读取站点当前证书/私钥，用于回滚。无有效证书或读取失败时返回 None
+
+        主路径 GetSSL：按 'csr' 键=证书、'key' 键=私钥解析（与 SetSSL 参数命名
+        一致；宝塔各版本返回形态未逐一确证，属已知假设）。拿不到时回退读宝塔
+        证书目录文件（fullchain.pem/privkey.pem）。
+        """
         try:
             result = site_obj.GetSSL(_BtParams(siteName=site_name))
         except Exception:
-            return None
-        if not isinstance(result, dict):
-            return None
-        key = result.get('key', '')
-        cert = result.get('csr', '')  # 宝塔 GetSSL 的 csr 字段是证书
-        if key and cert:
-            return {'key': key, 'cert': cert}
+            result = None
+        if isinstance(result, dict):
+            key = result.get('key', '')
+            cert = result.get('csr', '')  # 宝塔 GetSSL 的 csr 字段是证书
+            if key and cert:
+                return {'key': key, 'cert': cert}
+        return cls._read_site_cert_files(site_name)
+
+    @staticmethod
+    def _read_site_cert_files(site_name):
+        """回退：从宝塔证书目录读取站点当前证书/私钥文件"""
+        for dir_tpl in _BT_CERT_DIRS:
+            cert_dir = dir_tpl % site_name
+            cert_path = os.path.join(cert_dir, 'fullchain.pem')
+            key_path = os.path.join(cert_dir, 'privkey.pem')
+            try:
+                if not (os.path.isfile(cert_path) and os.path.isfile(key_path)):
+                    continue
+                with open(cert_path, 'r') as f:
+                    cert = f.read()
+                with open(key_path, 'r') as f:
+                    key = f.read()
+                if cert and key:
+                    return {'key': key, 'cert': cert}
+            except OSError:
+                continue
         return None
 
     def _rollback_ssl(self, site_obj, site_name, prev):

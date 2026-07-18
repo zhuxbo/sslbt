@@ -254,7 +254,6 @@ class TestDeployCert:
         assert result['status'] is False
         assert 'API' in result['msg']
 
-
     @patch('sslbt_main.APIClient')
     def test_deploy_processing_with_file(self, mock_api_cls, plugin):
         """processing + file 状态放置验证文件"""
@@ -632,6 +631,34 @@ class TestFetchDeployUrl:
         assert 'HTTPS' in result['msg'] or '不安全' in result['msg']
 
     @patch('sslbt_main.APIClient')
+    def test_reverse_proxy_subpath_preserved(self, mock_api_cls, plugin):
+        """反代子路径部署链接保留路径前缀（api_url 不得被改写回 host-root）"""
+        mock_api = MagicMock()
+        mock_api.query_batch.return_value = [{'order_id': 300, 'domains': 'a.com', 'status': 'active'}]
+        mock_api_cls.return_value = mock_api
+        plugin._site_mgr.get_sites.return_value = []
+
+        result = plugin.fetch_deploy_url({
+            'url': 'https://host.example.com/manager/api/deploy?token=' + TOKEN + '&order=300'})
+        assert result['status'] is True
+        # APIClient 用含子路径的 base_url 构造，session/config 后续沿用同一地址
+        assert mock_api_cls.call_args[0][0] == 'https://host.example.com/manager/api/deploy'
+        assert result['data']['api']['url'] == 'https://host.example.com/manager/api/deploy'
+
+    @patch('sslbt_main.APIClient')
+    def test_host_root_link_behavior_unchanged(self, mock_api_cls, plugin):
+        """标准链接（path=/api/deploy）功能不变，api_url 含标准路径"""
+        mock_api = MagicMock()
+        mock_api.query_batch.return_value = [{'order_id': 301, 'domains': 'a.com', 'status': 'active'}]
+        mock_api_cls.return_value = mock_api
+        plugin._site_mgr.get_sites.return_value = []
+
+        result = plugin.fetch_deploy_url({
+            'url': 'https://api.example.com/api/deploy?token=' + TOKEN + '&order=301'})
+        assert result['status'] is True
+        assert mock_api_cls.call_args[0][0] == 'https://api.example.com/api/deploy'
+
+    @patch('sslbt_main.APIClient')
     def test_add_cert_with_session_id(self, mock_api_cls, plugin):
         """通过 session_id 添加证书"""
         mock_api = MagicMock()
@@ -640,10 +667,11 @@ class TestFetchDeployUrl:
         mock_api_cls.return_value = mock_api
         plugin._site_mgr.get_sites.return_value = []
 
-        fetch_result = plugin.fetch_deploy_url({'url': 'https://api.example.com/api/deploy?token=' + TOKEN + '&order=100'})
+        fetch_result = plugin.fetch_deploy_url(
+            {'url': 'https://api.example.com/api/deploy?token=' + TOKEN + '&order=100'})
         session_id = fetch_result['data']['session_id']
 
-        # 用 session_id 添加证书
+        # 用 session_id 添加证书（api_url 保留链接路径，_build_api_url 对含 /api/ 的路径直接追加后缀）
         result = plugin.add_cert({
             'order_id': '100',
             'session_id': session_id,
@@ -651,7 +679,7 @@ class TestFetchDeployUrl:
         })
         assert result['status'] is True
         cert = plugin._config.get_cert(100)
-        assert cert['api']['url'] == 'https://api.example.com'
+        assert cert['api']['url'] == 'https://api.example.com/api/deploy'
         assert cert['api']['token'] == TOKEN
 
     @patch('sslbt_main.APIClient')
@@ -669,7 +697,8 @@ class TestFetchDeployUrl:
         mock_api_cls.return_value = mock_api
         plugin._site_mgr.get_sites.return_value = []
 
-        fetch_result = plugin.fetch_deploy_url({'url': 'https://api.example.com/api/deploy?token=' + TOKEN + '&order=101'})
+        fetch_result = plugin.fetch_deploy_url(
+            {'url': 'https://api.example.com/api/deploy?token=' + TOKEN + '&order=101'})
         session_id = fetch_result['data']['session_id']
 
         r1 = plugin.add_cert({'order_id': '101', 'session_id': session_id, 'site_names': 'a.com'})

@@ -366,6 +366,35 @@ class TestPreflightAndRollback:
         assert result['status'] is True
         assert panelSite.panelSite._ssl_data['freshsite.example.com'] == {'key': 'NEW-KEY', 'cert': 'NEW-CERT'}
 
+    def test_capture_falls_back_to_cert_files(self, deployer, tmp_path, monkeypatch):
+        """GetSSL 拿不到有效证书时回退读宝塔证书目录文件"""
+        import lib.deployer as deployer_mod
+        cert_dir = tmp_path / 'vhost-cert' / 'site.example.com'
+        cert_dir.mkdir(parents=True)
+        (cert_dir / 'fullchain.pem').write_text('FILE-CERT')
+        (cert_dir / 'privkey.pem').write_text('FILE-KEY')
+        monkeypatch.setattr(deployer_mod, '_BT_CERT_DIRS',
+                            (str(tmp_path / 'vhost-cert' / '%s'),))
+
+        site_obj = MagicMock()
+        site_obj.GetSSL.return_value = {'status': False}  # 无有效证书
+        prev = deployer._capture_current_ssl(site_obj, 'site.example.com')
+        assert prev == {'key': 'FILE-KEY', 'cert': 'FILE-CERT'}
+
+    def test_capture_prefers_getssl(self, deployer):
+        """GetSSL 返回有效证书时优先使用，不读文件"""
+        site_obj = MagicMock()
+        site_obj.GetSSL.return_value = {'status': True, 'key': 'K', 'csr': 'C'}
+        prev = deployer._capture_current_ssl(site_obj, 'any.example.com')
+        assert prev == {'key': 'K', 'cert': 'C'}
+
+    def test_capture_none_when_no_source(self, deployer):
+        """GetSSL 与文件回退均无结果时返回 None"""
+        site_obj = MagicMock()
+        site_obj.GetSSL.side_effect = Exception('boom')
+        prev = deployer._capture_current_ssl(site_obj, 'nonexist-site-xyz.example.com')
+        assert prev is None
+
 
 class TestFailureCallback:
     """失败必须回调 failure 并携带原因（P1-13）"""

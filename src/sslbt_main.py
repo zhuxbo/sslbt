@@ -701,8 +701,10 @@ class sslbt_main:
             order_value = order_list[0]
 
             # 构造 api_url，交给项目统一 API 客户端发请求：HTTPS 强制（拒绝 http，仅
-            # localhost 例外）+ SSRF/DNS Rebinding 防护 + token 校验，避免绕过统一安全出口
-            api_url = '%s://%s' % (parsed.scheme, parsed.netloc)
+            # localhost 例外）+ SSRF/DNS Rebinding 防护 + token 校验，避免绕过统一安全出口。
+            # 保留链接路径以兼容反代子路径部署（如 https://host/manager/api/deploy?...），
+            # APIClient._build_api_url 对含 /api/ 的 base_url 直接追加后缀，不重复拼路径
+            api_url = '%s://%s%s' % (parsed.scheme, parsed.netloc, parsed.path.rstrip('/'))
             try:
                 api = APIClient(api_url, token, self._logger)
             except ValueError as e:

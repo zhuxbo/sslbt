@@ -3,12 +3,11 @@
 import os
 import json
 import stat
-import struct
 import tempfile
 import shutil
 import hashlib
 import zipfile
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 import pytest
 
 

@@ -31,7 +31,8 @@ class TestBuildAPIURL:
         assert _build_api_url('https://api.example.com/api/deploy') == 'https://api.example.com/api/deploy'
 
     def test_with_suffix(self):
-        assert _build_api_url('https://api.example.com/api/deploy', '/callback') == 'https://api.example.com/api/deploy/callback'
+        assert _build_api_url('https://api.example.com/api/deploy', '/callback') == \
+            'https://api.example.com/api/deploy/callback'
 
     def test_trailing_slash(self):
         assert _build_api_url('https://api.example.com/') == 'https://api.example.com/api/deploy'

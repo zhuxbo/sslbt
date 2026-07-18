@@ -1,6 +1,5 @@
 """证书工具测试"""
 
-import pytest
 from lib.cert_utils import (
     validate_cert_pem, validate_key_pem, build_fullchain,
     PEM_CERT_RE, PEM_KEY_RE,
