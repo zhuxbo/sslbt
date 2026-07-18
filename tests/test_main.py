@@ -509,6 +509,20 @@ class TestGetSiteMatches:
         assert data[1]['bound'] is False
         assert data[1]['match_type'] is None
 
+    def test_partial_match_returns_unmatched(self, plugin):
+        """部分匹配站点返回未覆盖域名清单（前端据此提示 TLS 覆盖缺口，BT-05）"""
+        plugin._config.add_cert(order_id=703, cert_name='test',
+                                domains=['a.example.com'],
+                                api_url='https://api.example.com', api_token=TOKEN)
+        plugin._site_mgr.get_sites.return_value = [
+            {'name': 'site-p.example.com', 'domains': ['a.example.com', 'uncovered.example.com']},
+        ]
+        result = plugin.get_site_matches({'order_id': '703'})
+        assert result['status'] is True
+        row = result['data'][0]
+        assert row['match_type'] == 'partial'
+        assert row['unmatched'] == ['uncovered.example.com']
+
     def test_no_sites(self, plugin):
         plugin._config.add_cert(order_id=701, cert_name='test', domains=['a.example.com'],
                                 api_url='https://api.example.com', api_token=TOKEN)
@@ -534,6 +548,28 @@ class TestGetSiteMatches:
         result = plugin.get_site_matches({'order_id': '702'})
         assert result['status'] is True
         assert result['data'][0]['bound'] is True
+
+
+class TestGetRenewStatus:
+    """最近续签状态读取（B5）"""
+
+    def test_no_status_file(self, plugin):
+        """无状态文件时返回 data=None"""
+        result = plugin.get_renew_status()
+        assert result['status'] is True
+        assert result['data'] is None
+
+    def test_reads_status_file(self, plugin):
+        """读取续签状态文件内容"""
+        path = os.path.join(plugin._data_dir, 'renew_status.json')
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump({'last_run': '2026-07-17T10:00:00Z', 'total': 3,
+                       'success': 2, 'pending': 0, 'failure': 1}, f)
+        result = plugin.get_renew_status()
+        assert result['status'] is True
+        assert result['data']['total'] == 3
+        assert result['data']['success'] == 2
+        assert result['data']['failure'] == 1
 
 
 class TestFetchDeployUrl:
@@ -574,6 +610,25 @@ class TestFetchDeployUrl:
         assert 'session_id' in data
         assert 'token' not in data.get('api', {}) or data['api']['token'] == ''  # 明文 token 不应出现
         assert data['api']['token_masked'].endswith('***')  # 仅返回脱敏值
+
+    @patch('urllib.request.urlopen')
+    def test_partial_match_includes_unmatched(self, mock_urlopen, plugin):
+        """fetch_deploy_url 为部分匹配站点返回未覆盖域名（前端一键部署列表据此提示，BT-05）"""
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps({
+            'code': 1,
+            'data': {'order_id': 200, 'domains': 'a.example.com', 'status': 'active'},
+        }).encode()
+        mock_urlopen.return_value = mock_resp
+        plugin._site_mgr.get_sites.return_value = [
+            {'name': 'site-x.example.com', 'domains': ['a.example.com', 'b.uncovered.com']},
+        ]
+        result = plugin.fetch_deploy_url({'url': 'https://api.example.com/deploy?token=' + TOKEN + '&order=200'})
+        assert result['status'] is True
+        matches = result['data']['certs'][0]['_matches']
+        assert len(matches) == 1
+        assert matches[0]['match_type'] == 'partial'
+        assert matches[0]['unmatched'] == ['b.uncovered.com']
 
     @patch('urllib.request.urlopen')
     def test_add_cert_with_session_id(self, mock_urlopen, plugin):

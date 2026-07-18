@@ -22,6 +22,13 @@ class TestCronManager:
         assert 'sslbt_main' in script
         assert 'run_renew_cron' in script
 
+    def test_build_script_uses_current_interpreter(self, cron_mgr):
+        """脚本使用注册时进程的解释器（sys.executable）而非裸 python3（BT-06）"""
+        script = cron_mgr._build_script()
+        assert sys.executable in script
+        # 不应残留裸 python3 调用
+        assert 'python3 -c' not in script
+
     @staticmethod
     def _make_cron_db(tmp_path, with_task=False):
         """创建临时 crontab 数据库，可选预置一条本插件任务"""

@@ -764,13 +764,19 @@
           h += '<div style="font-size:12px;color:#606266;margin-bottom:4px">匹配站点：</div>';
           for (var s = 0; s < availableMatches.length; s++) {
             var mt = availableMatches[s];
-            var tagCls = mt.match_type === 'full' ? 'ssl-tag-success' : 'ssl-tag-warning';
-            var tagTxt = mt.match_type === 'full' ? '全部匹配' : '部分匹配';
+            var isFull = mt.match_type === 'full';
+            var tagCls = isFull ? 'ssl-tag-success' : 'ssl-tag-warning';
+            var tagTxt = isFull ? '全部匹配' : '部分匹配';
             h += '<label style="display:flex;align-items:center;gap:6px;padding:3px 0;font-size:12px;cursor:pointer">';
-            h += '<input type="checkbox" checked data-cert-idx="' + c + '" data-site="' + P._e(mt.site_name) + '" class="add-site-cb" />';
+            // 部分匹配默认不勾选，避免一键部署后未覆盖域名 TLS 失效
+            h += '<input type="checkbox"' + (isFull ? ' checked' : '') + ' data-cert-idx="' + c + '" data-site="' + P._e(mt.site_name) + '" class="add-site-cb" />';
             h += P._e(mt.site_name);
             h += ' <span class="ssl-tag ' + tagCls + '">' + tagTxt + '</span>';
             h += '</label>';
+            // 部分匹配：列出未被证书覆盖的域名，提示这些域名将失去 TLS 覆盖
+            if (!isFull && mt.unmatched && mt.unmatched.length) {
+              h += '<div style="margin:0 0 4px 22px;font-size:11px;color:#e6a23c">未覆盖域名: ' + P._e(mt.unmatched.join(', ')) + '</div>';
+            }
           }
         } else {
           h += '<div style="font-size:12px;color:#c0c4cc">无匹配站点</div>';
@@ -1033,6 +1039,10 @@
           sitesHtml += '<input type="checkbox" class="edit-site-cb" value="' + P._e(s.site_name) + '"' + (s.bound ? ' checked' : '') + ' />';
           sitesHtml += '<span>' + P._e(s.site_name) + '</span>' + tag;
           sitesHtml += '</label>';
+          // 部分匹配：提示该站点未被证书覆盖的域名
+          if (s.match_type === 'partial' && s.unmatched && s.unmatched.length) {
+            sitesHtml += '<div style="margin:0 0 4px 22px;font-size:11px;color:#e6a23c">未覆盖域名: ' + P._e(s.unmatched.join(', ')) + '</div>';
+          }
         }
         sitesHtml += '</div>';
 
@@ -1131,6 +1141,7 @@
         h += '<button class="ssl-btn ssl-btn-sm" onclick="sslbt.removeCron()">删除计划任务</button>';
         h += ' <span id="cron-status" style="color:#909399;font-size:12px;margin-left:8px"></span>';
         h += '</td></tr>';
+        h += '<tr><td>最近续签</td><td><span id="renew-status" style="color:#909399;font-size:12px">加载中...</span></td></tr>';
         h += '</table></div>';
 
         // Section 3: 批量操作
@@ -1159,6 +1170,7 @@
 
         $('#settings-form').html(h);
         sslbt._loadCronStatus();
+        sslbt._loadRenewStatus();
       });
     },
 
@@ -1169,6 +1181,18 @@
         var el = document.getElementById('cron-status');
         if (!el) return;
         el.textContent = d.exists ? '当前: ' + d.cycle : '未设置';
+      });
+    },
+
+    _loadRenewStatus: function () {
+      P._call('get_renew_status', null, function (r) {
+        var el = document.getElementById('renew-status');
+        if (!el) return;
+        if (!r.status || !r.data) { el.textContent = '暂无续签记录'; return; }
+        var d = r.data;
+        var t = (d.last_run || '').replace('T', ' ').replace('Z', ' UTC');
+        el.textContent = t + '：共 ' + (d.total || 0) + '，成功 ' + (d.success || 0) +
+          '，等待 ' + (d.pending || 0) + '，失败 ' + (d.failure || 0);
       });
     },
 

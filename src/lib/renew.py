@@ -1,6 +1,7 @@
 """续签引擎。对标 sslctl pkg/certops/renew.go 状态机"""
 
 import os
+import json
 import time
 import random
 import fcntl
@@ -171,7 +172,33 @@ class RenewEngine:
             else:
                 self._logger.info("续签检查完成: 无需续签")
 
+        self._write_renew_status(results)
         return results
+
+    def _write_renew_status(self, results):
+        """写入最近一次续签运行的轻量状态（供面板展示），失败不影响续签
+
+        复用数据目录，原子写 + 0600 权限，与 config/session 落盘约定一致。
+        """
+        status = {
+            'last_run': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'total': len(results),
+            'success': sum(1 for r in results if r.get('status') == 'success'),
+            'pending': sum(1 for r in results if r.get('status') == 'pending'),
+            'failure': sum(1 for r in results if r.get('status') == 'failure'),
+        }
+        path = os.path.join(self._data_dir, 'renew_status.json')
+        tmp = path + '.tmp'
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                os.write(fd, json.dumps(status, ensure_ascii=False).encode('utf-8'))
+            finally:
+                os.close(fd)
+            os.replace(tmp, path)
+        except OSError as e:
+            if self._logger:
+                self._logger.warning("写入续签状态文件失败: %s", str(e))
 
     @staticmethod
     def _calc_spread_delay(count):

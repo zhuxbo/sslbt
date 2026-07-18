@@ -1,6 +1,7 @@
 """宝塔计划任务集成模块"""
 
 import os
+import sys
 import random
 import sqlite3
 
@@ -172,8 +173,14 @@ class CronManager:
                     pass
 
     def _build_script(self):
-        """构建续签检查脚本"""
+        """构建续签检查脚本
+
+        使用注册时进程的解释器（面板 Python，sys.executable）而非裸 python3，
+        避免面板 pyenv 与系统 python3 环境不一致导致续签整体不可运行。
+        取不到时回退 python3；旧条目经 setup() 的 remove+重建替换。
+        """
         log_file = '%s/logs/cron.log' % self._data_dir
+        python_bin = sys.executable or 'python3'
         return '''#!/bin/bash
 # cron.log 轮转：超过 1000 行保留最后 500 行
 LOG_FILE="%s"
@@ -181,7 +188,7 @@ if [ -f "$LOG_FILE" ] && [ "$(wc -l < "$LOG_FILE")" -gt 1000 ]; then
     tail -500 "$LOG_FILE" > "$LOG_FILE.tmp" && mv "$LOG_FILE.tmp" "$LOG_FILE"
 fi
 cd "%s"
-python3 -c "
+"%s" -c "
 import sys
 sys.path.insert(0, '/www/server/panel/class/')
 sys.path.insert(0, '%s')
@@ -189,4 +196,4 @@ from sslbt_main import sslbt_main
 plugin = sslbt_main()
 plugin.run_renew_cron(None)
 " >> "$LOG_FILE" 2>&1
-''' % (log_file, PLUGIN_DIR, PLUGIN_DIR)
+''' % (log_file, PLUGIN_DIR, python_bin, PLUGIN_DIR)

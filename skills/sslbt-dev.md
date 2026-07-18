@@ -125,6 +125,8 @@ SetSSL 部署：写入前 pre-flight 校验既有配置（checkWebConfig，损�
 - callback：全部站点成功=success，任一失败=failure（message 附各站点失败原因，超长按 500 字符截断）
 - 分散续签：`check_and_renew_all(spread=True)` 在证书间加动态延迟，根据需续签数量自动缩短间隔（总延迟上限 600s），仅 cron 调用启用
 - 汇总日志：续签完成后记录成功/等待/失败数量
+- cron 注册：`_build_script()` 用注册时进程的解释器（`sys.executable`，面板 pyenv）而非裸 python3，避免环境不一致导致续签不可运行；旧条目经 `setup()` 的 remove+重建替换
+- 续签状态：每次运行结束写 `data/renew_status.json`（last_run/total/success/pending/failure，原子写 0600），面板经 `get_renew_status` 展示「最近续签」
 - 常量：RENEW_DEFAULT_DAYS=14, MAX_ISSUE_RETRY_COUNT=10, RENEW_SLEEP_MIN=5, RENEW_SLEEP_MAX=120, SPREAD_TOTAL_MAX=600
 - 已过期证书（days_remaining < 0）不再触发续签
 - deploy_multi 全部站点失败时不更新 metadata（保留重试状态）

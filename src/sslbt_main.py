@@ -917,6 +917,18 @@ class sslbt_main:
             self._logger.error("续签检查失败: %s", str(e))
             return _err('续签检查失败: %s' % str(e))
 
+    def get_renew_status(self, args=None):
+        """获取最近一次续签运行状态（供面板展示最近续签信息）"""
+        try:
+            path = os.path.join(self._data_dir, 'renew_status.json')
+            if not os.path.exists(path):
+                return _ok(None)
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            return _ok(data)
+        except Exception as e:
+            return _err('获取续签状态失败: %s' % str(e))
+
     # ==================== 计划任务 ====================
 
     def setup_cron(self, args=None):

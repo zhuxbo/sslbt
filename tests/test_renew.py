@@ -166,6 +166,25 @@ class TestRenewEngine:
         assert len(results) == 1
         assert results[0]['order_id'] == 7777
 
+    def test_writes_renew_status_file(self, engine, tmp_data_dir):
+        """续签运行结束写入轻量状态文件（时间戳/成功失败计数，0600 权限）"""
+        engine._mock_api.query_order.return_value = {
+            'status': 'active', 'certificate': '---C---',
+            'ca_certificate': '---CA---', 'private_key': '---K---',
+        }
+        engine._config.add_cert(order_id=8001, cert_name='order-8001',
+                                domains=['example.com'], site_names=['example.com'])
+        engine._config.update_metadata(8001, _make_cert_entry(10, order_id=8001)['metadata'])
+        engine.check_and_renew_all()
+        status_path = os.path.join(tmp_data_dir, 'renew_status.json')
+        assert os.path.isfile(status_path)
+        with open(status_path) as f:
+            data = json.load(f)
+        assert data['total'] == 1
+        assert data['success'] == 1
+        assert 'last_run' in data
+        assert (os.stat(status_path).st_mode & 0o777) == 0o600
+
     def test_retry_count_limit(self, engine):
         """retry_count > MAX_ISSUE_RETRY_COUNT 时拒绝（spec 3.2: > 10）"""
         cert = _make_cert_entry(10, renew_mode='local', retry_count=MAX_ISSUE_RETRY_COUNT + 1)
