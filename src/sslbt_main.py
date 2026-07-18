@@ -1001,6 +1001,14 @@ if __name__ == '__main__':
     import json as _json
     import traceback as _tb
 
+    if len(sys.argv) == 2 and sys.argv[1] == '--version':
+        try:
+            with open(os.path.join(PLUGIN_DIR, 'info.json'), 'r', encoding='utf-8') as _f:
+                print(_json.load(_f).get('versions', '0.0.0'))
+        except (OSError, ValueError):
+            print('0.0.0')
+        sys.exit(0)
+
     # 让 CLI 行为对齐面板进程：补上宝塔的 class 目录，使 crontab/panelSite 等可 import
     _BT_CLASS_DIR = '/www/server/panel/class'
     if os.path.isdir(_BT_CLASS_DIR) and _BT_CLASS_DIR not in sys.path:

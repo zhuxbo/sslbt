@@ -1,8 +1,3 @@
----
-name: sslbt-dev
-description: Use when developing sslbt baota panel plugin - modifying API client, deployer, renew engine, frontend UI, or config module
----
-
 # sslbt 宝塔面板插件开发
 
 纯 Python 宝塔面板插件，通过部署 API 获取证书，`panelSite.SetSSL()` 部署。仅用标准库，无第三方依赖。
@@ -164,7 +159,7 @@ SetSSL 部署：写入前 pre-flight 校验既有配置（checkWebConfig，损�
   - SSRF——`net_guard.check_ssrf()` 解析主机名后对内网 IP 段（`10/8`、`172.16/12`、`192.168/16`、`127/8`、`169.254.169.254`、`fc00::/7` 等）黑名单拦截
   - DNS Rebinding——自定义 opener（`_SafeHTTPConnection`/`_SafeHTTPSConnection`）在 TCP 连接建立后用 `getpeername()` 取实际对端 IP 二次校验，防解析与连接之间的地址替换
 - **升级模块（`updater.py`）复用 api_client 的 Safe Handler**：`build_opener(_SafeHTTPHandler, _SafeHTTPSHandler)`，同样 HTTPS 强制 + SSRF + DNS Rebinding；通道白名单 `_validate_channel`（仅 `main`/`dev`，防路径遍历）
-- **releases.json 规范扁平格式**：通道做顶层 key（`{main: {latest, versions: [{version, released_at, checksums: {filename: hash}}]}, dev: {...}}`），客户端按版本 pre-release 标识（版本号含 `-` 段）区分稳定/测试通道；下载后 SHA256 校验，无校验和拒绝安装
+- **releases.json**：结构和通道语义以 `deploy-spec.md` 第 6 节为准；客户端下载后校验 `sslbt.zip` 的 SHA256，无校验和拒绝安装
 - **安全解压 `_safe_extract`**：符号链接拒绝（`external_attr >> 28 == 0xA`）、路径遍历防护（`realpath` 前缀校验）、跳过 `data/`、目录 `0700` 文件 `0600`、解压后清除 `__pycache__`；ZIP 大小上限 10MB
 - **远程安装脚本 `deploy/install.sh`**：`curl --max-filesize` 限制（releases.json 256KB、ZIP 10MB）、SHA256 校验、解压前用 Python `zipfile` 拒绝含符号链接的 ZIP、`data/` 目录保留不覆盖
 
@@ -184,7 +179,8 @@ SetSSL 部署：写入前 pre-flight 校验既有配置（checkWebConfig，损�
 
 ```bash
 make test          # pytest 单元测试
-make build         # 构建 ZIP
+make build VERSION=1.2.3  # 构建 ZIP
+make finish-check  # 自动化完成门禁
 make docker-test   # 容器集成测试（nginx/apache 双环境，安装/部署/续签三段）
 ```
 

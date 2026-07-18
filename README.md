@@ -59,8 +59,11 @@ make test
 # 构建 ZIP（需指定版本号）
 make build VERSION=1.0.0
 
-# 发布到远程服务器
-make release VERSION=1.0.0
+# 完成前自动门禁
+make finish-check
+
+# 仅准备正式发布 bundle（不会上传）
+make build-release VERSION=1.0.0
 
 # 容器集成测试
 make docker-test
@@ -91,4 +94,9 @@ docker/                 # 容器集成测试
 scripts/                # 构建脚本
 deploy/                 # 安装脚本
 build/                  # 发布脚本及配置
+skills/                 # 开发、检查、构建与发布工作流
 ```
+
+## 发布维护
+
+跨仓发布语义以 `deploy-spec.md` 为准；本仓完整发布入口为 `skills/remote-release.md`，平台资产和恢复原语见 `skills/build-release.md`。规范正式资产仅 `sslbt.zip`，使用 SHA256 完整性校验。`make release` 固定拒绝执行，以免绕过 main 不可变发布和多节点一致性门禁。

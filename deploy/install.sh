@@ -175,25 +175,27 @@ except: pass
 " <<< "$RELEASES_JSON" 2>/dev/null)
 fi
 
-if [ -n "$EXPECTED_HASH" ]; then
-    ACTUAL_HASH=$(sha256sum "$TMP_FILE" 2>/dev/null | cut -d' ' -f1)
-    [ -z "$ACTUAL_HASH" ] && ACTUAL_HASH=$(shasum -a 256 "$TMP_FILE" 2>/dev/null | cut -d' ' -f1)
-    if [ -z "$ACTUAL_HASH" ]; then
-        echo_error "无法计算 SHA256"
-        rm -f "$TMP_FILE"
-        exit 1
-    fi
-    if [ "$ACTUAL_HASH" != "$EXPECTED_HASH" ]; then
-        echo_error "SHA256 校验失败"
-        echo_error "  期望: $EXPECTED_HASH"
-        echo_error "  实际: $ACTUAL_HASH"
-        rm -f "$TMP_FILE"
-        exit 1
-    fi
-    echo_info "SHA256 校验通过"
-else
-    echo_warn "无法获取校验和，跳过 SHA256 校验"
+if [ -z "$EXPECTED_HASH" ]; then
+    echo_error "版本索引缺少 sslbt.zip 的 SHA256，拒绝安装"
+    rm -f "$TMP_FILE"
+    exit 1
 fi
+
+ACTUAL_HASH=$(sha256sum "$TMP_FILE" 2>/dev/null | cut -d' ' -f1)
+[ -z "$ACTUAL_HASH" ] && ACTUAL_HASH=$(shasum -a 256 "$TMP_FILE" 2>/dev/null | cut -d' ' -f1)
+if [ -z "$ACTUAL_HASH" ]; then
+    echo_error "无法计算 SHA256"
+    rm -f "$TMP_FILE"
+    exit 1
+fi
+if [ "$ACTUAL_HASH" != "$EXPECTED_HASH" ]; then
+    echo_error "SHA256 校验失败"
+    echo_error "  期望: $EXPECTED_HASH"
+    echo_error "  实际: $ACTUAL_HASH"
+    rm -f "$TMP_FILE"
+    exit 1
+fi
+echo_info "SHA256 校验通过"
 
 echo_info "安装中..."
 
