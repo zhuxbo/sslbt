@@ -489,9 +489,11 @@ class RenewEngine:
             api_client=api,
         )
 
-        # 清理 pending key
+        # 仅在部署成功后清理 pending key：全失败时 _check_deploy_results 抛错，
+        # 保留 pending key 供下轮重试（spec §3.8）
+        ok = self._check_deploy_results(results, order_id)
         self._cleanup_pending_key(cert_entry)
-        return self._check_deploy_results(results, order_id)
+        return ok
 
     def _submit_new_csr(self, cert_entry, api):
         """生成并提交新的 CSR"""
@@ -574,8 +576,10 @@ class RenewEngine:
                         domains=domains,
                         api_client=api,
                     )
+                    # 部署成功后才清理 pending key（全失败保留供重试，spec §3.8）
+                    ok = self._check_deploy_results(results, order_id)
                     self._cleanup_pending_key(cert_entry)
-                    return self._check_deploy_results(results, order_id)
+                    return ok
 
         if self._logger:
             self._logger.info("CSR 已提交，等待签发: status=%s", status)

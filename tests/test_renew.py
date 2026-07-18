@@ -1062,3 +1062,108 @@ class TestLocalUnknownExpiryRefill:
         engine._renew_local(engine._config.get_cert(7007), engine._mock_api)
         engine._mock_api.query_order.assert_not_called()
         engine._mock_api.submit_csr.assert_called_once()
+
+
+class TestDeployFailureRetainsPendingKey:
+    """部署全失败时保留 pending 私钥（spec §3.8），仅成功才清理"""
+
+    @pytest.fixture
+    def engine(self, tmp_data_dir):
+        config = ConfigManager(tmp_data_dir)
+        mock_api = MagicMock()
+        mock_api.last_renew_before_days = 0
+        deployer = MagicMock()
+        logger = MagicMock()
+        eng = RenewEngine(config, MagicMock(return_value=mock_api), deployer, logger)
+        eng._mock_api = mock_api
+        return eng
+
+    def _setup_processing_cert(self, engine, order_id=8101, site_names=None):
+        site_names = site_names or ['example.com']
+        cert = _make_cert_entry(10, renew_mode='local', issue_state='processing', order_id=order_id)
+        cert['cert_name'] = 'order-%d' % order_id
+        engine._config.add_cert(order_id=order_id, cert_name=cert['cert_name'],
+                                domains=cert['domains'], site_names=site_names)
+        engine._config.update_metadata(order_id, cert['metadata'])
+        # 写入唯一 pending key
+        key_path = engine._pending_key_path(cert)
+        os.makedirs(os.path.dirname(key_path), exist_ok=True)
+        with open(key_path, 'w') as f:
+            f.write('PENDING-KEY')
+        return engine._config.get_cert(order_id), key_path
+
+    def test_handle_processing_all_fail_retains_pending_key(self, engine):
+        """processing→active 但 deploy_multi 全失败 → pending key 保留供重试"""
+        cert, key_path = self._setup_processing_cert(engine, 8101)
+        engine._mock_api.query_order.return_value = {
+            'status': 'active', 'certificate': '---CERT---', 'ca_certificate': '---CA---'}
+        engine._deployer.deploy_multi.return_value = [
+            {'site_name': 'example.com', 'status': False, 'message': '部署超时'}]
+        with pytest.raises(RuntimeError, match='部署失败'):
+            engine._handle_processing(cert, engine._mock_api)
+        assert os.path.isfile(key_path)  # 全失败保留 pending key
+
+    def test_handle_processing_success_cleans_pending_key(self, engine):
+        """processing→active 且部署成功 → 清理 pending key（现行为）"""
+        cert, key_path = self._setup_processing_cert(engine, 8102)
+        engine._mock_api.query_order.return_value = {
+            'status': 'active', 'certificate': '---CERT---', 'ca_certificate': '---CA---'}
+        engine._deployer.deploy_multi.return_value = [
+            {'site_name': 'example.com', 'status': True, 'message': '部署成功'}]
+        result = engine._handle_processing(cert, engine._mock_api)
+        assert result is True
+        assert not os.path.exists(key_path)  # 成功后清理
+
+    def test_handle_processing_partial_success_cleans_pending_key(self, engine):
+        """部分成功（至少一个站点成功）→ 清理 pending key（key 已被消费，现行为）"""
+        cert, key_path = self._setup_processing_cert(
+            engine, 8103, site_names=['example.com', 's2.example.com'])
+        engine._mock_api.query_order.return_value = {
+            'status': 'active', 'certificate': '---CERT---', 'ca_certificate': '---CA---'}
+        engine._deployer.deploy_multi.return_value = [
+            {'site_name': 'example.com', 'status': True, 'message': '部署成功'},
+            {'site_name': 's2.example.com', 'status': False, 'message': '超时'}]
+        result = engine._handle_processing(cert, engine._mock_api)
+        assert result is True
+        assert not os.path.exists(key_path)
+
+    @patch('lib.renew.cert_utils.generate_csr')
+    def test_submit_csr_immediate_active_all_fail_retains_pending_key(self, mock_csr, engine):
+        """submit_csr 立即返回 active 但部署全失败 → 保留生成的 pending key"""
+        mock_csr.return_value = ('CSR-PEM', 'GEN-KEY', 'hash123')
+        engine._config.add_cert(order_id=8104, cert_name='order-8104',
+                                domains=['example.com'], site_names=['example.com'],
+                                renew_mode='local')
+        # 已知临期到期，走 _submit_new_csr（非未知到期回填路径）
+        cert = _make_cert_entry(5, renew_mode='local', order_id=8104)
+        cert['cert_name'] = 'order-8104'
+        engine._config.update_metadata(8104, cert['metadata'])
+        engine._mock_api.submit_csr.return_value = {
+            'status': 'active', 'certificate': '---CERT---', 'ca_certificate': '---CA---'}
+        engine._deployer.deploy_multi.return_value = [
+            {'site_name': 'example.com', 'status': False, 'message': '部署超时'}]
+        cert = engine._config.get_cert(8104)
+        key_path = engine._pending_key_path(cert)
+        with pytest.raises(RuntimeError, match='部署失败'):
+            engine._submit_new_csr(cert, engine._mock_api)
+        assert os.path.isfile(key_path)  # 立即 active 部署全失败：保留 pending key
+
+    @patch('lib.renew.cert_utils.generate_csr')
+    def test_submit_csr_immediate_active_success_cleans_pending_key(self, mock_csr, engine):
+        """submit_csr 立即返回 active 且部署成功 → 清理 pending key（现行为）"""
+        mock_csr.return_value = ('CSR-PEM', 'GEN-KEY', 'hash123')
+        engine._config.add_cert(order_id=8105, cert_name='order-8105',
+                                domains=['example.com'], site_names=['example.com'],
+                                renew_mode='local')
+        cert = _make_cert_entry(5, renew_mode='local', order_id=8105)
+        cert['cert_name'] = 'order-8105'
+        engine._config.update_metadata(8105, cert['metadata'])
+        engine._mock_api.submit_csr.return_value = {
+            'status': 'active', 'certificate': '---CERT---', 'ca_certificate': '---CA---'}
+        engine._deployer.deploy_multi.return_value = [
+            {'site_name': 'example.com', 'status': True, 'message': '部署成功'}]
+        cert = engine._config.get_cert(8105)
+        key_path = engine._pending_key_path(cert)
+        result = engine._submit_new_csr(cert, engine._mock_api)
+        assert result is True
+        assert not os.path.exists(key_path)
