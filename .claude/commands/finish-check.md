@@ -56,6 +56,7 @@ git diff <base>...HEAD            # 全量改动
 - 配置文件是否保持 `0o600` 权限（`os.chmod(tmp_path, 0o600)`）
 - 写入是否经过 tmp + `os.replace()` 原子操作，而非直接覆盖
 - 写入前是否检查了符号链接（`os.path.islink()` 拒绝写入）
+- `site_name` 等外部输入用作**路径组件**（证书目录 / SSL 检测 / 文件验证根目录）时，是否拒绝可造成目录穿越或绝对路径逃逸的取值（空值 / `..` / 路径分隔符 / 绝对路径）？涉及 `cert_utils.py`、`deployer.py`、`site_manager.py`、`file_verifier.py`
 
 ## 6. 宝塔 API 兼容性
 
@@ -66,6 +67,7 @@ git diff <base>...HEAD            # 全量改动
 - 站点名称匹配是否正确处理了通配符域名（`*.example.com`）
 - `site_name` 字段是否统一为列表格式（历史兼容：旧数据可能是字符串）
 - 站点清单查询失败（`SiteQueryError`）是否与"确认零站点"严格区分？**绝不能把查询失败当站点不存在**；解绑/清空绑定等破坏性操作不得基于单次失败探测
+- 站点在面板清单中确认缺失时，是否遵守**两轮确认才解绑**（首轮仅记 `site_missing`、按 failure 上报但不解绑；连续第二轮、计数达 `SITE_MISSING_CONFIRM_THRESHOLD = 2` 且两轮间隔 ≥ `SITE_MISSING_MIN_INTERVAL_HOURS = 12` 小时后才 `site_removed` 解绑）？缺失计数是否持久化到 `metadata.site_missing_counts`、站点恢复后清零？
 
 ## 7. 续签逻辑边界检查
 
@@ -74,7 +76,7 @@ git diff <base>...HEAD            # 全量改动
 - 续签窗口是否由服务端主导（`renew_before_days`，默认 `RENEW_DEFAULT_DAYS = 14`，每次 API 交互回填），本地不得硬编码提前天数
 - 重试计数是否有上限保护（`MAX_ISSUE_RETRY_COUNT = 10`）
 - 证书过期判断是否用 UTC 时间，避免时区问题
-- 回调语义是否与 deploy-spec 一致（callback status 仅 success/failure，无 pending；message 仅 failure 携带且已脱敏截断至 ≤256）？metadata 写入失败是否绝不回调 success？
+- 回调语义是否与 deploy-spec 一致（callback status 仅 success/failure，无 pending；message 仅 failure 携带，且 **先脱敏后截断** 至 ≤256——`sanitize()` 过滤 Bearer/私钥/token 在前、`[:CALLBACK_MESSAGE_MAX]` 截断在后，避免截断切出半个凭证残留）？metadata 写入失败是否绝不回调 success？
 - 空/不可解析的 `cert_expires_at` 是否按"未知需处理"进入查询回填，而非静默跳过？
 - 对服务端的 HTTP 出口是否统一走 `APIClient`（HTTPS 强制 + SSRF 防线），无裸 urlopen？
 
@@ -111,7 +113,23 @@ git diff <base>...HEAD            # 全量改动
 - `pip install` 的包列表与实际依赖一致
 - 脚本中路径使用 `/www/server/panel/plugin/sslbt/`
 
-## 12. 已知局限性与潜在风险
+## 12. deploy-spec.md 跨仓一致性
+
+`deploy-spec.md` 是四仓（`sslctl` / `sslctlw` / `sslbt` / `sslnas`）共享的跨项目规范，四份必须逐字节一致。
+
+**仅当本次改动触碰了 `deploy-spec.md` 时**执行：确认与另三仓的副本字节完全相同（有意变更需同一份内容同步落到四仓，再各自提交）。在本仓根目录执行：
+
+```bash
+# 四份 md5 全部相同即通过
+md5 deploy-spec.md ../sslctl/deploy-spec.md ../sslctlw/deploy-spec.md ../sslnas/deploy-spec.md 2>/dev/null \
+  || md5sum deploy-spec.md ../sslctl/deploy-spec.md ../sslctlw/deploy-spec.md ../sslnas/deploy-spec.md
+# 或逐仓 diff（无输出即一致）
+for r in ../sslctl ../sslctlw ../sslnas; do diff -q deploy-spec.md "$r/deploy-spec.md"; done
+```
+
+若不一致：以本次有意变更为准，把同一份内容同步到四仓后再提交；未触碰 spec 时本项标注"不适用"。
+
+## 13. 已知局限性与潜在风险
 
 列出本次改动的已知局限性和风险，按以下分类输出：
 
@@ -122,7 +140,7 @@ git diff <base>...HEAD            # 全量改动
 
 ### 兼容性风险
 
-- 是否影响 Python 3.9 ~ 3.14 的兼容性（CI 矩阵覆盖 3.9 和 3.12）
+- 是否影响 Python 兼容性（CI 矩阵覆盖 3.9 与 3.12 两端，且需兼容宝塔面板自带 pyenv）
 - 是否影响宝塔面板 7.0+ 的兼容性
 - 配置文件格式变更是否向后兼容（旧配置能否正常读取）
 

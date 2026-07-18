@@ -122,12 +122,12 @@ SetSSL 部署：写入前 pre-flight 校验既有配置（checkWebConfig，损�
 - 私钥回退（deploy-spec §5.3）：deploy_cert 中按 API → 参数路径 → 站点已有私钥(GetSSL) → 弹窗粘贴 四级回退，所有来源均需 verify_cert_key_match 校验
 - 文件验证：CSR 提交返回 file 字段时自动放置，签发/超时/异常时自动清理
 - `_check_deploy_results()`：全部失败抛异常，部分失败记警告
-- callback：全部站点成功=success，任一失败=failure（message 仅 failure 携带各站点失败原因，客户端脱敏后截断至 256 字符；success 不带）
+- callback：全部站点成功=success，任一失败=failure（message 仅 failure 携带各站点失败原因摘要，含回滚状态；上限 `CALLBACK_MESSAGE_MAX=256`，**先脱敏后截断**——`sanitize()` 复用日志脱敏规则过滤 Bearer/私钥/token 后再截断，避免截断切出半个凭证残留；success 不带 message）
 - 分散续签：`check_and_renew_all(spread=True)` 在证书间加动态延迟，根据需续签数量自动缩短间隔（总延迟上限 600s），仅 cron 调用启用
 - 汇总日志：续签完成后记录成功/等待/失败数量
 - cron 注册：`_build_script()` 用注册时进程的解释器（`sys.executable`，面板 pyenv）而非裸 python3，避免环境不一致导致续签不可运行；旧条目经 `setup()` 的 remove+重建替换
 - 续签状态：每次运行结束写 `data/renew_status.json`（last_run/total/success/pending/failure，原子写 0600），面板经 `get_renew_status` 展示「最近续签」
-- 站点删除自愈：`deploy_multi` 部署前查一次 `SiteManager.get_sites()` 复用清单检测站点存在；`get_sites` 查询失败（DB 缺失/锁定/表结构漂移）抛 `SiteQueryError` 与「确认零站点」严格区分，失败或清单为空时放弃本轮删除判定（保守视为全部存在，绝不解绑）；仅当清单查询成功且非空时才把不在清单中的站点解除绑定并持久化；首次检测回调与续签结果均记 failure 带「站点已删除」，其余站点继续部署，解绑后不再重复失败
+- 站点删除自愈（两轮确认）：`deploy_multi` 部署前查一次 `SiteManager.get_sites()` 复用清单检测站点存在；`get_sites` 查询失败（DB 缺失/锁定/表结构漂移）抛 `SiteQueryError` 与「确认零站点」严格区分，失败或清单为空时放弃本轮删除判定（保守视为全部存在，不计数、不解绑）；仅当清单查询成功且非空时才对不在清单中的站点计数——首轮仅记「疑似删除」（`site_missing`，按 failure 上报但不解绑），连续第二轮（计数达 `SITE_MISSING_CONFIRM_THRESHOLD=2`，且两轮间隔 ≥ `SITE_MISSING_MIN_INTERVAL_HOURS=12` 小时）确认后才解除绑定并持久化，缩小迁移/重装中途不完整快照误清绑定的破坏半径；缺失计数存于证书 `metadata.site_missing_counts`，站点恢复/解绑后自动清零；`site_missing`/`site_removed` 均按 failure 上报（与部署回调 failure 语义一致），其余站点继续部署，解绑后不再重复失败
 - 常量：RENEW_DEFAULT_DAYS=14, MAX_ISSUE_RETRY_COUNT=10, RENEW_SLEEP_MIN=5, RENEW_SLEEP_MAX=120, SPREAD_TOTAL_MAX=600
 - 已过期证书（days_remaining < 0）不再触发续签
 - deploy_multi 全部站点失败时不更新 metadata（保留重试状态）
@@ -149,11 +149,24 @@ SetSSL 部署：写入前 pre-flight 校验既有配置（checkWebConfig，损�
 - `schedule.renew_before_days`：提前续签天数，默认 14，API 返回值覆写
 - `schedule.renew_mode`：全局续签模式（pull/local），证书级优先
 - `release_url` / `upgrade_channel`：升级地址和通道（main/dev）
-- `validation_method`：证书级验证方式（`delegation` 或 `file`），空值默认服务端决定；受域名类型约束（IP 不可 delegation，通配符不可 file），由 `validate_validation_method()` 统一校验
+- `validation_method`：证书级验证方式（`delegation` 或 `file`），空值默认服务端决定；受域名类型约束（IP 不可 delegation，通配符不可 file），由 `validate_validation_method()` 在 add/update/renew 三处统一校验
 - 站点唯一绑定：一个站点只能绑定一个证书，add_cert / update_cert / update_cert_config 均校验
 - 数据驱动迁移引擎：支持 delete/rename/move/spread 四种操作，升级后自动迁移旧字段
 - ConfigManager 支持可选 `logger` 参数，JSON 损坏时记录 error 并创建 .bak 备份
 - `add_cert` / `update_cert` / `remove_cert` / `update_order_id` 使用 `_update_json` 原子读-改-写（独立锁文件防止竞态）
+
+## 安全机制
+
+网络与升级安全详见 deploy-spec §10，本仓要点：
+
+- **网络出口统一 `APIClient`**（无裸 `urlopen`），三重防线：
+  - HTTPS 强制——非 loopback 地址必须 HTTPS，仅 `localhost`/`127.0.0.1`/`::1` 允许 HTTP
+  - SSRF——`net_guard.check_ssrf()` 解析主机名后对内网 IP 段（`10/8`、`172.16/12`、`192.168/16`、`127/8`、`169.254.169.254`、`fc00::/7` 等）黑名单拦截
+  - DNS Rebinding——自定义 opener（`_SafeHTTPConnection`/`_SafeHTTPSConnection`）在 TCP 连接建立后用 `getpeername()` 取实际对端 IP 二次校验，防解析与连接之间的地址替换
+- **升级模块（`updater.py`）复用 api_client 的 Safe Handler**：`build_opener(_SafeHTTPHandler, _SafeHTTPSHandler)`，同样 HTTPS 强制 + SSRF + DNS Rebinding；通道白名单 `_validate_channel`（仅 `main`/`dev`，防路径遍历）
+- **releases.json 规范扁平格式**：通道做顶层 key（`{main: {latest, versions: [{version, released_at, checksums: {filename: hash}}]}, dev: {...}}`），客户端按版本 pre-release 标识（版本号含 `-` 段）区分稳定/测试通道；下载后 SHA256 校验，无校验和拒绝安装
+- **安全解压 `_safe_extract`**：符号链接拒绝（`external_attr >> 28 == 0xA`）、路径遍历防护（`realpath` 前缀校验）、跳过 `data/`、目录 `0700` 文件 `0600`、解压后清除 `__pycache__`；ZIP 大小上限 10MB
+- **远程安装脚本 `deploy/install.sh`**：`curl --max-filesize` 限制（releases.json 256KB、ZIP 10MB）、SHA256 校验、解压前用 Python `zipfile` 拒绝含符号链接的 ZIP、`data/` 目录保留不覆盖
 
 ## 前端约定
 
