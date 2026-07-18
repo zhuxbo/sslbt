@@ -40,6 +40,9 @@ zip_time = (timestamp.year, timestamp.month, timestamp.day, timestamp.hour, time
 
 files = []
 for root, dirs, names in os.walk(source):
+    links = [name for name in dirs + names if os.path.islink(os.path.join(root, name))]
+    if links:
+        raise SystemExit('错误: src/ 禁止包含符号链接: ' + os.path.join(root, links[0]))
     dirs[:] = sorted(d for d in dirs if d != '__pycache__' and d != 'data')
     for name in sorted(names):
         if name.endswith('.pyc') or name == '.DS_Store':

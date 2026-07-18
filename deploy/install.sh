@@ -267,21 +267,23 @@ if [ -f "$CONFIG_FILE" ]; then
 import json, os, tempfile
 path = '$CONFIG_FILE'
 url = '$RELEASE_URL'
+channel = '$CHANNEL'
 try:
     with open(path, 'r', encoding='utf-8') as f:
         cfg = json.load(f)
 except (json.JSONDecodeError, FileNotFoundError):
     cfg = {}
 cfg['release_url'] = url
+cfg['upgrade_channel'] = channel
 d = os.path.dirname(path) or '.'
 fd, tmp = tempfile.mkstemp(dir=d)
 with os.fdopen(fd, 'w', encoding='utf-8') as f:
     json.dump(cfg, f, indent=2, ensure_ascii=False)
 os.replace(tmp, path)
 os.chmod(path, 0o600)
-" 2>/dev/null || echo_warn "写入 release_url 失败"
+" 2>/dev/null || echo_warn "写入 release_url 和升级通道失败"
 else
-    printf '{\n  "release_url": "%s"\n}\n' "$RELEASE_URL" > "$CONFIG_FILE"
+    printf '{\n  "release_url": "%s",\n  "upgrade_channel": "%s"\n}\n' "$RELEASE_URL" "$CHANNEL" > "$CONFIG_FILE"
     chmod 600 "$CONFIG_FILE"
 fi
 

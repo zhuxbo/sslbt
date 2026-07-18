@@ -11,8 +11,19 @@ SSH_TIMEOUT=10
 MODE=""
 VERSION=""
 BUNDLE_DIR=""
+LOCKS_HELD=false
+LOCAL_LOCK_HELD=false
+LOCK_OWNER=""
+LOCAL_LOCK_DIR=""
 
-die() { echo "错误: $*" >&2; exit 1; }
+die() {
+    echo "错误: $*" >&2
+    if [ "${LOCKS_HELD:-false}" = true ]; then
+        release_publish_locks || true
+    fi
+    release_local_lock || true
+    exit 1
+}
 info() { echo "[INFO] $*"; }
 
 usage() {
@@ -84,11 +95,69 @@ verify_bundle() {
     TXN_ID="sslbt-v${VERSION}-${SOURCE_COMMIT:0:12}-${ASSET_SHA:0:8}-${INSTALLER_SHA:0:8}"
 }
 
+canonical_index_hash() {
+    local canonical
+    canonical="$(python3 "$MANIFEST_TOOL" canonical --index "$1")"
+    printf '%s' "$canonical" | shasum -a 256 | cut -d' ' -f1
+}
+
+seal_transaction() {
+    local expected="$BUNDLE_DIR/release-candidate.expected.json"
+    python3 "$MANIFEST_TOOL" index --base "$BUNDLE_DIR/releases-baseline.json" \
+        --manifest "$BUNDLE_DIR/manifest.json" --bundle-dir "$BUNDLE_DIR" \
+        --keep "${KEEP_VERSIONS:-5}" --output "$expected"
+    cmp "$expected" "$BUNDLE_DIR/release-candidate.json" || die "候选索引不是由原始基线和 manifest 唯一生成"
+    rm -f "$expected"
+    python3 - "$BUNDLE_DIR" <<'PY'
+import hashlib, json, os, sys
+root = sys.argv[1]
+names = ('manifest.json', 'releases-baseline.json', 'release-candidate.json',
+         'assets/sslbt.zip', 'bootstrap/install.sh')
+files = {}
+for name in names:
+    path = os.path.join(root, name)
+    with open(path, 'rb') as handle:
+        files[name] = hashlib.sha256(handle.read()).hexdigest()
+data = {'schema_version': 1, 'files': files}
+path = os.path.join(root, 'transaction.json')
+with open(path + '.tmp', 'w', encoding='utf-8') as handle:
+    json.dump(data, handle, indent=2, sort_keys=True)
+    handle.write('\n')
+os.replace(path + '.tmp', path)
+os.chmod(path, 0o400)
+PY
+}
+
+verify_transaction() {
+    [ -f "$BUNDLE_DIR/transaction.json" ] || die "bundle 缺少 stage 事务封存 transaction.json"
+    python3 - "$BUNDLE_DIR" <<'PY'
+import hashlib, json, os, sys
+root = sys.argv[1]
+with open(os.path.join(root, 'transaction.json'), encoding='utf-8') as handle:
+    transaction = json.load(handle)
+expected = ('manifest.json', 'releases-baseline.json', 'release-candidate.json',
+            'assets/sslbt.zip', 'bootstrap/install.sh')
+if transaction.get('schema_version') != 1 or set(transaction.get('files', {})) != set(expected):
+    raise SystemExit('事务封存结构无效')
+for name in expected:
+    with open(os.path.join(root, name), 'rb') as handle:
+        actual = hashlib.sha256(handle.read()).hexdigest()
+    if actual != transaction['files'][name]:
+        raise SystemExit('事务封存哈希不匹配: ' + name)
+PY
+    BASELINE_HASH="$(canonical_index_hash "$BUNDLE_DIR/releases-baseline.json")"
+    CANDIDATE_HASH="$(canonical_index_hash "$BUNDLE_DIR/release-candidate.json")"
+}
+
 prepare_bundle() {
     normalize_version "$1"
     local channel="main" dirty=false
     [[ "$VERSION" == *-* ]] && channel="dev"
     [ -n "$(git -C "$PROJECT_ROOT" status --porcelain)" ] && dirty=true
+    local ignored_inputs
+    ignored_inputs="$(git -C "$PROJECT_ROOT" ls-files --others --ignored --exclude-standard -- src | \
+        python3 -c "import sys; print(''.join(p for p in sys.stdin if '/__pycache__/' not in p and '/data/' not in p and not p.rstrip().endswith(('.pyc', '/.DS_Store'))), end='')")"
+    [ -z "$ignored_inputs" ] || die "src/ 存在会进入构建但不受 Git 跟踪的忽略文件: $ignored_inputs"
     local commit build_epoch manifest_epoch
     commit="$(git -C "$PROJECT_ROOT" rev-parse HEAD)"
     build_epoch="$(git -C "$PROJECT_ROOT" show -s --format=%ct HEAD)"
@@ -116,12 +185,11 @@ prepare_bundle() {
     mkdir -p "$BUNDLE_DIR/assets" "$BUNDLE_DIR/bootstrap"
     SOURCE_DATE_EPOCH="$build_epoch" "$PROJECT_ROOT/scripts/build.sh" "$VERSION" "$BUNDLE_DIR/assets/sslbt.zip"
     cp "$PROJECT_ROOT/deploy/install.sh" "$BUNDLE_DIR/bootstrap/install.sh"
-    local dirty_arg=()
-    [ "$dirty" = true ] && dirty_arg=(--dirty)
-    python3 "$MANIFEST_TOOL" create \
-        --version "$VERSION" --channel "$channel" --commit "$commit" --epoch "$manifest_epoch" \
-        "${dirty_arg[@]}" --asset "$BUNDLE_DIR/assets/sslbt.zip" \
-        --bootstrap "$BUNDLE_DIR/bootstrap/install.sh" --output "$BUNDLE_DIR/manifest.json"
+    local manifest_args=(create --version "$VERSION" --channel "$channel" --commit "$commit" --epoch "$manifest_epoch")
+    [ "$dirty" = true ] && manifest_args+=(--dirty)
+    manifest_args+=(--asset "$BUNDLE_DIR/assets/sslbt.zip"
+        --bootstrap "$BUNDLE_DIR/bootstrap/install.sh" --output "$BUNDLE_DIR/manifest.json")
+    python3 "$MANIFEST_TOOL" "${manifest_args[@]}"
     verify_bundle
     info "bundle 已持久化: $BUNDLE_DIR"
 }
@@ -181,9 +249,8 @@ fetch_consistent_index() {
     for server in "${SERVERS[@]}"; do
         parse_server "$server"
         local output="$base_dir/$SERVER_NAME.json"
-        if ! ssh_run "test -f '$SERVER_DIR/releases.json' && cat '$SERVER_DIR/releases.json'" > "$output"; then
-            printf '{}\n' > "$output"
-        fi
+        ssh_run "if [ -f '$SERVER_DIR/releases.json' ]; then cat '$SERVER_DIR/releases.json'; else printf '{}\n'; fi" \
+            > "$output" || die "无法读取 $SERVER_NAME 的 releases.json 基线"
         local canonical current_hash
         canonical="$(python3 "$MANIFEST_TOOL" canonical --index "$output")"
         current_hash="$(printf '%s' "$canonical" | shasum -a 256 | cut -d' ' -f1)"
@@ -199,6 +266,7 @@ fetch_consistent_index() {
         --keep "${KEEP_VERSIONS:-5}" --output "$BUNDLE_DIR/release-candidate.json"
     python3 "$MANIFEST_TOOL" check-index --index "$BUNDLE_DIR/release-candidate.json" \
         --manifest "$BUNDLE_DIR/manifest.json" --bundle-dir "$BUNDLE_DIR"
+    seal_transaction
 }
 
 stage_nodes() {
@@ -206,12 +274,22 @@ stage_nodes() {
     verify_bundle
     load_config
     if [ "$resume" = false ]; then
-        [ ! -e "$BUNDLE_DIR/release-candidate.json" ] || die "bundle 已生成候选索引；使用 --resume"
-        fetch_consistent_index
+        if [ -f "$BUNDLE_DIR/release-candidate.json" ]; then
+            if [ -f "$BUNDLE_DIR/transaction.json" ]; then
+                verify_transaction
+            else
+                git -C "$PROJECT_ROOT" show-ref --verify --quiet "refs/tags/v$VERSION" \
+                    && die "tag 已存在但事务未封存，禁止重建恢复证据"
+                seal_transaction
+                verify_transaction
+            fi
+            info "复用原候选索引继续 tag 前 stage"
+        else
+            fetch_consistent_index
+            verify_transaction
+        fi
     else
-        [ -f "$BUNDLE_DIR/release-candidate.json" ] || die "恢复要求原始 release-candidate.json"
-        python3 "$MANIFEST_TOOL" check-index --index "$BUNDLE_DIR/release-candidate.json" \
-            --manifest "$BUNDLE_DIR/manifest.json" --bundle-dir "$BUNDLE_DIR"
+        verify_transaction
     fi
 
     for server in "${SERVERS[@]}"; do
@@ -222,7 +300,9 @@ stage_nodes() {
             ssh_run "test ! -e '$SERVER_DIR/$CHANNEL/v$VERSION'" || die "$SERVER_NAME 的 main/v$VERSION 已存在"
         fi
         ssh_run "mkdir -p '$stage'"
-        copy_to_server "$BUNDLE_DIR/bootstrap/install.sh" "$stage/install.sh"
+        if [ "$CHANNEL" = main ]; then
+            copy_to_server "$BUNDLE_DIR/bootstrap/install.sh" "$stage/install.sh"
+        fi
         copy_to_server "$BUNDLE_DIR/manifest.json" "$stage/manifest.json"
         copy_to_server "$BUNDLE_DIR/release-candidate.json" "$stage/releases.json"
         if [ "$resume" = true ] && ssh_run "test -f '$public' && test \"\$(sha256sum '$public' | cut -d' ' -f1)\" = '$ASSET_SHA'"; then
@@ -242,6 +322,96 @@ require_main_tag() {
     local tag_commit
     tag_commit="$(git -C "$PROJECT_ROOT" rev-parse "v$VERSION^{commit}" 2>/dev/null || true)"
     [ "$tag_commit" = "$SOURCE_COMMIT" ] || die "main publish/resume 要求 v$VERSION 精确指向 manifest commit"
+    local remote_tags remote_commit
+    remote_tags="$(git -C "$PROJECT_ROOT" ls-remote origin "refs/tags/v$VERSION" "refs/tags/v$VERSION^{}")" \
+        || die "无法核验远端版本 tag"
+    remote_commit="$(printf '%s\n' "$remote_tags" | awk -v tag="refs/tags/v$VERSION" '$2 == tag "^{}" {print $1}')"
+    [ -n "$remote_commit" ] || remote_commit="$(printf '%s\n' "$remote_tags" | awk -v tag="refs/tags/v$VERSION" '$2 == tag {print $1}')"
+    [ "$remote_commit" = "$SOURCE_COMMIT" ] || die "远端 v$VERSION 不存在或未指向 manifest commit"
+}
+
+remote_index_hash() {
+    local tmp canonical
+    tmp="$(mktemp)"
+    ssh_run "if [ -f '$SERVER_DIR/releases.json' ]; then cat '$SERVER_DIR/releases.json'; else printf '{}\n'; fi" \
+        > "$tmp" || { rm -f "$tmp"; die "无法读取 $SERVER_NAME 的当前 releases.json"; }
+    canonical="$(python3 "$MANIFEST_TOOL" canonical --index "$tmp")"
+    rm -f "$tmp"
+    printf '%s' "$canonical" | shasum -a 256 | cut -d' ' -f1
+}
+
+acquire_publish_locks() {
+    local server
+    acquire_local_lock
+    LOCK_OWNER="$TXN_ID:$(hostname):$$:$(date -u +%s):$RANDOM"
+    LOCKS_HELD=true
+    for server in "${SERVERS[@]}"; do
+        parse_server "$server"
+        local lock="$SERVER_DIR/.publish-lock"
+        local reclaim=false
+        [ "$MODE" = resume ] && reclaim=true
+        ssh_run "if mkdir '$lock' 2>/dev/null; then printf '%s\n' '$LOCK_OWNER' > '$lock/owner'; \
+            elif [ '$reclaim' = true ] && grep -q '^$TXN_ID:' '$lock/owner' 2>/dev/null; then \
+                rm -rf '$lock' && mkdir '$lock' && printf '%s\n' '$LOCK_OWNER' > '$lock/owner'; \
+            else false; fi" \
+            || die "$SERVER_NAME 已被其他发布事务锁定"
+    done
+}
+
+acquire_local_lock() {
+    LOCAL_LOCK_DIR="$BUNDLE_DIR/.publish-process.lock"
+    if ! mkdir "$LOCAL_LOCK_DIR" 2>/dev/null; then
+        die "同一 bundle 已有发布进程或遗留本地锁: $LOCAL_LOCK_DIR"
+    fi
+    LOCAL_LOCK_HELD=true
+    printf '%s:%s\n' "$(hostname)" "$$" > "$LOCAL_LOCK_DIR/owner"
+}
+
+release_local_lock() {
+    if [ "${LOCAL_LOCK_HELD:-false}" = true ] && [ -n "${LOCAL_LOCK_DIR:-}" ]; then
+        rm -rf "$LOCAL_LOCK_DIR"
+    fi
+    LOCAL_LOCK_HELD=false
+}
+
+release_publish_locks() {
+    local server
+    for server in "${SERVERS[@]}"; do
+        parse_server "$server"
+        local lock="$SERVER_DIR/.publish-lock"
+        ssh_run "if test \"\$(cat '$lock/owner' 2>/dev/null)\" = '$LOCK_OWNER'; then rm -rf '$lock'; fi" || true
+    done
+    LOCKS_HELD=false
+    release_local_lock
+}
+
+assert_indexes_publishable() {
+    local server current
+    for server in "${SERVERS[@]}"; do
+        parse_server "$server"
+        current="$(remote_index_hash)"
+        if [ "$current" != "$BASELINE_HASH" ] && [ "$current" != "$CANDIDATE_HASH" ]; then
+            die "$SERVER_NAME 的索引已在 stage 后变化，拒绝覆盖并发或更新版本"
+        fi
+    done
+}
+
+assert_all_indexes_candidate() {
+    local server current
+    for server in "${SERVERS[@]}"; do
+        parse_server "$server"
+        current="$(remote_index_hash)"
+        [ "$current" = "$CANDIDATE_HASH" ] || die "$SERVER_NAME 的完整索引与封存候选不一致"
+    done
+}
+
+all_indexes_are_candidate() {
+    local server current
+    for server in "${SERVERS[@]}"; do
+        parse_server "$server"
+        current="$(remote_index_hash)"
+        [ "$current" = "$CANDIDATE_HASH" ] || return 1
+    done
 }
 
 remote_asset_is_valid() {
@@ -253,7 +423,13 @@ publish_nodes() {
     verify_bundle
     load_config
     require_main_tag
-    [ -f "$BUNDLE_DIR/release-candidate.json" ] || die "缺少原始候选索引，请先 --stage"
+    verify_transaction
+    acquire_publish_locks
+    assert_indexes_publishable
+    if all_indexes_are_candidate; then
+        finish_forward_transaction
+        return
+    fi
     local published=()
     for server in "${SERVERS[@]}"; do
         parse_server "$server"
@@ -268,8 +444,10 @@ publish_nodes() {
             fi
             if ! ssh_run "rm -rf '$rollback' && mkdir -p '$rollback' '$(dirname "$target")'; \
                 if [ -e '$target' ]; then mv '$target' '$rollback/version'; fi; \
+                : > '$rollback/asset.changed'; \
                 mkdir -p '$target'; cp '$stage/sslbt.zip' '$target/sslbt.zip'; chmod 644 '$target/sslbt.zip'"; then
-                rollback_nodes "${published[@]}"
+                rollback_nodes "$server" || true
+                [ "${#published[@]}" -eq 0 ] || rollback_nodes "${published[@]}" || true
                 die "$SERVER_NAME 公开资产准备失败，已尝试回滚已处理节点"
             fi
         fi
@@ -280,38 +458,73 @@ publish_nodes() {
         parse_server "$server"
         local stage="$SERVER_DIR/.staging/$TXN_ID"
         local rollback="$SERVER_DIR/.rollback/$TXN_ID"
+        local installer_publish=""
+        if [ "$CHANNEL" = main ]; then
+            installer_publish="cp '$stage/install.sh' '$SERVER_DIR/install.sh.tmp'; mv '$SERVER_DIR/install.sh.tmp' '$SERVER_DIR/install.sh'; chmod 644 '$SERVER_DIR/install.sh';"
+        fi
         if ! ssh_run "mkdir -p '$rollback'; \
-            if [ -f '$SERVER_DIR/releases.json' ] && [ ! -f '$rollback/releases.json' ]; then cp '$SERVER_DIR/releases.json' '$rollback/releases.json'; fi; \
-            if [ -f '$SERVER_DIR/install.sh' ] && [ ! -f '$rollback/install.sh' ]; then cp '$SERVER_DIR/install.sh' '$rollback/install.sh'; fi; \
+            if [ ! -f '$rollback/releases.json' ] && [ ! -f '$rollback/releases.json.absent' ]; then \
+                if [ -f '$SERVER_DIR/releases.json' ]; then cp '$SERVER_DIR/releases.json' '$rollback/releases.json'; else : > '$rollback/releases.json.absent'; fi; \
+            fi; \
+            if [ '$CHANNEL' = main ] && [ ! -f '$rollback/install.sh' ] && [ ! -f '$rollback/install.sh.absent' ]; then \
+                if [ -f '$SERVER_DIR/install.sh' ]; then cp '$SERVER_DIR/install.sh' '$rollback/install.sh'; else : > '$rollback/install.sh.absent'; fi; \
+            fi; \
             cp '$stage/releases.json' '$SERVER_DIR/releases.json.tmp'; mv '$SERVER_DIR/releases.json.tmp' '$SERVER_DIR/releases.json'; \
-            cp '$stage/install.sh' '$SERVER_DIR/install.sh.tmp'; mv '$SERVER_DIR/install.sh.tmp' '$SERVER_DIR/install.sh'; \
-            chmod 644 '$SERVER_DIR/releases.json' '$SERVER_DIR/install.sh'"; then
-            rollback_nodes "${published[@]}"
+            chmod 644 '$SERVER_DIR/releases.json'; $installer_publish"; then
+            rollback_nodes "${published[@]}" || true
             die "$SERVER_NAME 公开索引失败，已尝试回滚全部节点"
         fi
     done
     for server in "${SERVERS[@]}"; do
         if ! verify_one_node "$server"; then
-            rollback_nodes "${published[@]}"
+            rollback_nodes "${published[@]}" || true
             die "全节点验收失败，已尝试回滚公开索引和资产"
         fi
     done
-    for server in "${SERVERS[@]}"; do
-        cleanup_one_node "$server" || die "旧版本清理失败；保留 bundle 后重新验收"
-    done
-    info "所有发布节点已公开并完成对账"
+    finish_forward_transaction
 }
 
 rollback_nodes() {
-    local server
+    local server failed=false
     for server in "$@"; do
         parse_server "$server"
         local target="$SERVER_DIR/$CHANNEL/v$VERSION"
         local rollback="$SERVER_DIR/.rollback/$TXN_ID"
-        ssh_run "if [ -f '$rollback/releases.json' ]; then cp '$rollback/releases.json' '$SERVER_DIR/releases.json'; fi; \
-            if [ -f '$rollback/install.sh' ]; then cp '$rollback/install.sh' '$SERVER_DIR/install.sh'; fi; \
-            rm -rf '$target'; if [ -d '$rollback/version' ]; then mv '$rollback/version' '$target'; fi" || true
+        if ! ssh_run "if [ -f '$rollback/releases.json' ]; then \
+                cp '$rollback/releases.json' '$SERVER_DIR/releases.json.rollback.tmp' && \
+                mv '$SERVER_DIR/releases.json.rollback.tmp' '$SERVER_DIR/releases.json'; \
+            elif [ -f '$rollback/releases.json.absent' ]; then rm -f '$SERVER_DIR/releases.json'; fi; \
+            if [ -f '$rollback/install.sh' ]; then \
+                cp '$rollback/install.sh' '$SERVER_DIR/install.sh.rollback.tmp' && \
+                mv '$SERVER_DIR/install.sh.rollback.tmp' '$SERVER_DIR/install.sh'; \
+            elif [ -f '$rollback/install.sh.absent' ]; then rm -f '$SERVER_DIR/install.sh'; fi; \
+            if [ -f '$rollback/asset.changed' ]; then \
+                rm -rf '$target'; if [ -d '$rollback/version' ]; then mv '$rollback/version' '$target'; fi; \
+            fi"; then
+            echo "ERROR: $SERVER_NAME 回滚失败，保留事务证据" >&2
+            failed=true
+        fi
     done
+    [ "$failed" = false ]
+}
+
+finish_forward_transaction() {
+    local server
+    for server in "${SERVERS[@]}"; do
+        verify_one_node "$server" || die "forward-only 全节点验收失败；保留原事务继续恢复"
+    done
+    assert_all_indexes_candidate
+    for server in "${SERVERS[@]}"; do
+        cleanup_one_node "$server" || die "旧版本清理失败；保留 bundle 后重新验收"
+    done
+    assert_all_indexes_candidate
+    for server in "${SERVERS[@]}"; do
+        parse_server "$server"
+        ssh_run "rm -rf '$SERVER_DIR/.staging/$TXN_ID' '$SERVER_DIR/.rollback/$TXN_ID'" \
+            || die "$SERVER_NAME 事务临时目录清理失败"
+    done
+    release_publish_locks
+    info "所有发布节点已公开并完成对账"
 }
 
 verify_nodes() {
@@ -334,9 +547,11 @@ verify_one_node() {
         rm -f "$tmp"
         return 1
     fi
-    if ! ssh_run "test -f '$SERVER_DIR/install.sh' && test \"\$(sha256sum '$SERVER_DIR/install.sh' | cut -d' ' -f1)\" = '$INSTALLER_SHA'"; then
-        rm -f "$tmp"
-        return 1
+    if [ "$CHANNEL" = main ]; then
+        if ! ssh_run "test -f '$SERVER_DIR/install.sh' && test \"\$(sha256sum '$SERVER_DIR/install.sh' | cut -d' ' -f1)\" = '$INSTALLER_SHA'"; then
+            rm -f "$tmp"
+            return 1
+        fi
     fi
     if ! python3 "$MANIFEST_TOOL" check-index --index "$tmp" --manifest "$BUNDLE_DIR/manifest.json" --bundle-dir "$BUNDLE_DIR"; then
         rm -f "$tmp"

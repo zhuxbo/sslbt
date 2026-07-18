@@ -4,15 +4,14 @@
 
 ## 自动门禁
 
-1. `python3 -m pytest tests/ -v`：全部通过，无跳过和警告。
+1. `python3 -m pytest tests/ -v -W error`：全部通过；测试钩子令任何 skip 失败，警告按错误处理。发布脚本测试同时解包核对必要文件、`info.json.versions` 和运行时 `--version`。
 2. `python3 -m flake8 src/ --max-line-length=120 --exclude=__pycache__`。
 3. `python3 -m flake8 tests/ --max-line-length=120 --exclude=__pycache__`。
-4. `python3 scripts/check-agent-config.py`：固定 `CLAUDE.md`、扁平 Skill 路由、薄工具模板和旧路径引用全部通过。
+4. `python3 scripts/check-agent-config.py`：Codex 根路由、固定 `CLAUDE.md`、扁平 Skill 元数据与路由、薄工具模板、旧路径引用及 Make/CI 接线全部通过。
 5. `bash build/release.sh --dry-run 0.0.0-finish-check`：确定性 ZIP、单资产 manifest、候选索引和 SHA256 通过且无网络操作。
-6. `make build VERSION=0.0.0-finish-check`，解包确认必要文件完整，`info.json.versions` 和 `python sslbt_main.py --version` 均为 `0.0.0-finish-check`。
-7. `git diff --check`。
+6. `git diff --check`。
 
-`make finish-check` 汇总第 1–5、7 项；第 6 项和下列按风险审查仍需明确记录。
+`make finish-check` 汇总以上全部自动门禁；下列按风险审查仍需明确记录。
 
 ## 代码与契约审查
 

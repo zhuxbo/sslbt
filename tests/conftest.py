@@ -19,6 +19,13 @@ SRC_DIR = os.path.join(os.path.dirname(TESTS_DIR), 'src')
 sys.path.insert(0, SRC_DIR)
 
 
+def pytest_sessionfinish(session, exitstatus):
+    """finish-check 不允许以 skip 掩盖缺失的运行环境或覆盖。"""
+    reporter = session.config.pluginmanager.get_plugin('terminalreporter')
+    if reporter and reporter.stats.get('skipped'):
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
+
+
 @pytest.fixture
 def tmp_data_dir():
     """创建临时数据目录"""

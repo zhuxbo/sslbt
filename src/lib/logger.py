@@ -56,8 +56,10 @@ class Logger:
         self._name = name
         self._logger = logging.getLogger(name)
         self._logger.setLevel(logging.DEBUG)
-        # 清除已有 handler/filter，防止多次实例化导致重复日志
-        self._logger.handlers.clear()
+        # 关闭并清除已有 handler，防止重复日志和文件描述符泄漏
+        for handler in list(self._logger.handlers):
+            self._logger.removeHandler(handler)
+            handler.close()
         self._logger.filters.clear()
         self._logger.addFilter(SensitiveFilter())
         self._current_date = None

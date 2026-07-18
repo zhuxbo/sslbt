@@ -60,7 +60,7 @@ bash build/release.sh --dev <version>
 
 ## 中断恢复
 
-- tag 创建前：保留或清理未公开 staging 后，可修复问题并重新执行 `--stage`；如需重建，先明确废弃整个未打 tag bundle。
+- tag 创建前：保留未公开 staging 和封存候选后，可修复连接问题并对同一 bundle 重复执行 `--stage` 幂等续传；如需重建，先明确废弃整个未打 tag bundle。
 - tag 创建后：只可使用原路径 `bash build/release.sh --resume <bundle>`；先校验 tag、manifest、ZIP 和原候选索引，不得运行构建、移动/删除 tag 或覆盖正式资产。
 - GitHub draft、服务器索引、Release 公开、`latest`、分支回同步任一步失败：保留既有不可变对象和 bundle，从该步骤继续，最终重新做全部节点/GitHub/公网对账。
 - 任一节点异常时不得宣布成功，也不得以 `--server` 只修一个节点后跳过全量验收。

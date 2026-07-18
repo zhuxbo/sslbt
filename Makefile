@@ -5,7 +5,7 @@ build:
 	bash scripts/build.sh $(VERSION)
 
 test:
-	python3 -m pytest tests/ -v
+	python3 -m pytest tests/ -v -W error
 
 test-cov:
 	python3 -m pytest tests/ -v --cov=src/lib --cov-report=term-missing

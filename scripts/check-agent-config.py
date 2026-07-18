@@ -31,20 +31,47 @@ EXPECTED_COMMANDS = {
 """,
 }
 
+CODEX_ROUTING_RULE = '先读取 `skills/SKILL.md`，再按路由读取对应叶子资源。'
+
 
 def fail(errors, message):
     errors.append(message)
 
 
+def parse_router_metadata(router, errors):
+    lines = router.splitlines()
+    if not lines or lines[0] != '---':
+        fail(errors, 'skills/SKILL.md 缺少入口元数据')
+        return
+    try:
+        end = lines.index('---', 1)
+    except ValueError:
+        fail(errors, 'skills/SKILL.md 入口元数据未闭合')
+        return
+
+    metadata = {}
+    for line in lines[1:end]:
+        match = re.fullmatch(r'(name|description):\s*(.+)', line)
+        if not match or match.group(1) in metadata:
+            fail(errors, 'skills/SKILL.md 入口元数据只允许唯一且非空的 name 和 description')
+            return
+        metadata[match.group(1)] = match.group(2).strip()
+    if set(metadata) != {'name', 'description'} or not all(metadata.values()):
+        fail(errors, 'skills/SKILL.md 入口元数据必须包含非空的 name 和 description')
+
+
 def main():
     errors = []
+    agents = (ROOT / 'AGENTS.md').read_text(encoding='utf-8')
+    if CODEX_ROUTING_RULE not in agents:
+        fail(errors, 'AGENTS.md 缺少 Codex 的根 Skill 路由')
+
     if (ROOT / 'CLAUDE.md').read_text(encoding='utf-8') != EXPECTED_CLAUDE:
         fail(errors, 'CLAUDE.md 不符合固定薄模板')
 
     router_path = SKILLS / 'SKILL.md'
     router = router_path.read_text(encoding='utf-8')
-    if not router.startswith('---\nname:'):
-        fail(errors, 'skills/SKILL.md 缺少入口元数据')
+    parse_router_metadata(router, errors)
 
     leaf_names = set(re.findall(r'`skills/([a-z0-9]+(?:-[a-z0-9]+)*\.md)`', router))
     actual_leaf_names = {path.name for path in SKILLS.glob('*.md') if path.name != 'SKILL.md'}
@@ -66,6 +93,16 @@ def main():
         path = command_dir / name
         if path.exists() and path.read_text(encoding='utf-8') != expected:
             fail(errors, str(path.relative_to(ROOT)) + ' 不符合固定薄模板')
+
+    makefile = (ROOT / 'Makefile').read_text(encoding='utf-8')
+    target = re.search(r'^check-agent-config:\n(?P<body>(?:\t.*\n)+)', makefile, re.MULTILINE)
+    if not target or '\tpython3 scripts/check-agent-config.py\n' not in target.group('body'):
+        fail(errors, 'Makefile 未接入 check-agent-config')
+
+    workflow = (ROOT / '.github' / 'workflows' / 'ci.yml').read_text(encoding='utf-8')
+    governance = re.search(r'^  governance:\n(?P<body>.*?)(?=^  [a-z0-9-]+:\n|\Z)', workflow, re.MULTILINE | re.DOTALL)
+    if not governance or 'run: make check-agent-config' not in governance.group('body'):
+        fail(errors, 'GitHub Actions governance job 未执行 check-agent-config')
 
     old_reference = re.compile(r'skills/[a-z0-9-]+/SKILL\.md')
     for path in ROOT.rglob('*.md'):
