@@ -166,6 +166,40 @@ class TestRenewEngine:
         assert len(results) == 1
         assert results[0]['order_id'] == 7777
 
+    def test_check_deploy_results_site_removed_raises(self, engine):
+        """站点已删除并解绑（site_removed）首次按失败上报，与部署回调 failure 一致"""
+        results = [
+            {'site_name': 'live.com', 'status': True, 'message': '部署成功'},
+            {'site_name': 'gone.com', 'status': False,
+             'message': '站点已删除，已解除绑定', 'site_removed': True},
+        ]
+        with pytest.raises(RuntimeError, match='已删除'):
+            engine._check_deploy_results(results, 123)
+
+    def test_renew_status_failure_on_site_removed(self, engine, tmp_data_dir):
+        """部分站点删除场景：renew 结果与 renew_status.json 均记 failure（与回调一致）"""
+        engine._mock_api.query_order.return_value = {
+            'status': 'active', 'certificate': '---C---',
+            'ca_certificate': '---CA---', 'private_key': '---K---',
+        }
+        engine._deployer.deploy_multi.return_value = [
+            {'site_name': 'live.com', 'status': True, 'message': '部署成功'},
+            {'site_name': 'gone.com', 'status': False,
+             'message': '站点已删除，已解除绑定', 'site_removed': True},
+        ]
+        cert = _make_cert_entry(10, order_id=9001)
+        engine._config.add_cert(order_id=9001, cert_name='order-9001',
+                                domains=cert['domains'], site_names=['live.com', 'gone.com'])
+        engine._config.update_metadata(9001, cert['metadata'])
+
+        results = engine.check_and_renew_all()
+        assert results[0]['status'] == 'failure'
+        assert '已删除' in results[0]['message']
+        with open(os.path.join(tmp_data_dir, 'renew_status.json')) as f:
+            status = json.load(f)
+        assert status['failure'] == 1
+        assert status['success'] == 0
+
     def test_writes_renew_status_file(self, engine, tmp_data_dir):
         """续签运行结束写入轻量状态文件（时间戳/成功失败计数，0600 权限）"""
         engine._mock_api.query_order.return_value = {

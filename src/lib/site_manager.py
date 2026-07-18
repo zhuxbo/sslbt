@@ -9,6 +9,14 @@ DB_PATH_NEW = '/www/server/panel/data/db/site.db'
 DB_PATH_OLD = '/www/server/panel/data/default.db'
 
 
+class SiteQueryError(Exception):
+    """站点清单查询失败（DB 缺失/锁定/表结构漂移等）
+
+    与「确认零站点」（返回空列表）严格区分：调用方绝不能把查询失败
+    当作站点不存在处理，否则会引发误解绑等破坏性操作。
+    """
+
+
 class SiteManager:
     """通过宝塔数据库和配置获取站点信息"""
 
@@ -23,25 +31,31 @@ class SiteManager:
         return DB_PATH_OLD
 
     def get_sites(self):
-        """获取所有站点列表，返回 [{name, path, status, domains, ssl}]"""
+        """获取所有站点列表，返回 [{name, path, status, domains, ssl}]
+
+        查询失败（DB 缺失/锁定/表结构异常）抛 SiteQueryError，
+        空列表仅代表「查询成功且确认零站点」。
+        """
+        db_path = self._get_db_path()
+        if not os.path.exists(db_path):
+            if self._logger:
+                self._logger.error("宝塔数据库不存在: %s", db_path)
+            raise SiteQueryError("宝塔数据库不存在: %s" % db_path)
+
         try:
-            db_path = self._get_db_path()
-            if not os.path.exists(db_path):
-                if self._logger:
-                    self._logger.error("宝塔数据库不存在: %s", db_path)
-                return []
-
             conn = sqlite3.connect(db_path)
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
+            try:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
 
-            cursor.execute('SELECT id, name, path, status FROM sites ORDER BY id DESC')
-            rows = cursor.fetchall()
+                cursor.execute('SELECT id, name, path, status FROM sites ORDER BY id DESC')
+                rows = cursor.fetchall()
 
-            # 获取域名绑定
-            cursor.execute('SELECT pid, name FROM domain')
-            domain_rows = cursor.fetchall()
-            conn.close()
+                # 获取域名绑定
+                cursor.execute('SELECT pid, name FROM domain')
+                domain_rows = cursor.fetchall()
+            finally:
+                conn.close()
 
             # 按站点 ID 分组域名
             domain_map = {}
@@ -69,10 +83,10 @@ class SiteManager:
         except Exception as e:
             if self._logger:
                 self._logger.error("获取站点列表失败: %s", str(e))
-            return []
+            raise SiteQueryError("获取站点列表失败: %s" % str(e))
 
     def get_site(self, site_name):
-        """获取指定站点信息"""
+        """获取指定站点信息，站点不存在返回 None；查询失败冒泡 SiteQueryError"""
         sites = self.get_sites()
         for s in sites:
             if s['name'] == site_name:
@@ -80,7 +94,7 @@ class SiteManager:
         return None
 
     def get_site_domains(self, site_name):
-        """获取站点绑定的域名列表"""
+        """获取站点绑定的域名列表；查询失败冒泡 SiteQueryError"""
         site = self.get_site(site_name)
         if site:
             return site.get('domains', [])

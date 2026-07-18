@@ -49,10 +49,11 @@ def _extract_reload_error(result):
 class Deployer:
     """证书部署器"""
 
-    def __init__(self, config_manager, api_client=None, logger=None):
+    def __init__(self, config_manager, api_client=None, logger=None, site_manager=None):
         self._config = config_manager
         self._api = api_client
         self._logger = logger
+        self._site_manager = site_manager
 
     def deploy(self, site_name, fullchain_pem, key_pem, order_id=None, domains=None,
                api_client=None):
@@ -164,9 +165,13 @@ class Deployer:
         if not cert_utils.verify_cert_key_match(fullchain_pem, key_pem):
             raise DeployError("证书和私钥不匹配", phase='validate')
 
-        # 逐站点部署
+        # 检测已删除站点并自愈：站点在面板被删后从证书绑定移除，
+        # 避免每日续签对其持续失败并拖累其余站点整体回调 failure
+        live_sites, deleted_sites = self._detect_deleted_sites(site_names, order_id)
+
+        # 逐站点部署（仅存活站点）
         results = []
-        for site_name in site_names:
+        for site_name in live_sites:
             try:
                 self._set_ssl(site_name, fullchain_pem, key_pem)
                 results.append({'site_name': site_name, 'status': True, 'message': '部署成功'})
@@ -202,6 +207,15 @@ class Deployer:
                 except Exception as e:
                     meta_error = 'metadata 更新失败: %s' % str(e)
 
+        # 已删除站点：从证书绑定中移除并持久化（自愈），并计入结果供回调如实反映
+        # 首次检测时该站点仍在绑定中，回调 failure 带原因；解除绑定后续签不再重复失败
+        if deleted_sites and order_id:
+            self._prune_deleted_sites(order_id, deleted_sites)
+        for sn in deleted_sites:
+            results.append({'site_name': sn, 'status': False,
+                            'message': '站点已删除，已解除绑定',
+                            'site_removed': True})
+
         # 发送部署回调（任一站点失败或 metadata 未落盘即 failure，附各失败原因）
         cb_api = api_client or self._api
         if order_id and cb_api:
@@ -227,6 +241,64 @@ class Deployer:
             raise DeployError('部署未完成: %s' % meta_error, phase='metadata', retryable=True)
 
         return results
+
+    def _detect_deleted_sites(self, site_names, order_id):
+        """检测已删除站点，返回 (live_sites, deleted_sites)
+
+        安全约束（防止误清绑定导致证书静默过期）：
+        - 一次 deploy_multi 只查一次站点清单并复用，不逐站点扫库
+        - 清单查询失败（SiteQueryError 等）：放弃本轮删除判定，全部保守视为存在
+        - 清单为空或形态异常：同样放弃判定——「面板零站点」多为 DB 迁移/重装等
+          异常中间态，单次探测不足以支撑清空全部绑定的破坏性操作
+        - 仅当清单查询成功且非空时，才把「不在清单中」判定为已删除
+        """
+        if self._site_manager is None:
+            return list(site_names), []
+
+        site_list = None
+        try:
+            site_list = self._site_manager.get_sites()
+        except Exception as e:
+            if self._logger:
+                self._logger.warning("站点清单查询失败，跳过删除检测（保守视为全部存在）: %s", str(e))
+            return list(site_names), []
+
+        existing = set()
+        if isinstance(site_list, list):
+            for s in site_list:
+                if isinstance(s, dict) and s.get('name'):
+                    existing.add(s['name'])
+        if not existing:
+            if self._logger:
+                self._logger.warning("站点清单为空或形态异常，跳过删除检测: order_id=%s", order_id)
+            return list(site_names), []
+
+        live_sites = [sn for sn in site_names if sn in existing]
+        deleted_sites = [sn for sn in site_names if sn not in existing]
+        if deleted_sites and self._logger:
+            self._logger.warning("检测到已删除站点: order_id=%s, sites=%s",
+                                 order_id, ','.join(deleted_sites))
+        return live_sites, deleted_sites
+
+    def _prune_deleted_sites(self, order_id, deleted_sites):
+        """将已删除的站点从证书绑定中移除并持久化（自愈），失败仅记日志"""
+        try:
+            cert = self._config.get_cert(order_id)
+            if not cert:
+                return
+            current = cert.get('site_name', [])
+            if isinstance(current, str):
+                current = [current] if current else []
+            remaining = [s for s in current if s not in deleted_sites]
+            if remaining != current:
+                self._config.update_cert(order_id, {'site_name': remaining})
+                if self._logger:
+                    self._logger.warning("已解除已删除站点的证书绑定: order_id=%s, sites=%s",
+                                         order_id, ','.join(deleted_sites))
+        except Exception as e:
+            if self._logger:
+                self._logger.warning("解除已删除站点绑定失败: order_id=%s, error=%s",
+                                     order_id, str(e))
 
     def _set_ssl(self, site_name, cert_pem, key_pem):
         """调用宝塔 panelSite.SetSSL()，写入前置检查 + 白名单判定 + 写入后校验/回滚

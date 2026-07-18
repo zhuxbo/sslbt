@@ -216,7 +216,11 @@ class RenewEngine:
         return sleep_min, sleep_max
 
     def _check_deploy_results(self, results, order_id):
-        """检查 deploy_multi 结果：全部失败视为部署失败，部分失败记录警告但仍视为成功"""
+        """检查 deploy_multi 结果：全部失败视为部署失败，部分失败记录警告但仍视为成功
+
+        站点已删除并解绑（site_removed）时首次按失败上报，与部署回调的 failure
+        语义一致；解绑完成后的后续轮次不再出现该站点，恢复 success。
+        """
         if not results:
             raise RuntimeError("部署结果为空: order_id=%s" % order_id)
         success_count = sum(1 for r in results if r.get('status'))
@@ -224,6 +228,9 @@ class RenewEngine:
         if success_count == 0:
             failed_msgs = '; '.join(r.get('message', '') for r in results if not r.get('status'))
             raise RuntimeError("所有站点部署失败: %s" % failed_msgs)
+        removed = [r['site_name'] for r in results if r.get('site_removed')]
+        if removed:
+            raise RuntimeError("站点已删除，已解除绑定: %s" % ','.join(removed))
         if fail_count > 0 and self._logger:
             failed = [r['site_name'] for r in results if not r.get('status')]
             self._logger.warning(

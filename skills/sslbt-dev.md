@@ -127,6 +127,7 @@ SetSSL 部署：写入前 pre-flight 校验既有配置（checkWebConfig，损�
 - 汇总日志：续签完成后记录成功/等待/失败数量
 - cron 注册：`_build_script()` 用注册时进程的解释器（`sys.executable`，面板 pyenv）而非裸 python3，避免环境不一致导致续签不可运行；旧条目经 `setup()` 的 remove+重建替换
 - 续签状态：每次运行结束写 `data/renew_status.json`（last_run/total/success/pending/failure，原子写 0600），面板经 `get_renew_status` 展示「最近续签」
+- 站点删除自愈：`deploy_multi` 部署前查一次 `SiteManager.get_sites()` 复用清单检测站点存在；`get_sites` 查询失败（DB 缺失/锁定/表结构漂移）抛 `SiteQueryError` 与「确认零站点」严格区分，失败或清单为空时放弃本轮删除判定（保守视为全部存在，绝不解绑）；仅当清单查询成功且非空时才把不在清单中的站点解除绑定并持久化；首次检测回调与续签结果均记 failure 带「站点已删除」，其余站点继续部署，解绑后不再重复失败
 - 常量：RENEW_DEFAULT_DAYS=14, MAX_ISSUE_RETRY_COUNT=10, RENEW_SLEEP_MIN=5, RENEW_SLEEP_MAX=120, SPREAD_TOTAL_MAX=600
 - 已过期证书（days_remaining < 0）不再触发续签
 - deploy_multi 全部站点失败时不更新 metadata（保留重试状态）

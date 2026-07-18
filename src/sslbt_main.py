@@ -122,7 +122,7 @@ class sslbt_main:
         return (api_url, api_token), None
 
     def _get_deployer(self):
-        return Deployer(self._config, None, self._logger)
+        return Deployer(self._config, None, self._logger, self._site_mgr)
 
     @contextlib.contextmanager
     def _renew_lock(self):

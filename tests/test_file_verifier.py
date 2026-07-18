@@ -95,6 +95,17 @@ class TestPlaceFile:
         placed = verifier.place_file(file_info, ['nonexist.com'])
         assert placed == []
 
+    def test_site_query_failure_no_crash(self, mock_site_mgr):
+        """站点清单查询失败（SiteQueryError）时安全结束，返回空列表不抛出"""
+        from lib.site_manager import SiteQueryError
+        mock_site_mgr.get_site.side_effect = SiteQueryError('宝塔数据库不存在')
+        verifier = FileVerifier(mock_site_mgr)
+        file_info = {'path': '.well-known/acme-challenge/token', 'content': 'c'}
+        placed = verifier.place_file(file_info, ['a.com', 'b.com'])
+        assert placed == []
+        # 查询失败对所有站点都失败，第一个站点失败即结束，不再逐站点重试
+        assert mock_site_mgr.get_site.call_count == 1
+
     def test_empty_file_info(self, mock_site_mgr):
         """file_info 为空"""
         verifier = FileVerifier(mock_site_mgr)

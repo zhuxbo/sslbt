@@ -120,7 +120,6 @@ class TestDeployer:
         assert results[0]['status'] is True
         assert results[1]['status'] is False
 
-
     @patch('lib.deployer.cert_utils')
     @patch('lib.deployer.Deployer._set_ssl')
     def test_deploy_multi_all_fail_no_metadata_update(self, mock_set_ssl, mock_cert_utils, deployer, tmp_data_dir):
@@ -534,6 +533,212 @@ class TestMetadataFailure:
         result = deployer.deploy('s1', 'cert', 'key', order_id=12345)
         assert result['status'] is True
         assert api.callback.call_args.kwargs['status'] == 'success'
+
+
+class TestDeletedSiteSelfHeal:
+    """站点删除后的续签自愈（B7）"""
+
+    @staticmethod
+    def _make(tmp_data_dir, site_list):
+        """site_list: get_sites() 的返回值（模拟真实语义：站点 dict 列表）"""
+        config = ConfigManager(tmp_data_dir)
+        api = MagicMock()
+        api.callback.return_value = {'code': 1}
+        site_mgr = MagicMock()
+        site_mgr.get_sites.return_value = site_list
+        deployer = Deployer(config, api, MagicMock(), site_mgr)
+        return deployer, api, config
+
+    @staticmethod
+    def _mock_cert_ok(mock_cert_utils):
+        mock_cert_utils.validate_cert_pem.return_value = (True, '')
+        mock_cert_utils.validate_key_pem.return_value = (True, '')
+        mock_cert_utils.verify_cert_key_match.return_value = True
+        mock_cert_utils.parse_cert_info.return_value = {'not_after': _FUTURE_EXPIRY, 'serial': 'X'}
+
+    @patch('lib.deployer.cert_utils')
+    @patch('lib.deployer.Deployer._set_ssl')
+    def test_partial_deleted_site_pruned(self, mock_set_ssl, mock_cert_utils, tmp_data_dir):
+        """部分站点已删：存活站点部署，已删站点解除绑定，回调 failure 带原因"""
+        deployer, api, config = self._make(tmp_data_dir, [{'name': 'live.com', 'path': '/w'}])
+        self._mock_cert_ok(mock_cert_utils)
+        mock_set_ssl.return_value = {'status': True}
+        config.add_cert(12345, 'test', ['a.com'], site_names=['live.com', 'deleted.com'])
+
+        results = deployer.deploy_multi(['live.com', 'deleted.com'], 'cert', 'key', order_id=12345)
+
+        live_r = next(r for r in results if r['site_name'] == 'live.com')
+        del_r = next(r for r in results if r['site_name'] == 'deleted.com')
+        assert live_r['status'] is True
+        assert del_r['status'] is False
+        assert '已删除' in del_r['message']
+        assert del_r.get('site_removed') is True
+        # 只部署存活站点，且一次 deploy_multi 只查一次站点清单
+        mock_set_ssl.assert_called_once_with('live.com', 'cert', 'key')
+        assert deployer._site_manager.get_sites.call_count == 1
+        # config 已解除已删站点绑定
+        assert config.get_cert(12345)['site_name'] == ['live.com']
+        # 回调 failure 带原因
+        kwargs = api.callback.call_args.kwargs
+        assert kwargs['status'] == 'failure'
+        assert 'deleted.com' in kwargs['message']
+
+    @patch('lib.deployer.cert_utils')
+    @patch('lib.deployer.Deployer._set_ssl')
+    def test_self_heal_no_repeat_failure(self, mock_set_ssl, mock_cert_utils, tmp_data_dir):
+        """自愈后再次部署不再包含已删站点，回调 success"""
+        deployer, api, config = self._make(tmp_data_dir, [{'name': 'live.com', 'path': '/w'}])
+        self._mock_cert_ok(mock_cert_utils)
+        mock_set_ssl.return_value = {'status': True}
+        config.add_cert(12345, 'test', ['a.com'], site_names=['live.com', 'deleted.com'])
+
+        # 首次：含已删站点 → failure + 解除绑定
+        deployer.deploy_multi(['live.com', 'deleted.com'], 'cert', 'key', order_id=12345)
+        assert api.callback.call_args.kwargs['status'] == 'failure'
+
+        # 第二次：用配置中剩余站点（已解除绑定）→ success
+        remaining = config.get_cert(12345)['site_name']
+        deployer.deploy_multi(remaining, 'cert', 'key', order_id=12345)
+        assert api.callback.call_args.kwargs['status'] == 'success'
+
+    @patch('lib.deployer.cert_utils')
+    @patch('lib.deployer.Deployer._set_ssl')
+    def test_all_bound_sites_deleted_but_panel_has_sites(self, mock_set_ssl, mock_cert_utils, tmp_data_dir):
+        """绑定的站点全部已删（面板仍有其他站点）：全部解除绑定，回调 failure"""
+        deployer, api, config = self._make(tmp_data_dir, [{'name': 'other.com', 'path': '/w'}])
+        self._mock_cert_ok(mock_cert_utils)
+        config.add_cert(12345, 'test', ['a.com'], site_names=['x.com', 'y.com'])
+
+        results = deployer.deploy_multi(['x.com', 'y.com'], 'cert', 'key', order_id=12345)
+
+        mock_set_ssl.assert_not_called()
+        assert all(r['status'] is False for r in results)
+        assert config.get_cert(12345)['site_name'] == []
+        assert api.callback.call_args.kwargs['status'] == 'failure'
+
+    @patch('lib.deployer.cert_utils')
+    @patch('lib.deployer.Deployer._set_ssl')
+    def test_no_site_manager_no_detection(self, mock_set_ssl, mock_cert_utils, tmp_data_dir):
+        """未注入 site_manager 时不做删除检测（保持原行为）"""
+        config = ConfigManager(tmp_data_dir)
+        api = MagicMock()
+        api.callback.return_value = {'code': 1}
+        deployer = Deployer(config, api, MagicMock())  # 无 site_manager
+        self._mock_cert_ok(mock_cert_utils)
+        mock_set_ssl.return_value = {'status': True}
+        config.add_cert(12345, 'test', ['a.com'], site_names=['s1.com'])
+
+        results = deployer.deploy_multi(['s1.com'], 'cert', 'key', order_id=12345)
+        assert results[0]['status'] is True
+        mock_set_ssl.assert_called_once()
+
+
+class TestSiteQueryFailureNoUnbind:
+    """站点清单查询失败绝不解绑（P0 复现场景：DB 缺失/锁定/表结构漂移都曾被判为「零站点」）"""
+
+    @staticmethod
+    def _make_with_real_mgr(tmp_data_dir):
+        from lib.site_manager import SiteManager
+        config = ConfigManager(tmp_data_dir)
+        api = MagicMock()
+        api.callback.return_value = {'code': 1}
+        site_mgr = SiteManager(logger=MagicMock())  # 真实 SiteManager，不用 mock 掩盖失败模式
+        deployer = Deployer(config, api, MagicMock(), site_mgr)
+        return deployer, api, config
+
+    @staticmethod
+    def _mock_cert_ok(mock_cert_utils):
+        mock_cert_utils.validate_cert_pem.return_value = (True, '')
+        mock_cert_utils.validate_key_pem.return_value = (True, '')
+        mock_cert_utils.verify_cert_key_match.return_value = True
+        mock_cert_utils.parse_cert_info.return_value = {'not_after': _FUTURE_EXPIRY, 'serial': 'X'}
+
+    @patch('lib.deployer.cert_utils')
+    @patch('lib.deployer.Deployer._set_ssl')
+    def test_db_missing_no_unbind(self, mock_set_ssl, mock_cert_utils, tmp_data_dir, tmp_path):
+        """DB 文件缺失：不解绑、site_name 保留、保守继续部署全部站点"""
+        from lib.site_manager import SiteManager
+        deployer, api, config = self._make_with_real_mgr(tmp_data_dir)
+        self._mock_cert_ok(mock_cert_utils)
+        mock_set_ssl.return_value = {'status': True}
+        config.add_cert(12345, 'test', ['a.com'], site_names=['s1.com', 's2.com'])
+
+        with patch.object(SiteManager, '_get_db_path',
+                          return_value=str(tmp_path / 'no-such-site.db')):
+            results = deployer.deploy_multi(['s1.com', 's2.com'], 'cert', 'key', order_id=12345)
+
+        # 全部站点保守视为存在并部署，绝不解绑
+        assert mock_set_ssl.call_count == 2
+        assert all(r['status'] is True for r in results)
+        assert not any(r.get('site_removed') for r in results)
+        assert config.get_cert(12345)['site_name'] == ['s1.com', 's2.com']
+        assert api.callback.call_args.kwargs['status'] == 'success'
+
+    @patch('lib.deployer.cert_utils')
+    @patch('lib.deployer.Deployer._set_ssl')
+    def test_db_schema_drift_no_unbind(self, mock_set_ssl, mock_cert_utils, tmp_data_dir, tmp_path):
+        """表结构漂移（sqlite3.OperationalError: no such table）：同样不解绑"""
+        import sqlite3
+        from lib.site_manager import SiteManager
+        db_path = str(tmp_path / 'drifted.db')
+        conn = sqlite3.connect(db_path)
+        conn.execute('CREATE TABLE unrelated (id INTEGER)')  # 没有 sites/domain 表
+        conn.commit()
+        conn.close()
+
+        deployer, api, config = self._make_with_real_mgr(tmp_data_dir)
+        self._mock_cert_ok(mock_cert_utils)
+        mock_set_ssl.return_value = {'status': True}
+        config.add_cert(12345, 'test', ['a.com'], site_names=['s1.com'])
+
+        with patch.object(SiteManager, '_get_db_path', return_value=db_path):
+            results = deployer.deploy_multi(['s1.com'], 'cert', 'key', order_id=12345)
+
+        mock_set_ssl.assert_called_once()
+        assert results[0]['status'] is True
+        assert config.get_cert(12345)['site_name'] == ['s1.com']
+
+    @patch('lib.deployer.cert_utils')
+    @patch('lib.deployer.Deployer._set_ssl')
+    def test_db_locked_no_unbind(self, mock_set_ssl, mock_cert_utils, tmp_data_dir):
+        """DB 锁定（database is locked）：mock get_sites 抛查询失败语义，不解绑"""
+        from lib.site_manager import SiteQueryError
+        config = ConfigManager(tmp_data_dir)
+        api = MagicMock()
+        api.callback.return_value = {'code': 1}
+        site_mgr = MagicMock()
+        site_mgr.get_sites.side_effect = SiteQueryError('获取站点列表失败: database is locked')
+        deployer = Deployer(config, api, MagicMock(), site_mgr)
+        self._mock_cert_ok(mock_cert_utils)
+        mock_set_ssl.return_value = {'status': True}
+        config.add_cert(12345, 'test', ['a.com'], site_names=['s1.com', 's2.com'])
+
+        results = deployer.deploy_multi(['s1.com', 's2.com'], 'cert', 'key', order_id=12345)
+
+        assert mock_set_ssl.call_count == 2
+        assert all(r['status'] is True for r in results)
+        assert config.get_cert(12345)['site_name'] == ['s1.com', 's2.com']
+
+    @patch('lib.deployer.cert_utils')
+    @patch('lib.deployer.Deployer._set_ssl')
+    def test_empty_site_list_no_unbind(self, mock_set_ssl, mock_cert_utils, tmp_data_dir):
+        """清单查询成功但为空（面板零站点/迁移中间态）：单次探测不清空绑定"""
+        config = ConfigManager(tmp_data_dir)
+        api = MagicMock()
+        api.callback.return_value = {'code': 1}
+        site_mgr = MagicMock()
+        site_mgr.get_sites.return_value = []
+        deployer = Deployer(config, api, MagicMock(), site_mgr)
+        self._mock_cert_ok(mock_cert_utils)
+        mock_set_ssl.return_value = {'status': True}
+        config.add_cert(12345, 'test', ['a.com'], site_names=['s1.com'])
+
+        results = deployer.deploy_multi(['s1.com'], 'cert', 'key', order_id=12345)
+
+        # 跳过删除判定：保守部署、不解绑
+        mock_set_ssl.assert_called_once()
+        assert results[0]['status'] is True
+        assert config.get_cert(12345)['site_name'] == ['s1.com']
 
 
 class TestDeployError:
