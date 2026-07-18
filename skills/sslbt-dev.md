@@ -94,10 +94,11 @@ Bearer Token 认证，部署链接格式：`https://domain/api/deploy?token=xxx&
   fetch_deploy_url → 提取 token/order → GET ?order=xxx → 解析 domains（DNS+IP SAN） → 匹配站点 → add_cert
 
 部署证书
-  query_order → 检查 order_id 变更 → active: 取 cert/key/ca → 校验匹配 → panelSite.SetSSL() → reload 校验 → callback
+  query_order → 检查 order_id 变更 → active: 取 cert/key/ca → 校验匹配 → pre-flight 配置检查 → 捕获原证书 → panelSite.SetSSL() → reload 校验（失败回滚） → callback
 
-SetSSL 结果白名单判定：仅「dict 且 status is True」算成功，非 dict/缺 status 键等异常形态一律判失败；
-成功后再经 public.checkWebConfig() + serviceReload() 校验重载，reload 失败同样视为部署失败（phase='reload'）。
+SetSSL 部署：写入前 pre-flight 校验既有配置（checkWebConfig，损坏则快速失败不写入，phase='preflight'）并捕获站点原证书；
+结果白名单判定（仅「dict 且 status is True」算成功，异常形态一律判失败）；
+写入后经 checkWebConfig + serviceReload 校验，失败则回滚原证书后判失败（phase='reload'），无原证书/回滚失败时提示人工检查。
              → processing + file: FileVerifier.place_file() → 等待 CA 验证
 
 自动续签（定时任务）

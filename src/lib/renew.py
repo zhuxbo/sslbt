@@ -19,22 +19,36 @@ MAX_RENEW_BATCH = 100   # 单次续签证书数量上限
 
 
 def needs_renewal(cert_entry, renew_before_days):
-    """判断证书是否需要续签。已过期证书不再续签。"""
-    expires_at = cert_entry.get('metadata', {}).get('cert_expires_at', '')
-    if not expires_at:
+    """判断证书是否需要进入续签/查询流程（续签决策以服务端为主，spec §3.4）。
+
+    - 已明确过期（剩余天数 < 0）：停止，等待人工处理（spec §3.2）
+    - local 模式已提交 CSR（last_issue_state == 'processing'）：进入查询流程跟进签发
+    - cert_expires_at 为空/不可解析：到期时间未知，视为需处理，进入 API 查询回填 metadata
+      （覆盖首次部署遇 processing、metadata 写失败等中间态，避免 cron 永不接手）
+    - 到期时间已知且未到期：仅当剩余天数 ≤ renew_before_days 才续签
+    """
+    meta = cert_entry.get('metadata', {})
+    expires_at = meta.get('cert_expires_at', '')
+
+    days_remaining = None
+    if expires_at:
+        try:
+            exp_dt = datetime.fromisoformat(expires_at.replace('Z', '+00:00'))
+            days_remaining = (exp_dt - datetime.now(timezone.utc)).days
+        except (ValueError, AttributeError):
+            days_remaining = None
+
+    # 已明确过期，停止续签，等待人工处理
+    if days_remaining is not None and days_remaining < 0:
         return False
 
-    try:
-        exp_dt = datetime.fromisoformat(expires_at.replace('Z', '+00:00'))
-    except (ValueError, AttributeError):
-        return False
+    # 已提交 CSR 待签发：无论到期时间是否已知都需进入查询流程
+    if meta.get('last_issue_state', '') == 'processing':
+        return True
 
-    now = datetime.now(timezone.utc)
-    days_remaining = (exp_dt - now).days
-
-    # 已过期，停止续签
-    if days_remaining < 0:
-        return False
+    # 到期时间未知（空/不可解析）：视为需处理，进入 API 查询回填 metadata
+    if days_remaining is None:
+        return True
 
     return days_remaining <= renew_before_days
 

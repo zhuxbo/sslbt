@@ -48,8 +48,24 @@ class TestNeedsRenewal:
         assert needs_renewal(cert, RENEW_DEFAULT_DAYS) is True
 
     def test_no_expires_at(self):
+        """空 cert_expires_at 视为到期时间未知，需进入 API 查询回填 metadata"""
         cert = {'metadata': {}}
-        assert needs_renewal(cert, 13) is False
+        assert needs_renewal(cert, 13) is True
+
+    def test_unparseable_expires_at(self):
+        """无法解析的 cert_expires_at 同样视为未知需处理"""
+        cert = {'metadata': {'cert_expires_at': 'not-a-date'}}
+        assert needs_renewal(cert, 13) is True
+
+    def test_processing_state_needs_query(self):
+        """local 模式 processing 状态即使远未到期也需进入查询流程跟进签发（spec §3.5）"""
+        cert = _make_cert_entry(days_remaining=60, renew_mode='local', issue_state='processing')
+        assert needs_renewal(cert, RENEW_DEFAULT_DAYS) is True
+
+    def test_processing_but_expired_stops(self):
+        """processing 但已过期：停止续签，等待人工处理（spec §3.2/§3.5）"""
+        cert = _make_cert_entry(days_remaining=-3, renew_mode='local', issue_state='processing')
+        assert needs_renewal(cert, RENEW_DEFAULT_DAYS) is False
 
     def test_expired_cert_no_renewal(self):
         """已过期证书不再续签"""
@@ -127,6 +143,28 @@ class TestRenewEngine:
     def test_check_and_renew_all_empty(self, engine):
         results = engine.check_and_renew_all()
         assert results == []
+
+    def test_empty_expires_at_enters_query(self, engine, tmp_data_dir):
+        """空 cert_expires_at 的证书应进入 API 查询流程回填 metadata，而非被静默跳过
+
+        覆盖首次部署遇 processing / metadata 写失败等中间态导致 cron 永不接手的缺陷。
+        """
+        engine._mock_api.query_order.return_value = {
+            'status': 'active',
+            'certificate': '---CERT---',
+            'ca_certificate': '---CA---',
+            'private_key': '---KEY---',
+        }
+        # add_cert 不写 metadata，cert_expires_at 保持空
+        engine._config.add_cert(
+            order_id=7777, cert_name='order-7777',
+            domains=['example.com'], site_names=['example.com'],
+        )
+        results = engine.check_and_renew_all()
+        # 进入了查询流程（而非因空 expires_at 被前置过滤跳过）
+        engine._mock_api.query_order.assert_called_once()
+        assert len(results) == 1
+        assert results[0]['order_id'] == 7777
 
     def test_retry_count_limit(self, engine):
         """retry_count > MAX_ISSUE_RETRY_COUNT 时拒绝（spec 3.2: > 10）"""

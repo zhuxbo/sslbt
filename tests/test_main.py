@@ -3,6 +3,7 @@
 import os
 import json
 import time
+import fcntl
 import pytest
 from unittest.mock import MagicMock, patch
 
@@ -322,6 +323,62 @@ class TestDeployCert:
         result = plugin.deploy_cert({'order_id': '304'})
         assert result['status'] is False
         assert '失败' in result['msg']
+
+    @patch('sslbt_main.APIClient')
+    def test_deploy_missing_ca_rejected(self, mock_api_cls, plugin):
+        """active 但缺少中间证书 → 拒绝部署，避免残链覆盖完整链（BT-01）"""
+        plugin._config.add_cert(
+            order_id=306,
+            cert_name='test',
+            domains=['a.com'],
+            site_names=['a.com'],
+            api_url='https://api.example.com',
+            api_token=TOKEN,
+        )
+        mock_api = MagicMock()
+        mock_api.query_order.return_value = {
+            'status': 'active',
+            'certificate': '-----BEGIN CERTIFICATE-----\nX\n-----END CERTIFICATE-----',
+            'ca_certificate': '',
+        }
+        mock_api_cls.return_value = mock_api
+        result = plugin.deploy_cert({'order_id': '306'})
+        assert result['status'] is False
+        assert '中间证书' in result['msg']
+
+    def test_deploy_cert_busy_when_renew_locked(self, plugin):
+        """cron 续签占用 renew.lock 时手动部署返回 busy（BT-08）"""
+        plugin._config.add_cert(
+            order_id=307,
+            cert_name='test',
+            domains=['a.com'],
+            site_names=['a.com'],
+            api_url='https://api.example.com',
+            api_token=TOKEN,
+        )
+        lock_path = os.path.join(plugin._data_dir, 'renew.lock')
+        lock_fd = open(lock_path, 'w')
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            result = plugin.deploy_cert({'order_id': '307'})
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            lock_fd.close()
+        assert result['status'] is False
+        assert '续签' in result['msg']
+
+    def test_deploy_all_busy_when_renew_locked(self, plugin):
+        """cron 续签占用锁时批量部署返回 busy（BT-08）"""
+        lock_path = os.path.join(plugin._data_dir, 'renew.lock')
+        lock_fd = open(lock_path, 'w')
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            result = plugin.deploy_all({})
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            lock_fd.close()
+        assert result['status'] is False
+        assert '续签' in result['msg']
 
 
 class TestCheckCert:

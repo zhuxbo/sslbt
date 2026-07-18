@@ -27,5 +27,5 @@ make docker-test        # 容器集成测试
 - 安装脚本：curl --max-filesize 限制、解压前符号链接检查
 - validation_method 受域名类型约束：IP 不可选 delegation、通配符不可选 file（add/update/renew 三层校验）
 - deploy_cert 私钥四级回退：API → 参数路径 → 站点已有私钥(GetSSL) → 返回 need_key 由前端弹窗收集
-- SetSSL 结果白名单判定：仅 dict 且 status is True 算成功；reload（checkWebConfig + serviceReload）纳入成败判定；失败回调 failure 并经 message 字段携带原因
+- SetSSL 部署：写入前 pre-flight 校验既有配置（损坏即快速失败不写入）并捕获原证书；结果白名单判定（仅 dict 且 status is True 算成功）；写入后 checkWebConfig + serviceReload 校验失败则回滚原证书；失败回调 failure 经 message 携带原因（含回滚状态）
 - 计划任务创建结果双重校验：AddCrontab 显式 status False 判失败，其余形态以任务入库反查为准，不再无条件报成功

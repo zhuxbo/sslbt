@@ -4,7 +4,9 @@ import os
 import sys
 import json
 import time
+import fcntl
 import secrets
+import contextlib
 
 # 插件路径
 PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -121,6 +123,34 @@ class sslbt_main:
 
     def _get_deployer(self):
         return Deployer(self._config, None, self._logger)
+
+    @contextlib.contextmanager
+    def _renew_lock(self):
+        """获取续签互斥锁（与 cron 续签共用 data/renew.lock，非阻塞，进程内可重入）
+
+        手动部署与 cron 续签共用同一把锁，避免并发交错执行 SetSSL/reload。
+        批量部署（deploy_all）持锁后嵌套调用单证书部署（deploy_cert）会重入放行；
+        被其他进程/实例占用时 yield False，调用方应返回 busy 提示。
+        """
+        # 可重入：本实例已持锁则直接放行（deploy_all 内部嵌套 deploy_cert）
+        if getattr(self, '_renew_lock_fd', None) is not None:
+            yield True
+            return
+        lock_path = os.path.join(self._data_dir, 'renew.lock')
+        lock_fd = open(lock_path, 'w')
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            lock_fd.close()
+            yield False
+            return
+        self._renew_lock_fd = lock_fd
+        try:
+            yield True
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            lock_fd.close()
+            self._renew_lock_fd = None
 
     def _resolve_private_key(self, cert_data, args, fullchain_pem, site_names):
         """按优先级尝试获取与证书匹配的私钥（deploy-spec §5.3）
@@ -424,7 +454,15 @@ class sslbt_main:
             return _err('删除失败: %s' % str(e))
 
     def deploy_cert(self, args=None):
-        """部署指定证书到多个站点"""
+        """部署指定证书到多个站点（与 cron 续签互斥）"""
+        with self._renew_lock() as acquired:
+            if not acquired:
+                self._logger.warning("deploy_cert 早返回: 续签任务占用锁")
+                return _err('续签任务正在执行，请稍后再试')
+            return self._deploy_cert_locked(args)
+
+    def _deploy_cert_locked(self, args=None):
+        """部署指定证书到多个站点（已持有续签锁）"""
         self._logger.info("deploy_cert 调用: args=%s", args)
         try:
             order_id = _get_param(args, 'order_id', '')
@@ -494,6 +532,12 @@ class sslbt_main:
                 self._logger.warning("deploy_cert 早返回: order_id=%s 证书内容为空", order_id)
                 return _err('证书内容为空')
 
+            # 缺少中间证书守卫：避免残链覆盖站点原有完整链导致信任链断裂
+            # （与 renew.py 自动路径 _renew_pull/_handle_processing 一致）
+            if not ca_certificate:
+                self._logger.warning("deploy_cert 早返回: order_id=%s 缺少中间证书", order_id)
+                return _err('缺少中间证书，无法部署')
+
             fullchain = build_fullchain(certificate, ca_certificate)
 
             # 私钥回退链（deploy-spec §5.3）
@@ -543,7 +587,14 @@ class sslbt_main:
             return _err('部署失败: %s' % str(e))
 
     def deploy_all(self, args=None):
-        """部署证书，支持 order_ids 过滤"""
+        """部署证书，支持 order_ids 过滤（与 cron 续签互斥）"""
+        with self._renew_lock() as acquired:
+            if not acquired:
+                return _err('续签任务正在执行，请稍后再试')
+            return self._deploy_all_locked(args)
+
+    def _deploy_all_locked(self, args=None):
+        """批量部署（已持有续签锁），复用 _deploy_cert_locked 避免重复获取锁"""
         try:
             certs = self._config.get_certs()
             # 支持选中部署

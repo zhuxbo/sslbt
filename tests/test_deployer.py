@@ -1,10 +1,14 @@
 """部署器测试"""
 
 import pytest
+from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 from lib.deployer import Deployer, DeployError
 from lib.config import ConfigManager
+
+# 有效的未来到期时间，供 parse_cert_info mock 使用（部署成功必须能记录到期时间）
+_FUTURE_EXPIRY = datetime(2035, 1, 1, tzinfo=timezone.utc)
 
 
 class TestDeployer:
@@ -34,6 +38,7 @@ class TestDeployer:
         mock_cert_utils.parse_cert_info.return_value = {
             'common_name': 'example.com',
             'serial': 'ABC123',
+            'not_after': _FUTURE_EXPIRY,
         }
         mock_set_ssl.return_value = {'status': True}
 
@@ -69,6 +74,7 @@ class TestDeployer:
         mock_cert_utils.parse_cert_info.return_value = {
             'common_name': 'a.com',
             'serial': 'ABC123',
+            'not_after': _FUTURE_EXPIRY,
         }
         mock_set_ssl.return_value = {'status': True}
 
@@ -96,6 +102,7 @@ class TestDeployer:
         mock_cert_utils.parse_cert_info.return_value = {
             'common_name': 'a.com',
             'serial': 'ABC123',
+            'not_after': _FUTURE_EXPIRY,
         }
         mock_set_ssl.side_effect = [{'status': True}, Exception('部署超时')]
 
@@ -155,6 +162,7 @@ class TestDeployer:
         mock_cert_utils.parse_cert_info.return_value = {
             'common_name': 'a.com',
             'serial': 'DEF456',
+            'not_after': _FUTURE_EXPIRY,
         }
         mock_set_ssl.side_effect = [{'status': True}, Exception('超时')]
 
@@ -180,6 +188,8 @@ class TestDeployer:
         assert cert['metadata']['last_issue_state'] == ''
         assert cert['metadata']['issue_retry_count'] == 0
         assert cert['metadata']['last_deploy_at'] != ''
+        # 到期时间应被回填（避免 cron 因空 expires_at 永不接手）
+        assert cert['metadata']['cert_expires_at'] != ''
 
 
 class TestSetSSLResultWhitelist:
@@ -238,6 +248,7 @@ class TestReloadJudgment:
     @pytest.fixture(autouse=True)
     def _set_ssl_ok(self, monkeypatch):
         import panelSite
+        panelSite.panelSite.reset()
         monkeypatch.setattr(panelSite.panelSite, 'SetSSL',
                             lambda self, params: {'status': True, 'msg': '设置成功'})
 
@@ -249,8 +260,15 @@ class TestReloadJudgment:
             deployer._set_ssl('test.example.com', 'cert', 'key')
 
     def test_web_config_error_phase_is_reload(self, deployer, monkeypatch):
+        """写入后配置校验失败归类为 reload 阶段（pre-flight 通过，写入后才检出）"""
         import public
-        monkeypatch.setattr(public, 'checkWebConfig', lambda: 'nginx: [emerg] boom')
+        calls = {'n': 0}
+
+        def staged_check():
+            calls['n'] += 1
+            return True if calls['n'] == 1 else 'nginx: [emerg] boom'
+
+        monkeypatch.setattr(public, 'checkWebConfig', staged_check)
         with pytest.raises(DeployError) as exc_info:
             deployer._set_ssl('test.example.com', 'cert', 'key')
         assert exc_info.value.phase == 'reload'
@@ -275,6 +293,81 @@ class TestReloadJudgment:
         assert result['status'] is True
 
 
+class TestPreflightAndRollback:
+    """SetSSL 写入前置检查与验证失败回滚（B3）"""
+
+    @pytest.fixture
+    def deployer(self, tmp_data_dir):
+        config = ConfigManager(tmp_data_dir)
+        return Deployer(config, MagicMock(), MagicMock())
+
+    @pytest.fixture(autouse=True)
+    def _clean_ssl(self):
+        import panelSite
+        panelSite.panelSite.reset()
+        yield
+        panelSite.panelSite.reset()
+
+    def test_preflight_rejects_broken_config(self, deployer, monkeypatch):
+        """既有配置损坏时 pre-flight 快速失败，不调用 SetSSL"""
+        import panelSite
+        import public
+        calls = {'setssl': 0}
+
+        def counting_setssl(self, params):
+            calls['setssl'] += 1
+            return {'status': True}
+
+        monkeypatch.setattr(panelSite.panelSite, 'SetSSL', counting_setssl)
+        monkeypatch.setattr(public, 'checkWebConfig', lambda: 'nginx: [emerg] pre-existing error')
+        with pytest.raises(DeployError) as exc:
+            deployer._set_ssl('test.example.com', 'cert', 'key')
+        assert exc.value.phase == 'preflight'
+        assert calls['setssl'] == 0  # 既有配置损坏，不应写入新证书
+
+    def test_setssl_ok_reload_fail_rolls_back(self, deployer, monkeypatch):
+        """SetSSL 成功但 reload 失败 → 回滚到原证书（用 mock 模拟）"""
+        import panelSite
+        import public
+        panelSite.panelSite._ssl_data['test.example.com'] = {'key': 'OLD-KEY', 'cert': 'OLD-CERT'}
+
+        reload_calls = {'n': 0}
+
+        def staged_reload():
+            reload_calls['n'] += 1
+            # 新证书写入后第一次 reload 失败触发回滚，回滚后恢复正常
+            return ('', 'Job for nginx.service failed') if reload_calls['n'] == 1 else ('', '')
+
+        monkeypatch.setattr(public, 'serviceReload', staged_reload)
+        with pytest.raises(DeployError, match='已回滚'):
+            deployer._set_ssl('test.example.com', 'NEW-CERT', 'NEW-KEY')
+        # 原证书已恢复
+        assert panelSite.panelSite._ssl_data['test.example.com'] == {'key': 'OLD-KEY', 'cert': 'OLD-CERT'}
+
+    def test_rollback_no_prev_cert(self, deployer, monkeypatch):
+        """SetSSL 成功但 reload 失败且站点无原证书 → 提示无法回滚"""
+        import public
+        monkeypatch.setattr(public, 'serviceReload', lambda: ('', 'Job for nginx.service failed'))
+        with pytest.raises(DeployError, match='无原证书可回滚'):
+            deployer._set_ssl('newsite.example.com', 'NEW-CERT', 'NEW-KEY')
+
+    def test_rollback_also_fails_needs_manual(self, deployer, monkeypatch):
+        """回滚后 reload 仍失败 → 提示人工检查"""
+        import panelSite
+        import public
+        panelSite.panelSite._ssl_data['test.example.com'] = {'key': 'OLD-KEY', 'cert': 'OLD-CERT'}
+        monkeypatch.setattr(public, 'serviceReload', lambda: ('', 'Job for nginx.service failed'))
+        with pytest.raises(DeployError, match='请人工检查'):
+            deployer._set_ssl('test.example.com', 'NEW-CERT', 'NEW-KEY')
+
+    def test_clean_deploy_writes_new_cert(self, deployer):
+        """配置正常时正常写入，不触发回滚，站点持有新证书"""
+        import panelSite
+        result = deployer._set_ssl('freshsite.example.com', 'NEW-CERT', 'NEW-KEY')
+        assert result['status'] is True
+        assert panelSite.panelSite._ssl_data['freshsite.example.com'] == {'key': 'NEW-KEY', 'cert': 'NEW-CERT'}
+
+
 class TestFailureCallback:
     """失败必须回调 failure 并携带原因（P1-13）"""
 
@@ -292,7 +385,7 @@ class TestFailureCallback:
         mock_cert_utils.validate_cert_pem.return_value = (True, '')
         mock_cert_utils.validate_key_pem.return_value = (True, '')
         mock_cert_utils.verify_cert_key_match.return_value = True
-        mock_cert_utils.parse_cert_info.return_value = {}
+        mock_cert_utils.parse_cert_info.return_value = {'not_after': _FUTURE_EXPIRY}
         mock_set_ssl.side_effect = [{'status': True}, DeployError('nginx 配置校验失败')]
         config.add_cert(12345, 'test', ['a.com'], site_names=['s1', 's2'])
 
@@ -310,7 +403,7 @@ class TestFailureCallback:
         mock_cert_utils.validate_cert_pem.return_value = (True, '')
         mock_cert_utils.validate_key_pem.return_value = (True, '')
         mock_cert_utils.verify_cert_key_match.return_value = True
-        mock_cert_utils.parse_cert_info.return_value = {}
+        mock_cert_utils.parse_cert_info.return_value = {'not_after': _FUTURE_EXPIRY}
         mock_set_ssl.return_value = {'status': True}
         config.add_cert(12345, 'test', ['a.com'], site_names=['s1'])
 
@@ -336,6 +429,111 @@ class TestFailureCallback:
         kwargs = api.callback.call_args.kwargs
         assert kwargs['status'] == 'failure'
         assert 'SetSSL 返回异常形态' in kwargs.get('message', '')
+
+
+class TestMetadataFailure:
+    """metadata 解析/写入失败必须回调 failure，不得误报成功（B1）"""
+
+    @staticmethod
+    def _make(tmp_data_dir):
+        config = ConfigManager(tmp_data_dir)
+        api = MagicMock()
+        api.callback.return_value = {'code': 1}
+        return Deployer(config, api, MagicMock()), api, config
+
+    @patch('lib.deployer.cert_utils')
+    @patch('lib.deployer.Deployer._set_ssl')
+    def test_deploy_multi_parse_failure_callbacks_failure(self, mock_set_ssl, mock_cert_utils, tmp_data_dir):
+        """证书解析失败（parse 返回 None）→ 回调 failure 并抛 DeployError，metadata 不落盘"""
+        deployer, api, config = self._make(tmp_data_dir)
+        mock_cert_utils.validate_cert_pem.return_value = (True, '')
+        mock_cert_utils.validate_key_pem.return_value = (True, '')
+        mock_cert_utils.verify_cert_key_match.return_value = True
+        mock_cert_utils.parse_cert_info.return_value = None
+        mock_set_ssl.return_value = {'status': True}
+        config.add_cert(12345, 'test', ['a.com'], site_names=['s1'])
+
+        with pytest.raises(DeployError, match='部署未完成'):
+            deployer.deploy_multi(['s1'], 'cert', 'key', order_id=12345)
+
+        kwargs = api.callback.call_args.kwargs
+        assert kwargs['status'] == 'failure'
+        assert '到期时间' in kwargs.get('message', '')
+        # cert_expires_at 未被回填，下次 cron 会因空值重新接手
+        cert = config.get_cert(12345)
+        assert cert['metadata']['cert_expires_at'] == ''
+
+    @patch('lib.deployer.cert_utils')
+    @patch('lib.deployer.Deployer._set_ssl')
+    def test_deploy_multi_no_not_after_callbacks_failure(self, mock_set_ssl, mock_cert_utils, tmp_data_dir):
+        """证书解析结果缺 not_after → 回调 failure 并抛 DeployError"""
+        deployer, api, config = self._make(tmp_data_dir)
+        mock_cert_utils.validate_cert_pem.return_value = (True, '')
+        mock_cert_utils.validate_key_pem.return_value = (True, '')
+        mock_cert_utils.verify_cert_key_match.return_value = True
+        mock_cert_utils.parse_cert_info.return_value = {'serial': 'ABC'}
+        mock_set_ssl.return_value = {'status': True}
+        config.add_cert(12345, 'test', ['a.com'], site_names=['s1'])
+
+        with pytest.raises(DeployError, match='部署未完成'):
+            deployer.deploy_multi(['s1'], 'cert', 'key', order_id=12345)
+
+        assert api.callback.call_args.kwargs['status'] == 'failure'
+
+    @patch('lib.deployer.cert_utils')
+    @patch('lib.deployer.Deployer._set_ssl')
+    def test_deploy_multi_metadata_write_failure_callbacks_failure(self, mock_set_ssl, mock_cert_utils, tmp_data_dir):
+        """metadata 写入抛异常 → 回调 failure 并抛 DeployError"""
+        deployer, api, config = self._make(tmp_data_dir)
+        mock_cert_utils.validate_cert_pem.return_value = (True, '')
+        mock_cert_utils.validate_key_pem.return_value = (True, '')
+        mock_cert_utils.verify_cert_key_match.return_value = True
+        mock_cert_utils.parse_cert_info.return_value = {'not_after': _FUTURE_EXPIRY, 'serial': 'X'}
+        mock_set_ssl.return_value = {'status': True}
+        # 用抛异常的 config 替换
+        bad_config = MagicMock()
+        bad_config.update_metadata.side_effect = OSError('disk full')
+        deployer._config = bad_config
+
+        with pytest.raises(DeployError, match='部署未完成'):
+            deployer.deploy_multi(['s1'], 'cert', 'key', order_id=12345)
+
+        kwargs = api.callback.call_args.kwargs
+        assert kwargs['status'] == 'failure'
+        assert 'metadata' in kwargs.get('message', '')
+
+    @patch('lib.deployer.cert_utils')
+    @patch('lib.deployer.Deployer._set_ssl')
+    def test_deploy_single_parse_failure_callbacks_failure(self, mock_set_ssl, mock_cert_utils, tmp_data_dir):
+        """单站点 deploy：证书解析失败 → 回调 failure 并抛 DeployError"""
+        deployer, api, config = self._make(tmp_data_dir)
+        mock_cert_utils.validate_cert_pem.return_value = (True, '')
+        mock_cert_utils.validate_key_pem.return_value = (True, '')
+        mock_cert_utils.verify_cert_key_match.return_value = True
+        mock_cert_utils.parse_cert_info.return_value = None
+        mock_set_ssl.return_value = {'status': True}
+        config.add_cert(12345, 'test', ['a.com'], site_name='s1')
+
+        with pytest.raises(DeployError, match='部署未完成'):
+            deployer.deploy('s1', 'cert', 'key', order_id=12345)
+
+        assert api.callback.call_args.kwargs['status'] == 'failure'
+
+    @patch('lib.deployer.cert_utils')
+    @patch('lib.deployer.Deployer._set_ssl')
+    def test_deploy_single_success_still_callbacks_success(self, mock_set_ssl, mock_cert_utils, tmp_data_dir):
+        """单站点 deploy：解析与写入均成功 → 回调 success 并返回成功"""
+        deployer, api, config = self._make(tmp_data_dir)
+        mock_cert_utils.validate_cert_pem.return_value = (True, '')
+        mock_cert_utils.validate_key_pem.return_value = (True, '')
+        mock_cert_utils.verify_cert_key_match.return_value = True
+        mock_cert_utils.parse_cert_info.return_value = {'not_after': _FUTURE_EXPIRY, 'serial': 'X'}
+        mock_set_ssl.return_value = {'status': True}
+        config.add_cert(12345, 'test', ['a.com'], site_name='s1')
+
+        result = deployer.deploy('s1', 'cert', 'key', order_id=12345)
+        assert result['status'] is True
+        assert api.callback.call_args.kwargs['status'] == 'success'
 
 
 class TestDeployError:
