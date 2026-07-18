@@ -1,7 +1,7 @@
 """证书部署模块。通过宝塔 panelSite.SetSSL() 部署证书。"""
 
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from . import cert_utils
 
@@ -10,6 +10,14 @@ _BT_CERT_DIRS = (
     '/www/server/panel/vhost/cert/%s',
     '/www/server/panel/vhost/ssl/%s',
 )
+
+# 绑定站点在面板清单中连续缺失达此阈值才确认删除并解绑；
+# 未达阈值仅记为"疑似删除"（本轮按失败上报但不解绑），缩小误清绑定的破坏半径
+SITE_MISSING_CONFIRM_THRESHOLD = 2
+
+# 相邻两次缺失观测计入计数的最小间隔（小时）：不足间隔的再次缺失不递增，
+# 确认删除需要跨时间段的两轮观测，而非短时间内的两次探测（如数分钟内两次手动运行）
+SITE_MISSING_MIN_INTERVAL_HOURS = 12
 
 
 class _BtParams(dict):
@@ -62,95 +70,6 @@ class Deployer:
         self._logger = logger
         self._site_manager = site_manager
 
-    def deploy(self, site_name, fullchain_pem, key_pem, order_id=None, domains=None,
-               api_client=None):
-        """部署证书到指定站点
-
-        Args:
-            site_name: 宝塔站点名称
-            fullchain_pem: 完整证书链（叶子证书 + 中间证书）
-            key_pem: 私钥 PEM
-            order_id: 订单 ID（用于回调和更新配置）
-            domains: 域名列表
-
-        Returns:
-            dict: {status, message}
-        """
-        if self._logger:
-            self._logger.info("开始部署证书: site=%s, order_id=%s", site_name, order_id)
-
-        # 验证证书和私钥
-        ok, err = cert_utils.validate_cert_pem(fullchain_pem)
-        if not ok:
-            raise DeployError("证书验证失败: %s" % err, phase='validate')
-
-        ok, err = cert_utils.validate_key_pem(key_pem)
-        if not ok:
-            raise DeployError("私钥验证失败: %s" % err, phase='validate')
-
-        if not cert_utils.verify_cert_key_match(fullchain_pem, key_pem):
-            raise DeployError("证书和私钥不匹配", phase='validate')
-
-        # 通过宝塔 API 部署，失败时回调 failure（附原因）后抛出
-        try:
-            self._set_ssl(site_name, fullchain_pem, key_pem)
-        except Exception as e:
-            now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
-            cb_api = api_client or self._api
-            if order_id and cb_api:
-                self._send_callback(
-                    order_id=order_id,
-                    status='failure',
-                    deployed_at=now,
-                    api_client=cb_api,
-                    message='%s: %s' % (site_name, str(e)),
-                )
-            raise DeployError("部署失败: %s" % str(e), phase='deploy', retryable=True)
-
-        # 解析证书信息并更新 metadata；解析或写入失败视为部署未完成
-        now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
-        meta_error = None
-        if order_id:
-            cert_info = cert_utils.parse_cert_info(fullchain_pem)
-            if not cert_info or not cert_info.get('not_after'):
-                meta_error = '证书解析失败，无法记录到期时间'
-            else:
-                meta = {
-                    'last_deploy_at': now,
-                    'cert_expires_at': cert_info['not_after'].strftime('%Y-%m-%dT%H:%M:%SZ'),
-                    'cert_serial': cert_info.get('serial', ''),
-                    'last_issue_state': '',
-                    'issue_retry_count': 0,
-                    'csr_submitted_at': '',
-                    'last_csr_hash': '',
-                }
-                try:
-                    self._config.update_metadata(order_id, meta)
-                except Exception as e:
-                    meta_error = 'metadata 更新失败: %s' % str(e)
-
-        # 发送部署回调：metadata 未落盘时回调 failure（本地状态不一致，需下次重试）
-        cb_api = api_client or self._api
-        if order_id and cb_api:
-            self._send_callback(
-                order_id=order_id,
-                status='failure' if meta_error else 'success',
-                deployed_at=now,
-                api_client=cb_api,
-                message=('%s: %s' % (site_name, meta_error)) if meta_error else '',
-            )
-
-        # metadata 解析/写入失败：站点虽已写入证书，但本地状态未落盘，视为部署未完成
-        if meta_error:
-            if self._logger:
-                self._logger.error("部署未完成（%s）: site=%s", meta_error, site_name)
-            raise DeployError('部署未完成: %s' % meta_error, phase='metadata', retryable=True)
-
-        if self._logger:
-            self._logger.info("证书部署成功: site=%s", site_name)
-
-        return {'status': True, 'message': '部署成功'}
-
     def deploy_multi(self, site_names, fullchain_pem, key_pem, order_id=None,
                      domains=None, api_client=None):
         """部署证书到多个站点，逐一执行，部分失败不中断
@@ -172,9 +91,11 @@ class Deployer:
         if not cert_utils.verify_cert_key_match(fullchain_pem, key_pem):
             raise DeployError("证书和私钥不匹配", phase='validate')
 
-        # 检测已删除站点并自愈：站点在面板被删后从证书绑定移除，
-        # 避免每日续签对其持续失败并拖累其余站点整体回调 failure
-        live_sites, deleted_sites = self._detect_deleted_sites(site_names, order_id)
+        # 检测面板中缺失的绑定站点并保守自愈：单次快照缺失仅记为"疑似删除"，
+        # 跨最小间隔的连续两轮缺失才确认解绑，避免迁移/重装等中途的不完整快照误清绑定
+        live_sites, missing_sites = self._detect_deleted_sites(site_names, order_id)
+        suspected_sites, confirmed_sites = self._track_missing_sites(
+            order_id, site_names, missing_sites)
 
         # 逐站点部署（仅存活站点）
         results = []
@@ -214,14 +135,18 @@ class Deployer:
                 except Exception as e:
                     meta_error = 'metadata 更新失败: %s' % str(e)
 
-        # 已删除站点：从证书绑定中移除并持久化（自愈），并计入结果供回调如实反映
-        # 首次检测时该站点仍在绑定中，回调 failure 带原因；解除绑定后续签不再重复失败
-        if deleted_sites and order_id:
-            self._prune_deleted_sites(order_id, deleted_sites)
-        for sn in deleted_sites:
+        # 已确认删除（连续两轮缺失）的站点：从证书绑定中移除并持久化（自愈），计入结果供回调
+        if confirmed_sites and order_id:
+            self._prune_deleted_sites(order_id, confirmed_sites)
+        for sn in confirmed_sites:
             results.append({'site_name': sn, 'status': False,
-                            'message': '站点已删除，已解除绑定',
+                            'message': '站点连续两轮缺失，已确认删除并解除绑定',
                             'site_removed': True})
+        # 疑似删除（首轮缺失）：本轮按部署失败上报，但不解绑，等待下一轮二次确认
+        for sn in suspected_sites:
+            results.append({'site_name': sn, 'status': False,
+                            'message': '站点疑似已删除，待下一轮确认（本轮暂不解绑）',
+                            'site_missing': True})
 
         # 发送部署回调（任一站点失败或 metadata 未落盘即 failure，附各失败原因）
         cb_api = api_client or self._api
@@ -250,14 +175,15 @@ class Deployer:
         return results
 
     def _detect_deleted_sites(self, site_names, order_id):
-        """检测已删除站点，返回 (live_sites, deleted_sites)
+        """检测面板清单中缺失的绑定站点，返回 (live_sites, missing_sites)
 
         安全约束（防止误清绑定导致证书静默过期）：
         - 一次 deploy_multi 只查一次站点清单并复用，不逐站点扫库
-        - 清单查询失败（SiteQueryError 等）：放弃本轮删除判定，全部保守视为存在
+        - 清单查询失败（SiteQueryError 等）：放弃本轮缺失判定，全部保守视为存在
         - 清单为空或形态异常：同样放弃判定——「面板零站点」多为 DB 迁移/重装等
           异常中间态，单次探测不足以支撑清空全部绑定的破坏性操作
-        - 仅当清单查询成功且非空时，才把「不在清单中」判定为已删除
+        - 仅当清单查询成功且非空时，才把「不在清单中」判定为缺失（疑似删除，
+          是否解绑由 _track_missing_sites 的连续两轮确认决定）
         """
         if self._site_manager is None:
             return list(site_names), []
@@ -267,7 +193,7 @@ class Deployer:
             site_list = self._site_manager.get_sites()
         except Exception as e:
             if self._logger:
-                self._logger.warning("站点清单查询失败，跳过删除检测（保守视为全部存在）: %s", str(e))
+                self._logger.warning("站点清单查询失败，跳过缺失检测（保守视为全部存在）: %s", str(e))
             return list(site_names), []
 
         existing = set()
@@ -277,15 +203,128 @@ class Deployer:
                     existing.add(s['name'])
         if not existing:
             if self._logger:
-                self._logger.warning("站点清单为空或形态异常，跳过删除检测: order_id=%s", order_id)
+                self._logger.warning("站点清单为空或形态异常，跳过缺失检测: order_id=%s", order_id)
             return list(site_names), []
 
         live_sites = [sn for sn in site_names if sn in existing]
-        deleted_sites = [sn for sn in site_names if sn not in existing]
-        if deleted_sites and self._logger:
-            self._logger.warning("检测到已删除站点: order_id=%s, sites=%s",
-                                 order_id, ','.join(deleted_sites))
-        return live_sites, deleted_sites
+        missing_sites = [sn for sn in site_names if sn not in existing]
+        if missing_sites and self._logger:
+            self._logger.warning("检测到面板缺失的绑定站点（待二次确认）: order_id=%s, sites=%s",
+                                 order_id, ','.join(missing_sites))
+        return live_sites, missing_sites
+
+    def _load_missing_counts(self, order_id):
+        """读取证书 metadata 中持久化的站点缺失跟踪（健壮解析，异常返回空）
+
+        形态: {site: {'count': int, 'last_at': iso8601}}；非法条目直接丢弃
+        （丢弃仅使确认周期重新起算，方向保守，不会导致误解绑）。
+        """
+        if not order_id:
+            return {}
+        try:
+            cert = self._config.get_cert(order_id)
+        except Exception:
+            return {}
+        if not isinstance(cert, dict):
+            return {}
+        meta = cert.get('metadata', {})
+        if not isinstance(meta, dict):
+            return {}
+        raw = meta.get('site_missing_counts', {})
+        if not isinstance(raw, dict):
+            return {}
+        counts = {}
+        for k, v in raw.items():
+            if not isinstance(v, dict):
+                continue
+            try:
+                c = int(v.get('count', 0))
+            except (TypeError, ValueError):
+                continue
+            if c > 0:
+                counts[k] = {'count': c, 'last_at': str(v.get('last_at') or '')}
+        return counts
+
+    def _track_missing_sites(self, order_id, site_names, missing_sites):
+        """更新站点缺失跟踪，返回 (suspected_sites, confirmed_sites)
+
+        保守自愈——确认删除需要跨时间段的两轮观测，而非短时间内的两次探测：
+        - 首次缺失记为疑似（count=1 并记录计入时间，本轮不解绑）
+        - 距上次计入不足 SITE_MISSING_MIN_INTERVAL_HOURS 的再次缺失不递增计数
+          （保持疑似态与失败上报），达到间隔才计为新一轮观测
+        - 连续计入达 SITE_MISSING_CONFIRM_THRESHOLD 轮才确认删除
+        - 存活/恢复/不再绑定的站点跟踪清零；无 order_id 无法持久化时全部视为疑似
+        """
+        counts = self._load_missing_counts(order_id)
+        if not missing_sites and not counts:
+            return [], []
+        if not order_id:
+            # 无法持久化缺失跟踪：保守全部视为疑似，绝不解绑
+            return list(missing_sites), []
+
+        now = datetime.now(timezone.utc)
+        now_str = now.strftime('%Y-%m-%dT%H:%M:%SZ')
+        min_interval = timedelta(hours=SITE_MISSING_MIN_INTERVAL_HOURS)
+        missing_set = set(missing_sites)
+        new_counts = {}
+        suspected = []
+        confirmed = []
+        for sn in site_names:
+            if sn not in missing_set:
+                continue  # 存活站点：不写入 new_counts，等价跟踪清零
+            entry = counts.get(sn)
+            if entry is None:
+                count, last_at = 1, now_str
+            else:
+                count, last_at = entry['count'], entry['last_at']
+                prev = self._parse_iso_ts(last_at)
+                if prev is None:
+                    # 时间戳缺失/损坏：修复为当前时间，本轮不递增（保守方向）
+                    last_at = now_str
+                elif now - prev >= min_interval:
+                    count = min(count + 1, SITE_MISSING_CONFIRM_THRESHOLD)
+                    last_at = now_str
+                # 间隔不足：计数与时间戳保持不变（锚定上次计入时刻，不滑动窗口）
+            new_counts[sn] = {'count': count, 'last_at': last_at}
+            if count >= SITE_MISSING_CONFIRM_THRESHOLD:
+                confirmed.append(sn)
+            else:
+                suspected.append(sn)
+
+        # 跟踪有变化才持久化（恢复/不再绑定的站点随 new_counts 重建而自动清理）
+        if new_counts != counts:
+            try:
+                self._config.update_metadata(order_id, {'site_missing_counts': new_counts})
+            except Exception as e:
+                if self._logger:
+                    self._logger.warning("更新站点缺失计数失败: order_id=%s, error=%s",
+                                         order_id, str(e))
+
+        if self._logger:
+            if suspected:
+                self._logger.warning("站点缺失疑似删除，待跨间隔二次确认: order_id=%s, sites=%s",
+                                     order_id, ','.join(suspected))
+            if confirmed:
+                self._logger.warning("站点连续缺失已确认删除: order_id=%s, sites=%s",
+                                     order_id, ','.join(confirmed))
+        return suspected, confirmed
+
+    @staticmethod
+    def _parse_iso_ts(value):
+        """解析 ISO8601 时间戳（Z 后缀），失败或缺少时区信息返回 None
+
+        naive 串（无 Z/偏移，如人工篡改的 '2026-07-16T10:00:00'）解析虽成功，
+        但与 aware now 相减会抛 TypeError，统一按损坏处理交由调用方修复分支。
+        """
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+        except (ValueError, AttributeError):
+            return None
+        if parsed.tzinfo is None:
+            return None
+        return parsed
 
     def _prune_deleted_sites(self, order_id, deleted_sites):
         """将已删除的站点从证书绑定中移除并持久化（自愈），失败仅记日志"""

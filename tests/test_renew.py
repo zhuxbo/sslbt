@@ -176,6 +176,16 @@ class TestRenewEngine:
         with pytest.raises(RuntimeError, match='已删除'):
             engine._check_deploy_results(results, 123)
 
+    def test_check_deploy_results_site_missing_raises(self, engine):
+        """站点疑似删除（首轮缺失，site_missing）按失败上报，与回调 failure 一致"""
+        results = [
+            {'site_name': 'live.com', 'status': True, 'message': '部署成功'},
+            {'site_name': 'gone.com', 'status': False,
+             'message': '站点疑似已删除，待下一轮确认（本轮暂不解绑）', 'site_missing': True},
+        ]
+        with pytest.raises(RuntimeError, match='疑似'):
+            engine._check_deploy_results(results, 123)
+
     def test_renew_status_failure_on_site_removed(self, engine, tmp_data_dir):
         """部分站点删除场景：renew 结果与 renew_status.json 均记 failure（与回调一致）"""
         engine._mock_api.query_order.return_value = {
@@ -635,6 +645,24 @@ class TestRenewEngine:
         engine._update_renew_before_days(mock_api)
         cfg = engine._config.get_config()
         assert cfg['schedule']['renew_before_days'] == 14
+
+    def test_update_renew_before_days_over_cap_ignored(self, engine):
+        """超过上限 30 视为服务端异常值，拒绝并保留本地配置"""
+        mock_api = MagicMock()
+        mock_api.last_renew_before_days = 31
+        engine._config.save_config({'schedule': {'renew_before_days': 14, 'renew_mode': 'pull'}})
+        engine._update_renew_before_days(mock_api)
+        cfg = engine._config.get_config()
+        assert cfg['schedule']['renew_before_days'] == 14
+
+    def test_update_renew_before_days_at_cap_updates(self, engine):
+        """上限值 30 本身有效，正常更新"""
+        mock_api = MagicMock()
+        mock_api.last_renew_before_days = 30
+        engine._config.save_config({'schedule': {'renew_before_days': 14, 'renew_mode': 'pull'}})
+        engine._update_renew_before_days(mock_api)
+        cfg = engine._config.get_config()
+        assert cfg['schedule']['renew_before_days'] == 30
 
 
 class TestOrderUpdate:
@@ -1167,6 +1195,115 @@ class TestDeployFailureRetainsPendingKey:
         result = engine._submit_new_csr(cert, engine._mock_api)
         assert result is True
         assert not os.path.exists(key_path)
+
+    def test_handle_processing_partial_success_with_missing_cleans_pending_key(self, engine):
+        """部分成功+另一站点疑似缺失：仍抛错上报，但私钥已被消费必须清理（不泄漏）"""
+        cert, key_path = self._setup_processing_cert(
+            engine, 8106, site_names=['example.com', 'gone.example.com'])
+        engine._mock_api.query_order.return_value = {
+            'status': 'active', 'certificate': '---CERT---', 'ca_certificate': '---CA---'}
+        engine._deployer.deploy_multi.return_value = [
+            {'site_name': 'example.com', 'status': True, 'message': '部署成功'},
+            {'site_name': 'gone.example.com', 'status': False,
+             'message': '站点疑似已删除，待下一轮确认（本轮暂不解绑）', 'site_missing': True}]
+        with pytest.raises(RuntimeError, match='疑似'):
+            engine._handle_processing(cert, engine._mock_api)
+        assert not os.path.exists(key_path)  # 私钥已写入成功站点：抛错上报不影响清理
+
+    @patch('lib.renew.cert_utils.generate_csr')
+    def test_submit_csr_active_partial_success_with_removed_cleans_pending_key(self, mock_csr, engine):
+        """立即 active：部分成功+另一站点确认删除解绑 → 抛错上报且清理 pending key"""
+        mock_csr.return_value = ('CSR-PEM', 'GEN-KEY', 'hash123')
+        engine._config.add_cert(order_id=8107, cert_name='order-8107',
+                                domains=['example.com'],
+                                site_names=['example.com', 'gone.example.com'],
+                                renew_mode='local')
+        cert = _make_cert_entry(5, renew_mode='local', order_id=8107)
+        cert['cert_name'] = 'order-8107'
+        engine._config.update_metadata(8107, cert['metadata'])
+        engine._mock_api.submit_csr.return_value = {
+            'status': 'active', 'certificate': '---CERT---', 'ca_certificate': '---CA---'}
+        engine._deployer.deploy_multi.return_value = [
+            {'site_name': 'example.com', 'status': True, 'message': '部署成功'},
+            {'site_name': 'gone.example.com', 'status': False,
+             'message': '站点连续两轮缺失，已确认删除并解除绑定', 'site_removed': True}]
+        cert = engine._config.get_cert(8107)
+        key_path = engine._pending_key_path(cert)
+        with pytest.raises(RuntimeError, match='已删除'):
+            engine._submit_new_csr(cert, engine._mock_api)
+        assert not os.path.exists(key_path)
+
+
+def _backdate_site_missing(config, order_id, hours=13):
+    """回拨站点缺失跟踪的上次计入时间戳，模拟距上次缺失已超过最小确认间隔"""
+    cert = config.get_cert(order_id)
+    counts = cert['metadata'].get('site_missing_counts', {})
+    old = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    for sn in counts:
+        if isinstance(counts[sn], dict):
+            counts[sn]['last_at'] = old
+    config.update_metadata(order_id, {'site_missing_counts': counts})
+
+
+class TestProcessingOrphanConvergence:
+    """processing 证书绑定站点全部删除确认解绑后，签发状态收敛不留孤儿"""
+
+    @patch('lib.deployer.cert_utils')
+    @patch('lib.deployer.Deployer._set_ssl')
+    def test_all_sites_deleted_then_converges(self, mock_set_ssl, mock_cert_utils, tmp_data_dir):
+        """三轮链路：疑似 → 确认解绑 → 无绑定站点收敛（清状态+清私钥+failure 回调）"""
+        from lib.deployer import Deployer
+        config = ConfigManager(tmp_data_dir)
+        api = MagicMock()
+        api.last_renew_before_days = 0
+        api.callback.return_value = {'code': 1}
+        api.query_order.return_value = {
+            'status': 'active', 'certificate': '---CERT---', 'ca_certificate': '---CA---'}
+        site_mgr = MagicMock()
+        site_mgr.get_sites.return_value = [{'name': 'other.com', 'path': '/w'}]
+        mock_cert_utils.validate_cert_pem.return_value = (True, '')
+        mock_cert_utils.validate_key_pem.return_value = (True, '')
+        mock_cert_utils.verify_cert_key_match.return_value = True
+        mock_set_ssl.return_value = {'status': True}
+        deployer = Deployer(config, api, MagicMock(), site_mgr)
+        engine = RenewEngine(config, MagicMock(return_value=api), deployer, MagicMock())
+
+        config.add_cert(order_id=9301, cert_name='order-9301', domains=['example.com'],
+                        site_names=['gone.com'], renew_mode='local')
+        now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        config.update_metadata(9301, {'last_issue_state': 'processing', 'csr_submitted_at': now})
+        key_path = engine._pending_key_path(config.get_cert(9301))
+        os.makedirs(os.path.dirname(key_path), exist_ok=True)
+        with open(key_path, 'w') as f:
+            f.write('PENDING-KEY')
+
+        # 轮 1：站点首轮缺失（疑似）→ 失败，不解绑，pending key 保留
+        with pytest.raises(RuntimeError):
+            engine._renew_local(config.get_cert(9301), api)
+        assert config.get_cert(9301)['site_name'] == ['gone.com']
+        assert os.path.isfile(key_path)
+
+        # 跨最小间隔后轮 2：连续缺失确认删除并解绑（site_name 清空）
+        _backdate_site_missing(config, 9301)
+        with pytest.raises(RuntimeError):
+            engine._renew_local(config.get_cert(9301), api)
+        assert config.get_cert(9301)['site_name'] == []
+        assert os.path.isfile(key_path)
+
+        # 轮 3：无绑定站点可部署 → 按失败收敛：清签发状态、清 pending key、failure 回调
+        with pytest.raises(RuntimeError, match='无绑定站点'):
+            engine._renew_local(config.get_cert(9301), api)
+        meta = config.get_cert(9301)['metadata']
+        assert meta['last_issue_state'] == ''
+        assert not os.path.exists(key_path)
+        kwargs = api.callback.call_args.kwargs
+        assert kwargs['status'] == 'failure'
+        assert '无绑定站点' in kwargs.get('message', '')
+
+        # 轮 4：不再进入 processing 分支（走未知到期回填路径），不盲目提交 CSR
+        result = engine._renew_local(config.get_cert(9301), api)
+        assert result is False
+        api.submit_csr.assert_not_called()
 
 
 class TestRenewStatusFileHardening:

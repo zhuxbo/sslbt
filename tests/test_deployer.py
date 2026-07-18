@@ -1,7 +1,7 @@
 """部署器测试"""
 
 import pytest
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from unittest.mock import MagicMock, patch
 
 from lib.deployer import Deployer, DeployError
@@ -9,6 +9,17 @@ from lib.config import ConfigManager
 
 # 有效的未来到期时间，供 parse_cert_info mock 使用（部署成功必须能记录到期时间）
 _FUTURE_EXPIRY = datetime(2035, 1, 1, tzinfo=timezone.utc)
+
+
+def _backdate_missing(config, order_id, hours=13):
+    """回拨站点缺失跟踪的上次计入时间戳，模拟距上次缺失已超过最小确认间隔"""
+    cert = config.get_cert(order_id)
+    counts = cert['metadata'].get('site_missing_counts', {})
+    old = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    for sn in counts:
+        if isinstance(counts[sn], dict):
+            counts[sn]['last_at'] = old
+    config.update_metadata(order_id, {'site_missing_counts': counts})
 
 
 class TestDeployer:
@@ -20,50 +31,23 @@ class TestDeployer:
         logger = MagicMock()
         return Deployer(config, api, logger)
 
-    def test_deploy_invalid_cert(self, deployer):
+    def test_deploy_multi_invalid_cert(self, deployer):
         with pytest.raises(DeployError, match='证书验证失败'):
-            deployer.deploy('test-site', 'bad cert', 'bad key')
+            deployer.deploy_multi(['test-site'], 'bad cert', 'bad key')
 
-    def test_deploy_invalid_key(self, deployer):
+    def test_deploy_multi_invalid_key(self, deployer):
         cert = "-----BEGIN CERTIFICATE-----\nTEST\n-----END CERTIFICATE-----"
         with pytest.raises(DeployError, match='私钥验证失败'):
-            deployer.deploy('test-site', cert, 'bad key')
+            deployer.deploy_multi(['test-site'], cert, 'bad key')
 
     @patch('lib.deployer.cert_utils')
-    @patch('lib.deployer.Deployer._set_ssl')
-    def test_deploy_success(self, mock_set_ssl, mock_cert_utils, deployer, tmp_data_dir):
-        mock_cert_utils.validate_cert_pem.return_value = (True, '')
-        mock_cert_utils.validate_key_pem.return_value = (True, '')
-        mock_cert_utils.verify_cert_key_match.return_value = True
-        mock_cert_utils.parse_cert_info.return_value = {
-            'common_name': 'example.com',
-            'serial': 'ABC123',
-            'not_after': _FUTURE_EXPIRY,
-        }
-        mock_set_ssl.return_value = {'status': True}
-
-        config = ConfigManager(tmp_data_dir)
-        config.add_cert(12345, 'test', ['example.com'], site_name='example.com')
-
-        deployer._config = config
-        result = deployer.deploy(
-            site_name='example.com',
-            fullchain_pem='cert-pem',
-            key_pem='key-pem',
-            order_id=12345,
-            domains=['example.com'],
-        )
-        assert result['status'] is True
-        mock_set_ssl.assert_called_once()
-
-    @patch('lib.deployer.cert_utils')
-    def test_deploy_key_mismatch(self, mock_cert_utils, deployer):
+    def test_deploy_multi_key_mismatch(self, mock_cert_utils, deployer):
         mock_cert_utils.validate_cert_pem.return_value = (True, '')
         mock_cert_utils.validate_key_pem.return_value = (True, '')
         mock_cert_utils.verify_cert_key_match.return_value = False
 
         with pytest.raises(DeployError, match='不匹配'):
-            deployer.deploy('test-site', 'cert', 'key')
+            deployer.deploy_multi(['test-site'], 'cert', 'key')
 
     @patch('lib.deployer.cert_utils')
     @patch('lib.deployer.Deployer._set_ssl')
@@ -492,23 +476,6 @@ class TestFailureCallback:
         assert kwargs['status'] == 'success'
         assert not kwargs.get('message')
 
-    @patch('lib.deployer.cert_utils')
-    @patch('lib.deployer.Deployer._set_ssl')
-    def test_deploy_single_failure_sends_failure_callback(self, mock_set_ssl, mock_cert_utils, tmp_data_dir):
-        deployer, api, config = self._make(tmp_data_dir)
-        mock_cert_utils.validate_cert_pem.return_value = (True, '')
-        mock_cert_utils.validate_key_pem.return_value = (True, '')
-        mock_cert_utils.verify_cert_key_match.return_value = True
-        mock_set_ssl.side_effect = DeployError('SetSSL 返回异常形态: None')
-        config.add_cert(12345, 'test', ['a.com'], site_name='s1')
-
-        with pytest.raises(DeployError):
-            deployer.deploy('s1', 'cert', 'key', order_id=12345)
-
-        kwargs = api.callback.call_args.kwargs
-        assert kwargs['status'] == 'failure'
-        assert 'SetSSL 返回异常形态' in kwargs.get('message', '')
-
 
 class TestMetadataFailure:
     """metadata 解析/写入失败必须回调 failure，不得误报成功（B1）"""
@@ -581,39 +548,6 @@ class TestMetadataFailure:
         assert kwargs['status'] == 'failure'
         assert 'metadata' in kwargs.get('message', '')
 
-    @patch('lib.deployer.cert_utils')
-    @patch('lib.deployer.Deployer._set_ssl')
-    def test_deploy_single_parse_failure_callbacks_failure(self, mock_set_ssl, mock_cert_utils, tmp_data_dir):
-        """单站点 deploy：证书解析失败 → 回调 failure 并抛 DeployError"""
-        deployer, api, config = self._make(tmp_data_dir)
-        mock_cert_utils.validate_cert_pem.return_value = (True, '')
-        mock_cert_utils.validate_key_pem.return_value = (True, '')
-        mock_cert_utils.verify_cert_key_match.return_value = True
-        mock_cert_utils.parse_cert_info.return_value = None
-        mock_set_ssl.return_value = {'status': True}
-        config.add_cert(12345, 'test', ['a.com'], site_name='s1')
-
-        with pytest.raises(DeployError, match='部署未完成'):
-            deployer.deploy('s1', 'cert', 'key', order_id=12345)
-
-        assert api.callback.call_args.kwargs['status'] == 'failure'
-
-    @patch('lib.deployer.cert_utils')
-    @patch('lib.deployer.Deployer._set_ssl')
-    def test_deploy_single_success_still_callbacks_success(self, mock_set_ssl, mock_cert_utils, tmp_data_dir):
-        """单站点 deploy：解析与写入均成功 → 回调 success 并返回成功"""
-        deployer, api, config = self._make(tmp_data_dir)
-        mock_cert_utils.validate_cert_pem.return_value = (True, '')
-        mock_cert_utils.validate_key_pem.return_value = (True, '')
-        mock_cert_utils.verify_cert_key_match.return_value = True
-        mock_cert_utils.parse_cert_info.return_value = {'not_after': _FUTURE_EXPIRY, 'serial': 'X'}
-        mock_set_ssl.return_value = {'status': True}
-        config.add_cert(12345, 'test', ['a.com'], site_name='s1')
-
-        result = deployer.deploy('s1', 'cert', 'key', order_id=12345)
-        assert result['status'] is True
-        assert api.callback.call_args.kwargs['status'] == 'success'
-
 
 class TestDeletedSiteSelfHeal:
     """站点删除后的续签自愈（B7）"""
@@ -639,23 +573,36 @@ class TestDeletedSiteSelfHeal:
     @patch('lib.deployer.cert_utils')
     @patch('lib.deployer.Deployer._set_ssl')
     def test_partial_deleted_site_pruned(self, mock_set_ssl, mock_cert_utils, tmp_data_dir):
-        """部分站点已删：存活站点部署，已删站点解除绑定，回调 failure 带原因"""
+        """部分站点连续两轮缺失：存活站点部署，缺失站点二次确认后才解除绑定，回调 failure 带原因
+
+        行为变更（缩小破坏半径）：首轮仅疑似不解绑，连续第二轮才解绑。
+        """
         deployer, api, config = self._make(tmp_data_dir, [{'name': 'live.com', 'path': '/w'}])
         self._mock_cert_ok(mock_cert_utils)
         mock_set_ssl.return_value = {'status': True}
         config.add_cert(12345, 'test', ['a.com'], site_names=['live.com', 'deleted.com'])
 
-        results = deployer.deploy_multi(['live.com', 'deleted.com'], 'cert', 'key', order_id=12345)
+        # 第一轮：缺失站点仅疑似，不解绑，但按失败上报
+        r1 = deployer.deploy_multi(['live.com', 'deleted.com'], 'cert', 'key', order_id=12345)
+        del_r1 = next(r for r in r1 if r['site_name'] == 'deleted.com')
+        assert del_r1['status'] is False
+        assert del_r1.get('site_missing') is True
+        assert not del_r1.get('site_removed')
+        assert config.get_cert(12345)['site_name'] == ['live.com', 'deleted.com']
+        assert api.callback.call_args.kwargs['status'] == 'failure'
 
+        # 跨最小间隔后第二轮：连续缺失确认，解除绑定
+        _backdate_missing(config, 12345)
+        results = deployer.deploy_multi(['live.com', 'deleted.com'], 'cert', 'key', order_id=12345)
         live_r = next(r for r in results if r['site_name'] == 'live.com')
         del_r = next(r for r in results if r['site_name'] == 'deleted.com')
         assert live_r['status'] is True
         assert del_r['status'] is False
-        assert '已删除' in del_r['message']
+        assert '解除绑定' in del_r['message']
         assert del_r.get('site_removed') is True
-        # 只部署存活站点，且一次 deploy_multi 只查一次站点清单
-        mock_set_ssl.assert_called_once_with('live.com', 'cert', 'key')
-        assert deployer._site_manager.get_sites.call_count == 1
+        # 只部署存活站点（两轮各一次），缺失站点从不写入
+        assert mock_set_ssl.call_count == 2
+        assert all(c.args[0] == 'live.com' for c in mock_set_ssl.call_args_list)
         # config 已解除已删站点绑定
         assert config.get_cert(12345)['site_name'] == ['live.com']
         # 回调 failure 带原因
@@ -666,31 +613,42 @@ class TestDeletedSiteSelfHeal:
     @patch('lib.deployer.cert_utils')
     @patch('lib.deployer.Deployer._set_ssl')
     def test_self_heal_no_repeat_failure(self, mock_set_ssl, mock_cert_utils, tmp_data_dir):
-        """自愈后再次部署不再包含已删站点，回调 success"""
+        """连续两轮确认解绑后，再次部署不再包含已删站点，回调 success"""
         deployer, api, config = self._make(tmp_data_dir, [{'name': 'live.com', 'path': '/w'}])
         self._mock_cert_ok(mock_cert_utils)
         mock_set_ssl.return_value = {'status': True}
         config.add_cert(12345, 'test', ['a.com'], site_names=['live.com', 'deleted.com'])
 
-        # 首次：含已删站点 → failure + 解除绑定
+        # 跨最小间隔的连续两轮含已删站点：首轮疑似、第二轮确认解绑，两轮均 failure
+        deployer.deploy_multi(['live.com', 'deleted.com'], 'cert', 'key', order_id=12345)
+        assert api.callback.call_args.kwargs['status'] == 'failure'
+        _backdate_missing(config, 12345)
         deployer.deploy_multi(['live.com', 'deleted.com'], 'cert', 'key', order_id=12345)
         assert api.callback.call_args.kwargs['status'] == 'failure'
 
-        # 第二次：用配置中剩余站点（已解除绑定）→ success
+        # 第三次：用配置中剩余站点（已解除绑定）→ success
         remaining = config.get_cert(12345)['site_name']
+        assert remaining == ['live.com']
         deployer.deploy_multi(remaining, 'cert', 'key', order_id=12345)
         assert api.callback.call_args.kwargs['status'] == 'success'
 
     @patch('lib.deployer.cert_utils')
     @patch('lib.deployer.Deployer._set_ssl')
     def test_all_bound_sites_deleted_but_panel_has_sites(self, mock_set_ssl, mock_cert_utils, tmp_data_dir):
-        """绑定的站点全部已删（面板仍有其他站点）：全部解除绑定，回调 failure"""
+        """绑定站点全部缺失（面板仍有其他站点）：连续两轮确认后全部解除绑定，回调 failure"""
         deployer, api, config = self._make(tmp_data_dir, [{'name': 'other.com', 'path': '/w'}])
         self._mock_cert_ok(mock_cert_utils)
         config.add_cert(12345, 'test', ['a.com'], site_names=['x.com', 'y.com'])
 
-        results = deployer.deploy_multi(['x.com', 'y.com'], 'cert', 'key', order_id=12345)
+        # 第一轮：全部疑似，不解绑
+        r1 = deployer.deploy_multi(['x.com', 'y.com'], 'cert', 'key', order_id=12345)
+        assert all(r['status'] is False for r in r1)
+        assert config.get_cert(12345)['site_name'] == ['x.com', 'y.com']
+        assert api.callback.call_args.kwargs['status'] == 'failure'
 
+        # 跨最小间隔后第二轮：连续缺失确认，全部解绑
+        _backdate_missing(config, 12345)
+        results = deployer.deploy_multi(['x.com', 'y.com'], 'cert', 'key', order_id=12345)
         mock_set_ssl.assert_not_called()
         assert all(r['status'] is False for r in results)
         assert config.get_cert(12345)['site_name'] == []
@@ -711,6 +669,164 @@ class TestDeletedSiteSelfHeal:
         results = deployer.deploy_multi(['s1.com'], 'cert', 'key', order_id=12345)
         assert results[0]['status'] is True
         mock_set_ssl.assert_called_once()
+
+
+class TestSiteMissingTwoRoundConfirm:
+    """站点缺失连续两轮确认才解绑（缩小误清绑定破坏半径）"""
+
+    @staticmethod
+    def _make(tmp_data_dir, get_sites_returns):
+        """get_sites_returns: 逐轮 get_sites() 返回值序列（模拟每轮面板快照）"""
+        config = ConfigManager(tmp_data_dir)
+        api = MagicMock()
+        api.callback.return_value = {'code': 1}
+        site_mgr = MagicMock()
+        site_mgr.get_sites.side_effect = list(get_sites_returns)
+        deployer = Deployer(config, api, MagicMock(), site_mgr)
+        return deployer, api, config
+
+    @staticmethod
+    def _mock_cert_ok(mock_cert_utils):
+        mock_cert_utils.validate_cert_pem.return_value = (True, '')
+        mock_cert_utils.validate_key_pem.return_value = (True, '')
+        mock_cert_utils.verify_cert_key_match.return_value = True
+        mock_cert_utils.parse_cert_info.return_value = {'not_after': _FUTURE_EXPIRY, 'serial': 'X'}
+
+    @patch('lib.deployer.cert_utils')
+    @patch('lib.deployer.Deployer._set_ssl')
+    def test_single_miss_not_unbound_counts_one(self, mock_set_ssl, mock_cert_utils, tmp_data_dir):
+        """单次缺失 → 不解绑，连续缺失计数=1，按失败回报"""
+        panel = [{'name': 'live.com', 'path': '/w'}]  # gone.com 缺失
+        deployer, api, config = self._make(tmp_data_dir, [panel])
+        self._mock_cert_ok(mock_cert_utils)
+        mock_set_ssl.return_value = {'status': True}
+        config.add_cert(12345, 'test', ['a.com'], site_names=['live.com', 'gone.com'])
+
+        results = deployer.deploy_multi(['live.com', 'gone.com'], 'cert', 'key', order_id=12345)
+
+        gone_r = next(r for r in results if r['site_name'] == 'gone.com')
+        assert gone_r['status'] is False
+        assert gone_r.get('site_missing') is True
+        assert not gone_r.get('site_removed')
+        # 未解绑
+        assert config.get_cert(12345)['site_name'] == ['live.com', 'gone.com']
+        # 连续缺失计数=1，随计数持久化上次计入时间戳
+        track = config.get_cert(12345)['metadata']['site_missing_counts']
+        assert track['gone.com']['count'] == 1
+        assert track['gone.com']['last_at']
+        # 按失败回报
+        assert api.callback.call_args.kwargs['status'] == 'failure'
+
+    @patch('lib.deployer.cert_utils')
+    @patch('lib.deployer.Deployer._set_ssl')
+    def test_two_consecutive_misses_unbind(self, mock_set_ssl, mock_cert_utils, tmp_data_dir):
+        """跨最小间隔的连续两轮缺失 → 第二轮确认解绑"""
+        panel = [{'name': 'live.com', 'path': '/w'}]
+        deployer, api, config = self._make(tmp_data_dir, [panel, panel])
+        self._mock_cert_ok(mock_cert_utils)
+        mock_set_ssl.return_value = {'status': True}
+        config.add_cert(12345, 'test', ['a.com'], site_names=['live.com', 'gone.com'])
+
+        deployer.deploy_multi(['live.com', 'gone.com'], 'cert', 'key', order_id=12345)
+        assert config.get_cert(12345)['site_name'] == ['live.com', 'gone.com']  # 首轮不解绑
+
+        _backdate_missing(config, 12345)
+        results = deployer.deploy_multi(['live.com', 'gone.com'], 'cert', 'key', order_id=12345)
+        gone_r = next(r for r in results if r['site_name'] == 'gone.com')
+        assert gone_r.get('site_removed') is True
+        assert config.get_cert(12345)['site_name'] == ['live.com']  # 第二轮解绑
+        assert config.get_cert(12345)['metadata']['site_missing_counts']['gone.com']['count'] == 2
+
+    @patch('lib.deployer.cert_utils')
+    @patch('lib.deployer.Deployer._set_ssl')
+    def test_miss_then_recover_resets_count(self, mock_set_ssl, mock_cert_utils, tmp_data_dir):
+        """缺失一轮后站点恢复 → 计数清零，不解绑"""
+        panel_missing = [{'name': 'live.com', 'path': '/w'}]              # gone.com 缺失
+        panel_full = [{'name': 'live.com', 'path': '/w'},
+                      {'name': 'gone.com', 'path': '/w'}]                 # gone.com 恢复
+        deployer, api, config = self._make(tmp_data_dir, [panel_missing, panel_full])
+        self._mock_cert_ok(mock_cert_utils)
+        mock_set_ssl.return_value = {'status': True}
+        config.add_cert(12345, 'test', ['a.com'], site_names=['live.com', 'gone.com'])
+
+        # 第一轮：gone.com 缺失，计数=1
+        deployer.deploy_multi(['live.com', 'gone.com'], 'cert', 'key', order_id=12345)
+        assert config.get_cert(12345)['metadata']['site_missing_counts']['gone.com']['count'] == 1
+
+        # 第二轮：gone.com 恢复 → 计数清零、正常部署、不解绑
+        results = deployer.deploy_multi(['live.com', 'gone.com'], 'cert', 'key', order_id=12345)
+        assert all(r['status'] is True for r in results)
+        assert config.get_cert(12345)['metadata'].get('site_missing_counts', {}) == {}
+        assert config.get_cert(12345)['site_name'] == ['live.com', 'gone.com']
+        assert api.callback.call_args.kwargs['status'] == 'success'
+
+    @patch('lib.deployer.cert_utils')
+    @patch('lib.deployer.Deployer._set_ssl')
+    def test_second_miss_within_12h_no_increment(self, mock_set_ssl, mock_cert_utils, tmp_data_dir):
+        """同日（<12h）再次缺失 → 计数仍为 1 不解绑（两轮确认按时间跨度而非探测次数）"""
+        panel = [{'name': 'live.com', 'path': '/w'}]
+        deployer, api, config = self._make(tmp_data_dir, [panel, panel])
+        self._mock_cert_ok(mock_cert_utils)
+        mock_set_ssl.return_value = {'status': True}
+        config.add_cert(12345, 'test', ['a.com'], site_names=['live.com', 'gone.com'])
+
+        deployer.deploy_multi(['live.com', 'gone.com'], 'cert', 'key', order_id=12345)
+        results = deployer.deploy_multi(['live.com', 'gone.com'], 'cert', 'key', order_id=12345)
+
+        gone_r = next(r for r in results if r['site_name'] == 'gone.com')
+        assert gone_r.get('site_missing') is True  # 仍为疑似态
+        assert not gone_r.get('site_removed')
+        assert config.get_cert(12345)['site_name'] == ['live.com', 'gone.com']  # 不解绑
+        assert config.get_cert(12345)['metadata']['site_missing_counts']['gone.com']['count'] == 1
+        assert api.callback.call_args.kwargs['status'] == 'failure'  # 仍按失败上报
+
+    @patch('lib.deployer.cert_utils')
+    @patch('lib.deployer.Deployer._set_ssl')
+    def test_naive_last_at_repaired_no_crash(self, mock_set_ssl, mock_cert_utils, tmp_data_dir):
+        """可解析但无时区的 last_at（人工篡改）→ 不抛异常按损坏修复，健康站点照常部署"""
+        panel = [{'name': 'live.com', 'path': '/w'}]
+        deployer, api, config = self._make(tmp_data_dir, [panel])
+        self._mock_cert_ok(mock_cert_utils)
+        mock_set_ssl.return_value = {'status': True}
+        config.add_cert(12345, 'test', ['a.com'], site_names=['live.com', 'gone.com'])
+        # 预置 naive 时间戳（无 Z/偏移，fromisoformat 可解析成 naive datetime）
+        config.update_metadata(12345, {'site_missing_counts': {
+            'gone.com': {'count': 1, 'last_at': '2026-07-16T10:00:00'}}})
+
+        results = deployer.deploy_multi(['live.com', 'gone.com'], 'cert', 'key', order_id=12345)
+
+        # 健康站点照常部署（整轮不因 TypeError 中止）
+        live_r = next(r for r in results if r['site_name'] == 'live.com')
+        assert live_r['status'] is True
+        mock_set_ssl.assert_called_once_with('live.com', 'cert', 'key')
+        # 走损坏修复分支：计数不递增、保持疑似不解绑
+        gone_r = next(r for r in results if r['site_name'] == 'gone.com')
+        assert gone_r.get('site_missing') is True
+        assert not gone_r.get('site_removed')
+        track = config.get_cert(12345)['metadata']['site_missing_counts']['gone.com']
+        assert track['count'] == 1
+        # 时间戳已修复为带时区的当前时间
+        assert track['last_at'] != '2026-07-16T10:00:00'
+        repaired = datetime.fromisoformat(track['last_at'].replace('Z', '+00:00'))
+        assert repaired.tzinfo is not None
+
+    @patch('lib.deployer.cert_utils')
+    @patch('lib.deployer.Deployer._set_ssl')
+    def test_second_miss_after_12h_unbinds(self, mock_set_ssl, mock_cert_utils, tmp_data_dir):
+        """跨 12 小时的两轮缺失 → 确认删除并解绑"""
+        panel = [{'name': 'live.com', 'path': '/w'}]
+        deployer, api, config = self._make(tmp_data_dir, [panel, panel])
+        self._mock_cert_ok(mock_cert_utils)
+        mock_set_ssl.return_value = {'status': True}
+        config.add_cert(12345, 'test', ['a.com'], site_names=['live.com', 'gone.com'])
+
+        deployer.deploy_multi(['live.com', 'gone.com'], 'cert', 'key', order_id=12345)
+        _backdate_missing(config, 12345)
+        results = deployer.deploy_multi(['live.com', 'gone.com'], 'cert', 'key', order_id=12345)
+
+        gone_r = next(r for r in results if r['site_name'] == 'gone.com')
+        assert gone_r.get('site_removed') is True
+        assert config.get_cert(12345)['site_name'] == ['live.com']
 
 
 class TestSiteQueryFailureNoUnbind:

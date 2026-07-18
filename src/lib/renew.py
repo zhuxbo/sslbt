@@ -13,6 +13,7 @@ from .api_client import APIError
 
 # 常量，对标 sslctl
 RENEW_DEFAULT_DAYS = 14
+MAX_RENEW_BEFORE_DAYS = 30  # 续签应在到期前 30 天内，超限视为服务端异常值（spec 2.9）
 MAX_ISSUE_RETRY_COUNT = 10
 RENEW_SLEEP_MIN = 5
 RENEW_SLEEP_MAX = 120
@@ -247,8 +248,9 @@ class RenewEngine:
     def _check_deploy_results(self, results, order_id):
         """检查 deploy_multi 结果：全部失败视为部署失败，部分失败记录警告但仍视为成功
 
-        站点已删除并解绑（site_removed）时首次按失败上报，与部署回调的 failure
-        语义一致；解绑完成后的后续轮次不再出现该站点，恢复 success。
+        站点缺失（site_removed 已确认删除并解绑 / site_missing 首轮疑似删除）时按
+        失败上报，与部署回调的 failure 语义一致；缺失站点恢复或解绑后的后续轮次
+        不再出现该站点，恢复 success。
         """
         if not results:
             raise RuntimeError("部署结果为空: order_id=%s" % order_id)
@@ -260,6 +262,10 @@ class RenewEngine:
         removed = [r['site_name'] for r in results if r.get('site_removed')]
         if removed:
             raise RuntimeError("站点已删除，已解除绑定: %s" % ','.join(removed))
+        # 疑似删除（首轮缺失，尚未解绑）：与回调 failure 一致按失败上报，等待二次确认
+        suspected = [r['site_name'] for r in results if r.get('site_missing')]
+        if suspected:
+            raise RuntimeError("站点疑似已删除，待二次确认: %s" % ','.join(suspected))
         if fail_count > 0 and self._logger:
             failed = [r['site_name'] for r in results if not r.get('status')]
             self._logger.warning(
@@ -274,10 +280,25 @@ class RenewEngine:
             days = int(getattr(api, 'last_renew_before_days', 0) or 0)
         except (TypeError, ValueError):
             return
+        if days > MAX_RENEW_BEFORE_DAYS:
+            if self._logger:
+                self._logger.warning(
+                    "服务端返回的 renew_before_days=%s 超过上限 %s（续签应在到期前 30 天内），保留本地配置",
+                    days, MAX_RENEW_BEFORE_DAYS)
+            return
         if days > 0:
             cfg = self._config.get_config()
             cfg['schedule']['renew_before_days'] = days
             self._config.save_config(cfg)
+
+    def _send_failure_callback(self, api, order_id, message):
+        """发送 failure 部署回调（非关键路径，失败仅记日志）"""
+        now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        try:
+            api.callback(order_id=order_id, status='failure', deployed_at=now, message=message)
+        except Exception as e:
+            if self._logger:
+                self._logger.warning("部署回调失败（非关键）: %s", str(e))
 
     def _renew_pull(self, cert_entry, api):
         """Pull 模式续签：查询订单 → 证书就绪则部署"""
@@ -489,9 +510,21 @@ class RenewEngine:
         domains = cert_entry.get('domains', [])
 
         if not site_names:
+            # 无绑定站点可部署（如站点删除确认解绑后）：不再静默跳过留下
+            # processing 孤儿（每日空查询+私钥永驻）——清理 pending 私钥、清空
+            # 签发状态使状态收敛，发 failure 回调并按失败上报；
+            # 用户重新绑定站点后走正常重签流程
             if self._logger:
-                self._logger.warning("未绑定站点，跳过部署")
-            return False
+                self._logger.error("无绑定站点可部署，清除签发状态收敛: order_id=%s", order_id)
+            self._cleanup_pending_key(cert_entry)
+            self._config.update_metadata(order_id, {
+                'last_issue_state': '',
+                'csr_submitted_at': '',
+                'pending_file_verify': '',
+                'pending_verify_paths': [],
+            })
+            self._send_failure_callback(api, order_id, '无绑定站点可部署')
+            raise RuntimeError("无绑定站点可部署，已清除签发状态，请重新绑定站点")
 
         results = self._deployer.deploy_multi(
             site_names=site_names,
@@ -502,11 +535,12 @@ class RenewEngine:
             api_client=api,
         )
 
-        # 仅在部署成功后清理 pending key：全失败时 _check_deploy_results 抛错，
-        # 保留 pending key 供下轮重试（spec §3.8）
-        ok = self._check_deploy_results(results, order_id)
-        self._cleanup_pending_key(cert_entry)
-        return ok
+        # 清理判据 = 私钥是否已被消费（任一站点部署成功即已写入站点），与
+        # _check_deploy_results 是否抛错解耦：部分成功+站点缺失/删除时仍抛错上报，
+        # 但私钥必须清理不泄漏；全失败（success=0）保留 pending key 供下轮重试（spec §3.8）
+        if any(r.get('status') for r in results):
+            self._cleanup_pending_key(cert_entry)
+        return self._check_deploy_results(results, order_id)
 
     def _submit_new_csr(self, cert_entry, api):
         """生成并提交新的 CSR"""
@@ -589,10 +623,11 @@ class RenewEngine:
                         domains=domains,
                         api_client=api,
                     )
-                    # 部署成功后才清理 pending key（全失败保留供重试，spec §3.8）
-                    ok = self._check_deploy_results(results, order_id)
-                    self._cleanup_pending_key(cert_entry)
-                    return ok
+                    # 私钥已被消费（任一站点成功）即清理，与抛错上报解耦；
+                    # 全失败保留供重试（spec §3.8）
+                    if any(r.get('status') for r in results):
+                        self._cleanup_pending_key(cert_entry)
+                    return self._check_deploy_results(results, order_id)
 
         if self._logger:
             self._logger.info("CSR 已提交，等待签发: status=%s", status)
