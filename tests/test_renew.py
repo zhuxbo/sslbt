@@ -946,3 +946,119 @@ class TestFileVerifyIntegration:
             result = engine._submit_new_csr(cert, mock_api)
         assert result is False
         # 不应报错，file 字段被忽略
+
+
+class TestLocalUnknownExpiryRefill:
+    """Local 模式到期时间未知：先查询 API 回填元数据再判定，不盲目提交 CSR"""
+
+    @pytest.fixture
+    def engine(self, tmp_data_dir):
+        config = ConfigManager(tmp_data_dir)
+        mock_api = MagicMock()
+        # 与真实 APIClient 一致：未返回新阈值时为 0（避免 MagicMock.__int__ 默认返回 1
+        # 污染全局 renew_before_days）
+        mock_api.last_renew_before_days = 0
+        api_factory = MagicMock(return_value=mock_api)
+        deployer = MagicMock()
+        deployer.deploy_multi.return_value = [
+            {'site_name': 'example.com', 'status': True, 'message': '部署成功'}]
+        logger = MagicMock()
+        eng = RenewEngine(config, api_factory, deployer, logger)
+        eng._mock_api = mock_api
+        return eng
+
+    def _add_local_cert_empty_meta(self, engine, order_id=7001):
+        # add_cert 不写 metadata，cert_expires_at 保持空（到期时间未知）
+        engine._config.add_cert(
+            order_id=order_id, cert_name='order-%d' % order_id,
+            domains=['example.com'], site_names=['example.com'], renew_mode='local',
+        )
+        return engine._config.get_cert(order_id)
+
+    @patch('lib.renew.cert_utils.parse_cert_info')
+    def test_unknown_expiry_queries_api_once(self, mock_parse, engine):
+        """local + 空 metadata → 先查询 API（query_calls=1），不直接提交 CSR"""
+        mock_parse.return_value = {
+            'not_after': datetime.now(timezone.utc) + timedelta(days=60), 'serial': 'AA'}
+        engine._mock_api.query_order.return_value = {
+            'status': 'active', 'certificate': '---CERT---', 'ca_certificate': '---CA---'}
+        cert = self._add_local_cert_empty_meta(engine)
+        result = engine._renew_local(cert, engine._mock_api)
+        engine._mock_api.query_order.assert_called_once()
+        engine._mock_api.submit_csr.assert_not_called()
+        assert result is False
+
+    @patch('lib.renew.cert_utils.parse_cert_info')
+    def test_unknown_expiry_far_future_no_submit(self, mock_parse, engine):
+        """回填后远期 → 不提交 CSR，并写回 cert_expires_at"""
+        far = datetime.now(timezone.utc) + timedelta(days=80)
+        mock_parse.return_value = {'not_after': far, 'serial': 'BB'}
+        engine._mock_api.query_order.return_value = {
+            'status': 'active', 'certificate': '---CERT---', 'ca_certificate': '---CA---'}
+        cert = self._add_local_cert_empty_meta(engine, order_id=7002)
+        result = engine._renew_local(cert, engine._mock_api)
+        assert result is False
+        engine._mock_api.submit_csr.assert_not_called()
+        # 元数据已回填，下轮无需再查询
+        saved = engine._config.get_cert(7002)
+        assert saved['metadata']['cert_expires_at'] != ''
+        assert saved['metadata']['cert_serial'] == 'BB'
+
+    @patch('lib.renew.cert_utils.generate_csr')
+    @patch('lib.renew.cert_utils.parse_cert_info')
+    def test_unknown_expiry_near_expiry_submits(self, mock_parse, mock_csr, engine):
+        """回填后临期 → 正常走 CSR 提交"""
+        near = datetime.now(timezone.utc) + timedelta(days=3)
+        mock_parse.return_value = {'not_after': near, 'serial': 'CC'}
+        mock_csr.return_value = ('CSR-PEM', 'KEY-PEM', 'hash123')
+        engine._mock_api.query_order.return_value = {
+            'status': 'active', 'certificate': '---CERT---', 'ca_certificate': '---CA---'}
+        engine._mock_api.submit_csr.return_value = {'status': 'processing'}
+        cert = self._add_local_cert_empty_meta(engine, order_id=7003)
+        result = engine._renew_local(cert, engine._mock_api)
+        engine._mock_api.query_order.assert_called_once()
+        engine._mock_api.submit_csr.assert_called_once()
+        assert result is False  # 提交后进入 processing
+
+    def test_unknown_expiry_query_failure_no_submit(self, engine):
+        """查询失败 → 不提交 CSR（按失败处理，不盲目重签）"""
+        from lib.api_client import APIError
+        engine._mock_api.query_order.side_effect = APIError('查询失败')
+        cert = self._add_local_cert_empty_meta(engine, order_id=7004)
+        with pytest.raises(APIError):
+            engine._renew_local(cert, engine._mock_api)
+        engine._mock_api.submit_csr.assert_not_called()
+
+    def test_unknown_expiry_no_cert_content_no_submit(self, engine):
+        """服务端未返回证书内容（processing）→ 本轮跳过，不提交 CSR"""
+        engine._mock_api.query_order.return_value = {'status': 'processing', 'certificate': ''}
+        cert = self._add_local_cert_empty_meta(engine, order_id=7005)
+        result = engine._renew_local(cert, engine._mock_api)
+        assert result is False
+        engine._mock_api.submit_csr.assert_not_called()
+
+    @patch('lib.renew.cert_utils.parse_cert_info')
+    def test_unknown_expiry_parse_failure_no_submit(self, mock_parse, engine):
+        """回填时证书解析失败 → 本轮跳过，不提交 CSR"""
+        mock_parse.return_value = None
+        engine._mock_api.query_order.return_value = {
+            'status': 'active', 'certificate': '---CERT---', 'ca_certificate': '---CA---'}
+        cert = self._add_local_cert_empty_meta(engine, order_id=7006)
+        result = engine._renew_local(cert, engine._mock_api)
+        assert result is False
+        engine._mock_api.submit_csr.assert_not_called()
+
+    @patch('lib.renew.cert_utils.generate_csr')
+    def test_known_near_expiry_skips_refill_query(self, mock_csr, engine):
+        """到期时间已知且临期 → 直接提交，不做回填查询"""
+        mock_csr.return_value = ('CSR-PEM', 'KEY-PEM', 'hash123')
+        engine._mock_api.submit_csr.return_value = {'status': 'processing'}
+        engine._config.add_cert(
+            order_id=7007, cert_name='order-7007',
+            domains=['example.com'], site_names=['example.com'], renew_mode='local')
+        cert = _make_cert_entry(5, renew_mode='local', order_id=7007)
+        cert['cert_name'] = 'order-7007'
+        engine._config.update_metadata(7007, cert['metadata'])
+        engine._renew_local(engine._config.get_cert(7007), engine._mock_api)
+        engine._mock_api.query_order.assert_not_called()
+        engine._mock_api.submit_csr.assert_called_once()

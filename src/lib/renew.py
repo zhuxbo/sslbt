@@ -19,13 +19,29 @@ SPREAD_TOTAL_MAX = 600  # 分散延迟总量上限（秒）
 MAX_RENEW_BATCH = 100   # 单次续签证书数量上限
 
 
+def _expiry_unknown(meta):
+    """判断 metadata 中的到期时间是否未知（为空或不可解析）"""
+    expires_at = meta.get('cert_expires_at', '')
+    if not expires_at:
+        return True
+    try:
+        datetime.fromisoformat(expires_at.replace('Z', '+00:00'))
+        return False
+    except (ValueError, AttributeError):
+        return True
+
+
 def needs_renewal(cert_entry, renew_before_days):
     """判断证书是否需要进入续签/查询流程（续签决策以服务端为主，spec §3.4）。
 
+    本函数仅做"是否放行进入续签流程"的前置判定，不发起任何网络请求；到期时间
+    未知时的实际 API 查询回填由各模式处理器完成（local 见 RenewEngine._renew_local
+    的回填分支，pull 见 RenewEngine._renew_pull 的查询-部署）。
+
     - 已明确过期（剩余天数 < 0）：停止，等待人工处理（spec §3.2）
-    - local 模式已提交 CSR（last_issue_state == 'processing'）：进入查询流程跟进签发
-    - cert_expires_at 为空/不可解析：到期时间未知，视为需处理，进入 API 查询回填 metadata
-      （覆盖首次部署遇 processing、metadata 写失败等中间态，避免 cron 永不接手）
+    - local 模式已提交 CSR（last_issue_state == 'processing'）：放行进入查询流程跟进签发
+    - cert_expires_at 为空/不可解析：到期时间未知，放行交由处理器查询回填后再判定
+      （覆盖首次部署遇 processing、metadata 写失败、带外换证等中间态，避免 cron 永不接手）
     - 到期时间已知且未到期：仅当剩余天数 ≤ renew_before_days 才续签
     """
     meta = cert_entry.get('metadata', {})
@@ -314,8 +330,61 @@ class RenewEngine:
 
         if last_state == 'processing':
             return self._handle_processing(cert_entry, api)
-        else:
-            return self._submit_new_csr(cert_entry, api)
+
+        # 到期时间未知且无在途 CSR：先查询 API 回填元数据再按正常逻辑判定，
+        # 避免对"部署成功但元数据丢失/带外换证"的证书盲目重新提交 CSR（对齐 sslctl）
+        if _expiry_unknown(meta):
+            return self._refresh_and_maybe_renew_local(cert_entry, api)
+
+        return self._submit_new_csr(cert_entry, api)
+
+    def _refresh_and_maybe_renew_local(self, cert_entry, api):
+        """Local 模式到期时间未知：查询 API 回填元数据后再按正常续签逻辑判定
+
+        - 查询失败：向上抛出（本轮按失败处理），不盲目提交 CSR
+        - 服务端未返回证书内容 / 证书解析失败：本轮跳过（返回 False），下轮再试
+        - 回填成功后：仍需续签（临期/已过期）→ 提交新 CSR；否则本轮不续签
+        """
+        order_id = cert_entry['order_id']
+        cert_data = api.query_order(order_id)
+        self._update_renew_before_days(api)
+        order_id = self._check_order_update(cert_entry, cert_data)
+
+        certificate = cert_data.get('certificate', '')
+        if not certificate:
+            if self._logger:
+                self._logger.warning(
+                    "证书到期时间未知且服务端未返回证书内容，本轮跳过: order_id=%s, status=%s",
+                    order_id, cert_data.get('status', ''))
+            return False
+
+        cert_info = cert_utils.parse_cert_info(certificate)
+        if not cert_info or not cert_info.get('not_after'):
+            if self._logger:
+                self._logger.warning("回填到期时间失败（证书解析错误），本轮跳过: order_id=%s", order_id)
+            return False
+
+        expires_at = cert_info['not_after'].strftime('%Y-%m-%dT%H:%M:%SZ')
+        cert_serial = cert_info.get('serial', '')
+        self._config.update_metadata(order_id, {
+            'cert_expires_at': expires_at,
+            'cert_serial': cert_serial,
+        })
+        meta = cert_entry.setdefault('metadata', {})
+        meta['cert_expires_at'] = expires_at
+        meta['cert_serial'] = cert_serial
+        if self._logger:
+            self._logger.info("证书到期时间已从服务端回填: order_id=%s, expires_at=%s",
+                              order_id, expires_at)
+
+        # 回填后按正常逻辑判定：剩余期限充足则本轮不续签
+        renew_days = self._config.get_renew_before_days(cert_entry)
+        if not needs_renewal(cert_entry, renew_days):
+            if self._logger:
+                self._logger.info("回填后剩余期限充足，本轮不续签: order_id=%s", order_id)
+            return False
+
+        return self._submit_new_csr(cert_entry, api)
 
     def _check_order_update(self, cert_entry, cert_data):
         """检查 API 返回的 order_id 是否变化（续费），变化则更新配置和 pending key 路径"""
