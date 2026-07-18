@@ -84,7 +84,7 @@ Bearer Token 认证，部署链接格式：`https://domain/api/deploy?token=xxx&
 ### POST /api/deploy/callback — 部署回调
 
 ```json
-{"order_id": 123, "status": "success|failure", "deployed_at": "2026-01-01T00:00:00Z", "message": "失败原因（可选，仅失败时携带，≤500 字符）"}
+{"order_id": 123, "status": "success|failure", "deployed_at": "2026-01-01T00:00:00Z", "message": "失败原因（可选，仅 failure 携带；客户端脱敏并截断至 ≤256 字符，服务端上限 500）"}
 ```
 
 ## 部署流程
@@ -122,7 +122,7 @@ SetSSL 部署：写入前 pre-flight 校验既有配置（checkWebConfig，损�
 - 私钥回退（deploy-spec §5.3）：deploy_cert 中按 API → 参数路径 → 站点已有私钥(GetSSL) → 弹窗粘贴 四级回退，所有来源均需 verify_cert_key_match 校验
 - 文件验证：CSR 提交返回 file 字段时自动放置，签发/超时/异常时自动清理
 - `_check_deploy_results()`：全部失败抛异常，部分失败记警告
-- callback：全部站点成功=success，任一失败=failure（message 附各站点失败原因，超长按 500 字符截断）
+- callback：全部站点成功=success，任一失败=failure（message 仅 failure 携带各站点失败原因，客户端脱敏后截断至 256 字符；success 不带）
 - 分散续签：`check_and_renew_all(spread=True)` 在证书间加动态延迟，根据需续签数量自动缩短间隔（总延迟上限 600s），仅 cron 调用启用
 - 汇总日志：续签完成后记录成功/等待/失败数量
 - cron 注册：`_build_script()` 用注册时进程的解释器（`sys.executable`，面板 pyenv）而非裸 python3，避免环境不一致导致续签不可运行；旧条目经 `setup()` 的 remove+重建替换

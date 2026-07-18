@@ -74,7 +74,7 @@ git diff <base>...HEAD            # 全量改动
 - 续签窗口是否由服务端主导（`renew_before_days`，默认 `RENEW_DEFAULT_DAYS = 14`，每次 API 交互回填），本地不得硬编码提前天数
 - 重试计数是否有上限保护（`MAX_ISSUE_RETRY_COUNT = 10`）
 - 证书过期判断是否用 UTC 时间，避免时区问题
-- 回调语义是否与 deploy-spec 一致（status 仅 success/failure/pending）？metadata 写入失败是否绝不回调 success？
+- 回调语义是否与 deploy-spec 一致（callback status 仅 success/failure，无 pending；message 仅 failure 携带且已脱敏截断至 ≤256）？metadata 写入失败是否绝不回调 success？
 - 空/不可解析的 `cert_expires_at` 是否按"未知需处理"进入查询回填，而非静默跳过？
 - 对服务端的 HTTP 出口是否统一走 `APIClient`（HTTPS 强制 + SSRF 防线），无裸 urlopen？
 

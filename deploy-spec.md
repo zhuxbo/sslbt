@@ -270,6 +270,7 @@ Content-Type: application/json
 | `order_id`    | int    | 订单 ID               |
 | `status`      | string | `success` / `failure` |
 | `deployed_at` | string | 部署时间（RFC3339）   |
+| `message`     | string | 可选，仅 `status=failure` 时携带失败原因摘要：客户端截断至 ≤256 字符并经敏感信息脱敏；服务端校验上限 500，超限整条被拒 |
 
 响应 data 包含 `renew_before_days`。
 
