@@ -345,6 +345,31 @@ class TestDeployCert:
         assert result['status'] is False
         assert '中间证书' in result['msg']
 
+    @patch('sslbt_main.APIClient')
+    def test_deploy_all_sites_failed_returns_failure(self, mock_api_cls, plugin):
+        """所有绑定站点部署失败时顶层状态必须为失败"""
+        plugin._config.add_cert(
+            order_id=305, cert_name='test', domains=['a.com'], site_names=['a.com'],
+            api_url='https://api.example.com', api_token=TOKEN,
+        )
+        mock_api = MagicMock()
+        mock_api.query_order.return_value = {
+            'status': 'active', 'certificate': '---CERT---',
+            'ca_certificate': '---CA---', 'private_key': '---KEY---',
+        }
+        mock_api_cls.return_value = mock_api
+        deployer_mock = MagicMock()
+        deployer_mock.deploy_multi.return_value = [
+            {'site_name': 'a.com', 'status': False, 'message': '部署超时'},
+        ]
+        with patch('sslbt_main.Deployer', return_value=deployer_mock), \
+             patch.object(plugin, '_resolve_private_key', return_value='---KEY---'):
+            result = plugin.deploy_cert({'order_id': '305'})
+
+        assert result['status'] is False
+        assert '0 成功，1 失败' in result['msg']
+        assert result['data'][0]['message'] == '部署超时'
+
     def test_deploy_cert_busy_when_renew_locked(self, plugin):
         """cron 续签占用 renew.lock 时手动部署返回 busy（BT-08）"""
         plugin._config.add_cert(
@@ -1190,6 +1215,7 @@ class TestDeployAll:
 
         with patch.object(plugin, 'deploy_cert', side_effect=fake_deploy):
             result = plugin.deploy_all()
+        assert result['status'] is False
         assert '1 成功' in result['msg']
         assert '1 失败' in result['msg']
         assert '1 需要私钥' in result['msg']
@@ -1202,9 +1228,21 @@ class TestDeployAll:
         with patch.object(plugin, 'deploy_cert',
                           return_value={'status': False, 'msg': '需要私钥', 'need_key': True}):
             result = plugin.deploy_all()
+        assert result['status'] is False
         assert '2 需要私钥' in result['msg']
         assert 'cert-x' in result['msg']
         assert 'cert-y' in result['msg']
+        assert '成功' not in result['msg']
+
+    def test_all_failed(self, plugin):
+        """全部证书部署失败时批量顶层状态必须为失败"""
+        self._add_cert(plugin, 940, 'cert-a')
+        self._add_cert(plugin, 941, 'cert-b')
+        with patch.object(plugin, 'deploy_cert',
+                          return_value={'status': False, 'msg': '部署失败'}):
+            result = plugin.deploy_all()
+        assert result['status'] is False
+        assert '2 失败' in result['msg']
         assert '成功' not in result['msg']
 
     def test_no_deployable_certs(self, plugin):

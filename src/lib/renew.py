@@ -262,6 +262,9 @@ class RenewEngine:
         removed = [r['site_name'] for r in results if r.get('site_removed')]
         if removed:
             raise RuntimeError("站点已删除，已解除绑定: %s" % ','.join(removed))
+        remove_failed = [r['site_name'] for r in results if r.get('site_remove_failed')]
+        if remove_failed:
+            raise RuntimeError("站点已删除，但解除绑定持久化失败: %s" % ','.join(remove_failed))
         # 疑似删除（首轮缺失，尚未解绑）：与回调 failure 一致按失败上报，等待二次确认
         suspected = [r['site_name'] for r in results if r.get('site_missing')]
         if suspected:
@@ -604,30 +607,6 @@ class RenewEngine:
                 meta_update['pending_verify_paths'] = placed
 
         self._config.update_metadata(order_id, meta_update)
-
-        if status == 'active':
-            # 立即签发，部署
-            certificate = cert_data.get('certificate', '')
-            ca_certificate = cert_data.get('ca_certificate', '')
-            if certificate and ca_certificate:
-                fullchain = cert_utils.build_fullchain(certificate, ca_certificate)
-                site_names = cert_entry.get('site_name', [])
-                if isinstance(site_names, str):
-                    site_names = [site_names] if site_names else []
-                if site_names:
-                    results = self._deployer.deploy_multi(
-                        site_names=site_names,
-                        fullchain_pem=fullchain,
-                        key_pem=key_pem,
-                        order_id=order_id,
-                        domains=domains,
-                        api_client=api,
-                    )
-                    # 私钥已被消费（任一站点成功）即清理，与抛错上报解耦；
-                    # 全失败保留供重试（spec §3.8）
-                    if any(r.get('status') for r in results):
-                        self._cleanup_pending_key(cert_entry)
-                    return self._check_deploy_results(results, order_id)
 
         if self._logger:
             self._logger.info("CSR 已提交，等待签发: status=%s", status)

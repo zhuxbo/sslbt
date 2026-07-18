@@ -238,7 +238,9 @@ Content-Type: application/json
 
 `validation_method` 限制见 §1.3。
 
-响应 data：单个 CertData + `renew_before_days`。
+响应 data：单个 CertData + `renew_before_days`。提交 CSR 后服务端先进入验证流程，响应状态为
+`processing`（提交暂未完成时可能保持 `pending`），不会在本次请求中同步返回 `active`；客户端应在后续
+查询中等待状态变为 `active` 后再部署。
 
 ### 2.7 切换自动重签
 
@@ -335,8 +337,7 @@ effective_mode = cert.renew_mode || schedule.renew_mode
   │   ├─ 生成 CSR（仅 CN，不含 SAN），保存私钥到 pending-keys/
   │   ├─ 递增 issue_retry_count
   │   ├─ POST /api/deploy 提交 CSR
-  │   ├─ 响应 status=processing → 放置验证文件，标记 processing
-  │   └─ 响应 status=active → 立即部署
+  │   └─ 响应 status=processing → 放置验证文件，标记 processing
   └─ 剩余天数 > renew_before_days → 跳过
 
 == "processing"（等待签发）：

@@ -186,6 +186,17 @@ class TestRenewEngine:
         with pytest.raises(RuntimeError, match='疑似'):
             engine._check_deploy_results(results, 123)
 
+    def test_check_deploy_results_site_remove_failed_raises(self, engine):
+        """解绑持久化失败必须按失败上报，不得宣称已经解除绑定"""
+        results = [
+            {'site_name': 'live.com', 'status': True, 'message': '部署成功'},
+            {'site_name': 'gone.com', 'status': False,
+             'message': '站点连续两轮缺失，但解除绑定持久化失败',
+             'site_remove_failed': True},
+        ]
+        with pytest.raises(RuntimeError, match='持久化失败'):
+            engine._check_deploy_results(results, 123)
+
     def test_renew_status_failure_on_site_removed(self, engine, tmp_data_dir):
         """部分站点删除场景：renew 结果与 renew_status.json 均记 failure（与回调一致）"""
         engine._mock_api.query_order.return_value = {
@@ -1155,47 +1166,6 @@ class TestDeployFailureRetainsPendingKey:
         assert result is True
         assert not os.path.exists(key_path)
 
-    @patch('lib.renew.cert_utils.generate_csr')
-    def test_submit_csr_immediate_active_all_fail_retains_pending_key(self, mock_csr, engine):
-        """submit_csr 立即返回 active 但部署全失败 → 保留生成的 pending key"""
-        mock_csr.return_value = ('CSR-PEM', 'GEN-KEY', 'hash123')
-        engine._config.add_cert(order_id=8104, cert_name='order-8104',
-                                domains=['example.com'], site_names=['example.com'],
-                                renew_mode='local')
-        # 已知临期到期，走 _submit_new_csr（非未知到期回填路径）
-        cert = _make_cert_entry(5, renew_mode='local', order_id=8104)
-        cert['cert_name'] = 'order-8104'
-        engine._config.update_metadata(8104, cert['metadata'])
-        engine._mock_api.submit_csr.return_value = {
-            'status': 'active', 'certificate': '---CERT---', 'ca_certificate': '---CA---'}
-        engine._deployer.deploy_multi.return_value = [
-            {'site_name': 'example.com', 'status': False, 'message': '部署超时'}]
-        cert = engine._config.get_cert(8104)
-        key_path = engine._pending_key_path(cert)
-        with pytest.raises(RuntimeError, match='部署失败'):
-            engine._submit_new_csr(cert, engine._mock_api)
-        assert os.path.isfile(key_path)  # 立即 active 部署全失败：保留 pending key
-
-    @patch('lib.renew.cert_utils.generate_csr')
-    def test_submit_csr_immediate_active_success_cleans_pending_key(self, mock_csr, engine):
-        """submit_csr 立即返回 active 且部署成功 → 清理 pending key（现行为）"""
-        mock_csr.return_value = ('CSR-PEM', 'GEN-KEY', 'hash123')
-        engine._config.add_cert(order_id=8105, cert_name='order-8105',
-                                domains=['example.com'], site_names=['example.com'],
-                                renew_mode='local')
-        cert = _make_cert_entry(5, renew_mode='local', order_id=8105)
-        cert['cert_name'] = 'order-8105'
-        engine._config.update_metadata(8105, cert['metadata'])
-        engine._mock_api.submit_csr.return_value = {
-            'status': 'active', 'certificate': '---CERT---', 'ca_certificate': '---CA---'}
-        engine._deployer.deploy_multi.return_value = [
-            {'site_name': 'example.com', 'status': True, 'message': '部署成功'}]
-        cert = engine._config.get_cert(8105)
-        key_path = engine._pending_key_path(cert)
-        result = engine._submit_new_csr(cert, engine._mock_api)
-        assert result is True
-        assert not os.path.exists(key_path)
-
     def test_handle_processing_partial_success_with_missing_cleans_pending_key(self, engine):
         """部分成功+另一站点疑似缺失：仍抛错上报，但私钥已被消费必须清理（不泄漏）"""
         cert, key_path = self._setup_processing_cert(
@@ -1209,29 +1179,6 @@ class TestDeployFailureRetainsPendingKey:
         with pytest.raises(RuntimeError, match='疑似'):
             engine._handle_processing(cert, engine._mock_api)
         assert not os.path.exists(key_path)  # 私钥已写入成功站点：抛错上报不影响清理
-
-    @patch('lib.renew.cert_utils.generate_csr')
-    def test_submit_csr_active_partial_success_with_removed_cleans_pending_key(self, mock_csr, engine):
-        """立即 active：部分成功+另一站点确认删除解绑 → 抛错上报且清理 pending key"""
-        mock_csr.return_value = ('CSR-PEM', 'GEN-KEY', 'hash123')
-        engine._config.add_cert(order_id=8107, cert_name='order-8107',
-                                domains=['example.com'],
-                                site_names=['example.com', 'gone.example.com'],
-                                renew_mode='local')
-        cert = _make_cert_entry(5, renew_mode='local', order_id=8107)
-        cert['cert_name'] = 'order-8107'
-        engine._config.update_metadata(8107, cert['metadata'])
-        engine._mock_api.submit_csr.return_value = {
-            'status': 'active', 'certificate': '---CERT---', 'ca_certificate': '---CA---'}
-        engine._deployer.deploy_multi.return_value = [
-            {'site_name': 'example.com', 'status': True, 'message': '部署成功'},
-            {'site_name': 'gone.example.com', 'status': False,
-             'message': '站点连续两轮缺失，已确认删除并解除绑定', 'site_removed': True}]
-        cert = engine._config.get_cert(8107)
-        key_path = engine._pending_key_path(cert)
-        with pytest.raises(RuntimeError, match='已删除'):
-            engine._submit_new_csr(cert, engine._mock_api)
-        assert not os.path.exists(key_path)
 
 
 def _backdate_site_missing(config, order_id, hours=13):

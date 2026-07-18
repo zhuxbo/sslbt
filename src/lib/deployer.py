@@ -136,12 +136,18 @@ class Deployer:
                     meta_error = 'metadata 更新失败: %s' % str(e)
 
         # 已确认删除（连续两轮缺失）的站点：从证书绑定中移除并持久化（自愈），计入结果供回调
+        prune_succeeded = True
         if confirmed_sites and order_id:
-            self._prune_deleted_sites(order_id, confirmed_sites)
+            prune_succeeded = self._prune_deleted_sites(order_id, confirmed_sites)
         for sn in confirmed_sites:
-            results.append({'site_name': sn, 'status': False,
-                            'message': '站点连续两轮缺失，已确认删除并解除绑定',
-                            'site_removed': True})
+            if prune_succeeded:
+                results.append({'site_name': sn, 'status': False,
+                                'message': '站点连续两轮缺失，已确认删除并解除绑定',
+                                'site_removed': True})
+            else:
+                results.append({'site_name': sn, 'status': False,
+                                'message': '站点连续两轮缺失，但解除绑定持久化失败',
+                                'site_remove_failed': True})
         # 疑似删除（首轮缺失）：本轮按部署失败上报，但不解绑，等待下一轮二次确认
         for sn in suspected_sites:
             results.append({'site_name': sn, 'status': False,
@@ -327,11 +333,11 @@ class Deployer:
         return parsed
 
     def _prune_deleted_sites(self, order_id, deleted_sites):
-        """将已删除的站点从证书绑定中移除并持久化（自愈），失败仅记日志"""
+        """将已删除的站点从证书绑定中移除并持久化，返回是否成功"""
         try:
             cert = self._config.get_cert(order_id)
             if not cert:
-                return
+                return False
             current = cert.get('site_name', [])
             if isinstance(current, str):
                 current = [current] if current else []
@@ -341,10 +347,12 @@ class Deployer:
                 if self._logger:
                     self._logger.warning("已解除已删除站点的证书绑定: order_id=%s, sites=%s",
                                          order_id, ','.join(deleted_sites))
+            return True
         except Exception as e:
             if self._logger:
                 self._logger.warning("解除已删除站点绑定失败: order_id=%s, error=%s",
                                      order_id, str(e))
+            return False
 
     def _set_ssl(self, site_name, cert_pem, key_pem):
         """调用宝塔 panelSite.SetSSL()，写入前置检查 + 白名单判定 + 写入后校验/回滚

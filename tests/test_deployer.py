@@ -671,6 +671,39 @@ class TestDeletedSiteSelfHeal:
 
     @patch('lib.deployer.cert_utils')
     @patch('lib.deployer.Deployer._set_ssl')
+    def test_confirmed_deleted_site_prune_failure_is_reported(
+            self, mock_set_ssl, mock_cert_utils, tmp_data_dir):
+        """解绑落盘失败时保持原绑定，并明确返回持久化失败"""
+        deployer, api, config = self._make(tmp_data_dir, [{'name': 'live.com', 'path': '/w'}])
+        self._mock_cert_ok(mock_cert_utils)
+        mock_set_ssl.return_value = {'status': True}
+        config.add_cert(12345, 'test', ['a.com'], site_names=['live.com', 'deleted.com'])
+
+        deployer.deploy_multi(['live.com', 'deleted.com'], 'cert', 'key', order_id=12345)
+        _backdate_missing(config, 12345)
+        real_update_cert = config.update_cert
+
+        def fail_site_name_update(order_id, updates):
+            if 'site_name' in updates:
+                raise OSError('磁盘写入失败')
+            return real_update_cert(order_id, updates)
+
+        with patch.object(config, 'update_cert', side_effect=fail_site_name_update):
+            results = deployer.deploy_multi(
+                ['live.com', 'deleted.com'], 'cert', 'key', order_id=12345)
+
+        deleted = next(r for r in results if r['site_name'] == 'deleted.com')
+        assert deleted.get('site_remove_failed') is True
+        assert not deleted.get('site_removed')
+        assert '持久化失败' in deleted['message']
+        assert config.get_cert(12345)['site_name'] == ['live.com', 'deleted.com']
+        callback = api.callback.call_args.kwargs
+        assert callback['status'] == 'failure'
+        assert '持久化失败' in callback['message']
+        assert '已解除绑定' not in callback['message']
+
+    @patch('lib.deployer.cert_utils')
+    @patch('lib.deployer.Deployer._set_ssl')
     def test_all_bound_sites_deleted_but_panel_has_sites(self, mock_set_ssl, mock_cert_utils, tmp_data_dir):
         """绑定站点全部缺失（面板仍有其他站点）：连续两轮确认后全部解除绑定，回调 failure"""
         deployer, api, config = self._make(tmp_data_dir, [{'name': 'other.com', 'path': '/w'}])

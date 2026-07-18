@@ -575,7 +575,11 @@ class sslbt_main:
 
             if fail_count == 0:
                 return _ok(results, msg='部署成功（%d 个站点）' % success_count)
-            return _ok(results, msg='部署完成：%d 成功，%d 失败' % (success_count, fail_count))
+            return {
+                'status': False,
+                'msg': '部署完成：%d 成功，%d 失败' % (success_count, fail_count),
+                'data': results,
+            }
         except DeployError as e:
             self._logger.error("部署失败: %s", str(e))
             return _err('部署失败: %s' % str(e))
@@ -633,6 +637,8 @@ class sslbt_main:
                 names = [r['cert_name'] or str(r['order_id']) for r in need_key]
                 parts.append('%d 需要私钥（%s）' % (len(need_key), ', '.join(names)))
             msg = '批量部署：' + '，'.join(parts) if parts else '无可部署的证书'
+            if failed or need_key:
+                return {'status': False, 'msg': msg, 'data': results}
             return _ok(results, msg=msg)
         except Exception as e:
             return _err('批量部署失败: %s' % str(e))
