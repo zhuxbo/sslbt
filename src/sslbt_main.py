@@ -683,15 +683,10 @@ class sslbt_main:
             if not url:
                 return _err('请提供部署链接')
 
-            from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+            from urllib.parse import urlparse, parse_qs
             parsed = urlparse(url)
             if parsed.scheme not in ('http', 'https'):
                 return _err('不支持的 URL 协议')
-
-            from lib.net_guard import check_ssrf
-            ssrf_reason = check_ssrf(url)
-            if ssrf_reason:
-                return _err('URL 不安全: %s' % ssrf_reason)
 
             # 从 URL 中解析 token 和 order
             params = parse_qs(parsed.query)
@@ -705,44 +700,15 @@ class sslbt_main:
                 return _err('URL 中缺少 order 参数')
             order_value = order_list[0]
 
-            # 构造 api_url（scheme + netloc）
+            # 构造 api_url，交给项目统一 API 客户端发请求：HTTPS 强制（拒绝 http，仅
+            # localhost 例外）+ SSRF/DNS Rebinding 防护 + token 校验，避免绕过统一安全出口
             api_url = '%s://%s' % (parsed.scheme, parsed.netloc)
+            try:
+                api = APIClient(api_url, token, self._logger)
+            except ValueError as e:
+                return _err('部署链接不安全: %s' % str(e))
 
-            # 重建请求 URL：保留路径和 order 参数，去掉 token（通过 Bearer 传递）
-            query_params = {k: v[0] for k, v in params.items() if k != 'token'}
-            request_url = urlunparse((
-                parsed.scheme, parsed.netloc, parsed.path,
-                '', urlencode(query_params), '',
-            ))
-
-            # GET 请求
-            import json as _json
-            from urllib.request import Request, urlopen
-            import ssl as _ssl
-            headers = {
-                'Authorization': 'Bearer %s' % token,
-                'Accept': 'application/json',
-            }
-            req = Request(request_url, headers=headers, method='GET')
-            ctx = _ssl.create_default_context() if url.startswith('https') else None
-            resp = urlopen(req, timeout=30, context=ctx)
-            data = _json.loads(resp.read(5 * 1024 * 1024).decode('utf-8'))
-
-            code = data.get('code', 0)
-            if code != 1:
-                return _err(data.get('msg', 'API 返回错误'))
-
-            cert_data = data.get('data')
-            # 统一为列表（分页格式：data.data 为数组）
-            if isinstance(cert_data, dict):
-                if 'data' in cert_data:
-                    certs = cert_data['data'] if isinstance(cert_data['data'], list) else [cert_data['data']]
-                else:
-                    certs = [cert_data]
-            elif isinstance(cert_data, list):
-                certs = cert_data
-            else:
-                certs = []
+            certs = api.query_batch(order_value)
 
             # 自动匹配站点（排除已绑定的站点）
             sites = self._site_mgr.get_sites()
@@ -771,6 +737,9 @@ class sslbt_main:
                 'order': order_value,
                 'certs': certs,
             })
+        except APIError as e:
+            self._logger.error("fetch_deploy_url API 错误: %s", str(e))
+            return _err('API 错误: %s' % str(e))
         except Exception as e:
             self._logger.error("fetch_deploy_url 失败: %s", str(e))
             return _err('请求失败: %s' % str(e))

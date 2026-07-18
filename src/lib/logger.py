@@ -14,9 +14,14 @@ _FILTERS = [
      'Bearer ***REDACTED***'),
     (re.compile(r'Basic\s+[A-Za-z0-9+/=]+'),
      'Basic ***REDACTED***'),
-    (re.compile(r'"(token|secret|password|api_key|apikey|private_key)"\s*:\s*"[^"]*"'),
+    # JSON 敏感字段（双引号，含 api_token 等复合词）
+    (re.compile(r'"(\w*(?:token|secret|password|api_?key|private_key)\w*)"\s*:\s*"[^"]*"'),
      lambda m: '"%s": "***REDACTED***"' % m.group(1)),
-    (re.compile(r'(token|secret|password|api_key|apikey)=["\']?[^"\'\s&]+["\']?'),
+    # dict repr 敏感字段（单引号，含复合词），覆盖 args 传入的 dict/list 参数
+    (re.compile(r"'(\w*(?:token|secret|password|api_?key|private_key)\w*)'\s*:\s*'[^']*'"),
+     lambda m: "'%s': '***REDACTED***'" % m.group(1)),
+    # key=value 形式（URL 参数等，含复合词）
+    (re.compile(r'(\w*(?:token|secret|password|api_?key)\w*)=["\']?[^"\'\s&]+["\']?'),
      lambda m: '%s=***REDACTED***' % m.group(1)),
 ]
 
@@ -35,12 +40,13 @@ def sanitize(text):
 
 class SensitiveFilter(logging.Filter):
     def filter(self, record):
-        record.msg = sanitize(str(record.msg))
-        if record.args:
-            record.args = tuple(
-                sanitize(str(a)) if isinstance(a, str) else a
-                for a in record.args
-            ) if isinstance(record.args, tuple) else record.args
+        # 先按 args 格式化出完整消息，再整串脱敏，确保 dict/list 等非 str 参数也被覆盖
+        try:
+            message = record.getMessage()
+        except Exception:
+            message = str(record.msg)
+        record.msg = sanitize(message)
+        record.args = None
         return True
 
 

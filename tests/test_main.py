@@ -593,103 +593,89 @@ class TestFetchDeployUrl:
         assert result['status'] is False
         assert 'order' in result['msg']
 
-    @patch('urllib.request.urlopen')
-    def test_success_returns_session_id(self, mock_urlopen, plugin):
+    @patch('sslbt_main.APIClient')
+    def test_success_returns_session_id(self, mock_api_cls, plugin):
         """正常流程返回 session_id 而非明文 token"""
-        mock_resp = MagicMock()
-        mock_resp.read.return_value = json.dumps({
-            'code': 1,
-            'data': {'order_id': 100, 'domains': 'a.com', 'status': 'active'},
-        }).encode()
-        mock_urlopen.return_value = mock_resp
+        mock_api = MagicMock()
+        mock_api.query_batch.return_value = [{'order_id': 100, 'domains': 'a.com', 'status': 'active'}]
+        mock_api_cls.return_value = mock_api
         plugin._site_mgr.get_sites.return_value = []
 
-        result = plugin.fetch_deploy_url({'url': 'https://api.example.com/deploy?token=secret123456789012345678901234&order=100'})
+        result = plugin.fetch_deploy_url({'url': 'https://api.example.com/api/deploy?token=' + TOKEN + '&order=100'})
         assert result['status'] is True
         data = result['data']
         assert 'session_id' in data
-        assert 'token' not in data.get('api', {}) or data['api']['token'] == ''  # 明文 token 不应出现
+        assert 'token' not in data.get('api', {})  # 明文 token 不应出现
         assert data['api']['token_masked'].endswith('***')  # 仅返回脱敏值
 
-    @patch('urllib.request.urlopen')
-    def test_partial_match_includes_unmatched(self, mock_urlopen, plugin):
+    @patch('sslbt_main.APIClient')
+    def test_partial_match_includes_unmatched(self, mock_api_cls, plugin):
         """fetch_deploy_url 为部分匹配站点返回未覆盖域名（前端一键部署列表据此提示，BT-05）"""
-        mock_resp = MagicMock()
-        mock_resp.read.return_value = json.dumps({
-            'code': 1,
-            'data': {'order_id': 200, 'domains': 'a.example.com', 'status': 'active'},
-        }).encode()
-        mock_urlopen.return_value = mock_resp
+        mock_api = MagicMock()
+        mock_api.query_batch.return_value = [{'order_id': 200, 'domains': 'a.example.com', 'status': 'active'}]
+        mock_api_cls.return_value = mock_api
         plugin._site_mgr.get_sites.return_value = [
             {'name': 'site-x.example.com', 'domains': ['a.example.com', 'b.uncovered.com']},
         ]
-        result = plugin.fetch_deploy_url({'url': 'https://api.example.com/deploy?token=' + TOKEN + '&order=200'})
+        result = plugin.fetch_deploy_url({'url': 'https://api.example.com/api/deploy?token=' + TOKEN + '&order=200'})
         assert result['status'] is True
         matches = result['data']['certs'][0]['_matches']
         assert len(matches) == 1
         assert matches[0]['match_type'] == 'partial'
         assert matches[0]['unmatched'] == ['b.uncovered.com']
 
-    @patch('urllib.request.urlopen')
-    def test_add_cert_with_session_id(self, mock_urlopen, plugin):
+    def test_http_scheme_rejected(self, plugin):
+        """http 部署链接被拒绝（统一客户端 HTTPS 强制，BT-09）"""
+        result = plugin.fetch_deploy_url({
+            'url': 'http://api.example.com/api/deploy?token=' + TOKEN + '&order=1'})
+        assert result['status'] is False
+        assert 'HTTPS' in result['msg'] or '不安全' in result['msg']
+
+    @patch('sslbt_main.APIClient')
+    def test_add_cert_with_session_id(self, mock_api_cls, plugin):
         """通过 session_id 添加证书"""
-        # 先 fetch 获取 session_id
-        mock_resp = MagicMock()
-        mock_resp.read.return_value = json.dumps({
-            'code': 1,
-            'data': {'order_id': 100, 'domains': 'a.com', 'status': 'active'},
-        }).encode()
-        mock_urlopen.return_value = mock_resp
+        mock_api = MagicMock()
+        mock_api.query_batch.return_value = [{'order_id': 100, 'domains': 'a.com', 'status': 'active'}]
+        mock_api.query_order.return_value = {'status': 'active', 'domains': 'a.com'}
+        mock_api_cls.return_value = mock_api
         plugin._site_mgr.get_sites.return_value = []
 
-        fetch_result = plugin.fetch_deploy_url({'url': 'https://api.example.com/deploy?token=' + TOKEN + '&order=100'})
+        fetch_result = plugin.fetch_deploy_url({'url': 'https://api.example.com/api/deploy?token=' + TOKEN + '&order=100'})
         session_id = fetch_result['data']['session_id']
 
         # 用 session_id 添加证书
-        with patch('sslbt_main.APIClient') as mock_api_cls:
-            mock_api = MagicMock()
-            mock_api.query_order.return_value = {'status': 'active', 'domains': 'a.com'}
-            mock_api_cls.return_value = mock_api
+        result = plugin.add_cert({
+            'order_id': '100',
+            'session_id': session_id,
+            'site_names': 'a.com',
+        })
+        assert result['status'] is True
+        cert = plugin._config.get_cert(100)
+        assert cert['api']['url'] == 'https://api.example.com'
+        assert cert['api']['token'] == TOKEN
 
-            result = plugin.add_cert({
-                'order_id': '100',
-                'session_id': session_id,
-                'site_names': 'a.com',
-            })
-            assert result['status'] is True
-            cert = plugin._config.get_cert(100)
-            assert cert['api']['url'] == 'https://api.example.com'
-            assert cert['api']['token'] == TOKEN
-
-    @patch('urllib.request.urlopen')
-    def test_session_id_reusable_for_batch(self, mock_urlopen, plugin):
+    @patch('sslbt_main.APIClient')
+    def test_session_id_reusable_for_batch(self, mock_api_cls, plugin):
         """同一 session_id 可用于批量添加多个证书"""
-        mock_resp = MagicMock()
-        mock_resp.read.return_value = json.dumps({
-            'code': 1,
-            'data': [
-                {'order_id': 101, 'domains': 'a.com'},
-                {'order_id': 102, 'domains': 'b.com'},
-            ],
-        }).encode()
-        mock_urlopen.return_value = mock_resp
+        mock_api = MagicMock()
+        mock_api.query_batch.return_value = [
+            {'order_id': 101, 'domains': 'a.com'},
+            {'order_id': 102, 'domains': 'b.com'},
+        ]
+        mock_api.query_order.side_effect = [
+            {'status': 'active', 'domains': 'a.com'},
+            {'status': 'active', 'domains': 'b.com'},
+        ]
+        mock_api_cls.return_value = mock_api
         plugin._site_mgr.get_sites.return_value = []
 
-        fetch_result = plugin.fetch_deploy_url({'url': 'https://api.example.com/deploy?token=' + TOKEN + '&order=101'})
+        fetch_result = plugin.fetch_deploy_url({'url': 'https://api.example.com/api/deploy?token=' + TOKEN + '&order=101'})
         session_id = fetch_result['data']['session_id']
 
-        with patch('sslbt_main.APIClient') as mock_api_cls:
-            mock_api = MagicMock()
-            mock_api.query_order.side_effect = [
-                {'status': 'active', 'domains': 'a.com'},
-                {'status': 'active', 'domains': 'b.com'},
-            ]
-            mock_api_cls.return_value = mock_api
-
-            r1 = plugin.add_cert({'order_id': '101', 'session_id': session_id, 'site_names': 'a.com'})
-            r2 = plugin.add_cert({'order_id': '102', 'session_id': session_id, 'site_names': 'b.com'})
-            assert r1['status'] is True
-            assert r2['status'] is True
+        r1 = plugin.add_cert({'order_id': '101', 'session_id': session_id, 'site_names': 'a.com'})
+        r2 = plugin.add_cert({'order_id': '102', 'session_id': session_id, 'site_names': 'b.com'})
+        assert r1['status'] is True
+        assert r2['status'] is True
 
     def test_expired_session(self, plugin):
         """过期 session_id 被拒绝"""
@@ -787,14 +773,15 @@ class TestFetchDeployUrl:
         assert 'sid-A' in loaded
         assert loaded['sid-A']['api_token'] == TOKEN
 
-    @patch('urllib.request.urlopen')
-    def test_api_error(self, mock_urlopen, plugin):
-        """API 返回错误"""
-        mock_resp = MagicMock()
-        mock_resp.read.return_value = json.dumps({'code': 0, 'msg': '认证失败'}).encode()
-        mock_urlopen.return_value = mock_resp
+    @patch('sslbt_main.APIClient')
+    def test_api_error(self, mock_api_cls, plugin):
+        """API 返回错误时透传"""
+        from lib.api_client import APIError
+        mock_api = MagicMock()
+        mock_api.query_batch.side_effect = APIError('认证失败')
+        mock_api_cls.return_value = mock_api
 
-        result = plugin.fetch_deploy_url({'url': 'https://api.example.com/deploy?token=abc&order=1'})
+        result = plugin.fetch_deploy_url({'url': 'https://api.example.com/api/deploy?token=' + TOKEN + '&order=1'})
         assert result['status'] is False
         assert '认证失败' in result['msg']
 

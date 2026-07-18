@@ -21,7 +21,7 @@ sslbt_main.py  ← 插件入口（控制器），宝塔面板调用
   ├─ site_manager.py    ← 宝塔站点管理 + 域名匹配（兼容新旧数据库分片）
   ├─ updater.py         ← 在线升级（releases.json 解析 + 安全下载 + 校验）
   ├─ cron.py            ← 宝塔计划任务（_BtParams + 直接查库 + 每天随机时间 + cron.log 轮转；AddCrontab 结果按「显式 False 判失败 + 入库反查」双重校验）
-  └─ logger.py          ← 日志（敏感信息过滤，MAX_LOG_FILES=90 自动清理）
+  └─ logger.py          ← 日志（对格式化后完整消息脱敏，覆盖 dict/list 参数，MAX_LOG_FILES=90 自动清理）
 index.html              ← 前端 UI（纯 JS，3 Tab: 证书管理/设置/日志）
 ```
 
@@ -91,7 +91,7 @@ Bearer Token 认证，部署链接格式：`https://domain/api/deploy?token=xxx&
 
 ```
 添加证书（用户粘贴部署链接）
-  fetch_deploy_url → 提取 token/order → GET ?order=xxx → 解析 domains（DNS+IP SAN） → 匹配站点 → add_cert
+  fetch_deploy_url → 提取 token/order → 经统一 APIClient(HTTPS 强制+SSRF+DNS Rebinding)query_batch → 解析 domains（DNS+IP SAN） → 匹配站点 → add_cert
 
 部署证书
   query_order → 检查 order_id 变更 → active: 取 cert/key/ca → 校验匹配 → pre-flight 配置检查 → 捕获原证书 → panelSite.SetSSL() → reload 校验（失败回滚） → callback
