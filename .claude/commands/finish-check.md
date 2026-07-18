@@ -2,6 +2,20 @@
 
 ---
 
+## 0. 检查范围
+
+先确定本次检查的 diff 范围，后续所有"审查改动"的步骤都以此范围为准：
+
+- **工作区模式**（默认）：改动尚未提交，范围是 `git diff` + `git diff --cached`。
+- **工作分支模式**：改动已按批次提交到特性分支，以基线分支（通常 `dev`）为对照：
+
+```bash
+git log --oneline <base>..HEAD    # 逐提交清单
+git diff <base>...HEAD            # 全量改动
+```
+
+分支模式还需逐提交检查：每个提交只含单一主题的相关文件；提交信息为 `type: 中文主题` + 2–10 条要点式 body；无任何 AI 署名。
+
 ## 1. 单元测试
 
 运行 `python3 -m pytest tests/ -v`，确认全部通过、无跳过、无警告。
@@ -11,6 +25,8 @@
 ## 2. Lint 检查
 
 运行 `python3 -m flake8 src/ --max-line-length=120 --exclude=__pycache__`，确认零告警。
+
+`tests/` 目录同样保持零告警：`python3 -m flake8 tests/ --max-line-length=120 --exclude=__pycache__`。
 
 注意本项目行宽限制是 **120**，不是默认 79。
 
@@ -49,15 +65,18 @@
 - 数据库查询（`sqlite3`）是否使用参数化查询，避免 SQL 注入
 - 站点名称匹配是否正确处理了通配符域名（`*.example.com`）
 - `site_name` 字段是否统一为列表格式（历史兼容：旧数据可能是字符串）
+- 站点清单查询失败（`SiteQueryError`）是否与"确认零站点"严格区分？**绝不能把查询失败当站点不存在**；解绑/清空绑定等破坏性操作不得基于单次失败探测
 
 ## 7. 续签逻辑边界检查
 
 如果修改了 `renew.py` 或相关续签流程：
 
-- Pull / Local 两种模式的天数常量是否正确（PULL=13, LOCAL=15, SERVER_AUTO=14）
-- CSR 超时判断是否使用 `CSR_PENDING_TIMEOUT_HOURS = 24`
+- 续签窗口是否由服务端主导（`renew_before_days`，默认 `RENEW_DEFAULT_DAYS = 14`，每次 API 交互回填），本地不得硬编码提前天数
 - 重试计数是否有上限保护（`MAX_ISSUE_RETRY_COUNT = 10`）
 - 证书过期判断是否用 UTC 时间，避免时区问题
+- 回调语义是否与 deploy-spec 一致（status 仅 success/failure/pending）？metadata 写入失败是否绝不回调 success？
+- 空/不可解析的 `cert_expires_at` 是否按"未知需处理"进入查询回填，而非静默跳过？
+- 对服务端的 HTTP 出口是否统一走 `APIClient`（HTTPS 强制 + SSRF 防线），无裸 urlopen？
 
 ## 8. Mock 模块同步
 
@@ -76,7 +95,7 @@
 
 ## 10. Git Diff 审查
 
-运行 `git diff` 和 `git diff --cached`，逐文件审查：
+按第 0 步确定的范围审查（工作区模式用 `git diff` + `git diff --cached`；工作分支模式用 `git diff <base>...HEAD` 并逐提交 `git show`），逐文件审查：
 
 - 是否有调试代码残留（`print()`、`breakpoint()`、`import pdb`）
 - 是否有被意外修改的文件（与本次任务无关的改动）
