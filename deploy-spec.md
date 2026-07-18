@@ -1,6 +1,6 @@
 # SSL 证书部署工具统一规范
 
-跨平台 SSL 证书自动部署工具的共通行为规范。定义配置文件结构、API 接口、续签状态机、一键部署、部署流程、升级协议、安装/卸载、安全规范和共享常量。
+跨平台 SSL 证书自动部署工具的共通行为规范。定义配置文件结构、API 接口、续签状态机、一键部署、部署流程、升级协议、构建发布、安装/卸载、安全规范、共享常量和智能体协作约定。
 
 适用项目：sslctl（Linux Nginx/Apache）、sslctlw（Windows IIS）、sslbt（宝塔面板）、sslnas（NAS 系统）及未来新平台实现。
 
@@ -543,6 +543,8 @@ GET {release_url}/releases.json
 | `version`              | 版本号（不带 v 前缀），目录名加 v 前缀（`v1.2.0`）    |
 | `released_at`          | 发布日期（YYYY-MM-DD）                                 |
 | `checksums`            | 按文件名索引的 SHA256 哈希，支持多平台产物              |
+| `source_commit`        | 可选；产物来源 Git commit，dev 发布必须记录             |
+| `dirty`                | 可选；产物是否包含未提交改动，dev 发布必须记录           |
 
 平台可在版本条目中增加扩展字段（如 sslctl 的 `signature`），与 `checksums` 同级。
 
@@ -629,8 +631,8 @@ GET {release_url}/releases.json
 各平台构建方式不同（Go binary / Python zip），但遵守统一约定：
 
 - **版本号注入**：构建时注入版本号（语义化版本 x.y.z），运行时可通过 `--version` 查看
-- **产物命名**：`{product}-{os}-{arch}.{ext}`，版本在目录路径 `{channel}/v{version}/` 中体现。单二进制产物仅 gz 压缩（如 `sslctl-linux-amd64.gz`），多文件产物使用 tar.gz 或 zip
-- **校验文件**：每个产物附带 SHA256 校验文件（`{filename}.sha256`）
+- **产物命名**：由各仓发布 skill 按平台安装与升级契约定义；同一平台和版本内必须稳定，版本统一在目录路径 `{channel}/v{version}/` 中体现，`checksums` 必须以实际公开文件名为 key
+- **完整性信息**：每个发布产物的 SHA256 必须写入 `releases.json` 对应版本条目的 `checksums`；不要求生成或上传独立 `.sha256` 文件，平台可按需额外提供
 
 ### 8.2 发布目录结构
 
@@ -654,18 +656,92 @@ GET {release_url}/releases.json
 
 ```
 1. 构建产物，注入版本号
-2. 生成 SHA256 校验文件
-3. 上传产物和校验文件到对应通道目录
-4. 更新 releases.json（追加版本、更新 latest 字段）
-5. 各平台可增加额外签名步骤（Ed25519、Authenticode 等）
+2. 计算所有产物的 SHA256；平台可增加额外签名步骤（Ed25519、Authenticode 等）
+3. 上传同一批产物到所有发布节点的对应通道目录
+4. 核对各节点产物数量、SHA256 和平台签名（如适用）
+5. 所有节点验证通过后更新 releases.json（追加或更新版本、更新 latest 字段）
 ```
+
+同一次发布中，各发布节点和 GitHub Release 上属于“规范正式资产集合”的产物必须来自同一次构建且字节一致，不得为不同目标分别重建；`releases.json.checksums` 必须与该资产集合的实际文件名和 SHA256 一致。平台如需 GitHub-only 附加资产，必须在本仓发布 skill 中明确列出，且不得替代规范正式资产。
 
 ### 8.4 releases.json 维护
 
 格式定义见 6.1 节。发布脚本负责：
 - 根据版本类型写入对应通道（正式版 → `main`，pre-release → `dev`）
-- 追加新版本条目（含 checksums、released_at）到对应通道 `versions` 首位，更新 `latest`
+- 追加或更新版本条目（含 checksums、released_at）到对应通道 `versions` 首位，更新 `latest`
 - 每通道保留最近 5 个版本条目，清理超出的旧条目及 `{channel}/v{version}/` 产物目录
+- 版本条目和 `latest` 均不带 `v` 前缀；发布目录、版本 Git tag 使用 `v{version}`
+- 通过同目录临时文件写入并原子替换 `releases.json`，避免中断产生半写文件
+
+`dev` 通道允许同一版本重复发布并覆盖原条目；`main` 通道版本不可覆盖，规则见 8.6 和 8.7。
+
+### 8.5 dev 测试版发布
+
+`dev` 用于真机验证和快速反馈，优先保证发布灵活性：
+
+- 版本号必须是带预发布段的 SemVer（如 `1.2.0-beta.1`、`1.2.0-rc.2`）
+- 可直接发布当前工作区快照，允许存在未提交改动
+- 不要求等待本地或 GitHub CI，不因当前 HEAD 已推送而增加 CI 门禁
+- 不提交、不推送、不合并、不切换分支，不改变 `main` / `dev` 引用
+- 不创建或移动任何 Git tag，不创建 GitHub Release
+- 允许同一版本重复发布；重新发布时覆盖该版本产物和索引条目，并刷新 `released_at`、`checksums` 和 `latest`
+- 版本条目必须写入 `source_commit` 和 `dirty`；工作区不干净时 `dirty` 必须为 `true`，明确该产物不完全对应 Git commit
+- 构建、签名（平台要求时）、上传、远端哈希或索引更新任一步失败，均不得报告发布成功
+
+dev 发布完成至少验证所有发布节点的版本目录可读、产物数量正确，且 `releases.json.dev.latest` 与实际产物 SHA256 一致。
+
+### 8.6 main 正式版发布
+
+`main` 用于可复现、可审计、不可变的正式发布。一个正式版本必须唯一对应一个 Git commit、一批确定的产物字节、一组 SHA256 和一个 GitHub Release。
+
+正式发布按以下顺序执行：
+
+1. 校验稳定 SemVer（不得含预发布段），且版本高于当前 `main.latest`
+2. 确认工作区干净，本地 `dev` 与 `origin/dev` 指向同一 commit
+3. 通过 `dev → main` Pull Request 发布；等待该仓发布 skill 明确列出且适用于该 PR commit 的 required checks 和 release gates 全部成功后合并
+4. 同步本地 `main`，确认本地 `main` 与 `origin/main` 指向合并后的同一 commit，且工作区仍干净
+5. 等待该仓发布 skill 明确列出且适用于该精确 `main` commit 的 required checks 和 release gates 全部成功
+6. 从该 commit 只构建一次正式产物，完成签名，生成绑定版本、commit、规范资产集合和 SHA256 的发布 manifest
+7. 将发布 manifest 和完整产物 bundle 持久保存到发布恢复期间不会被清理或重建的位置；将同一 bundle 暂存到所有发布节点并完成哈希与签名验证
+8. 创建并推送不可变版本 tag `v{version}`；tag 必须指向该 `main` commit
+9. 创建指向该 tag 和 commit 的 draft GitHub Release，从已保存 bundle 上传规范正式资产及平台声明的附加资产，并完成验收
+10. 使用已暂存内容原子更新各节点的 `releases.json.main`，发布 GitHub Release；完成全节点对账后，将唯一可移动的 `latest` Git tag 更新到 `v{version}`
+11. 将 `main` 以 fast-forward 方式同步回 `dev` 并推送，等待该仓发布 skill 明确列出且适用于该精确 `dev` commit 的 required checks 和 release gates 全部成功
+12. 执行 8.9 的最终验收；验收完成前不得清理发布 bundle，全部通过后才可宣布发布完成
+
+从 PR 合并开始到 `main` 同步回 `dev` 完成为正式发布窗口。该窗口内不得向 `dev` 添加新提交；如果 `dev` 已前进导致无法 fast-forward，必须停止收尾并处理分支差异，禁止通过 force-push 对齐。
+
+### 8.7 正式版本与 Git 引用不可变性
+
+- 初次发布前，`v{version}`、对应 GitHub Release 和 `main/v{version}/` 正式产物必须不存在
+- `v{version}` 一旦推送不得删除、移动或覆盖；正式产物和已发布 GitHub Release 资产同样不得替换
+- 发布脚本不得自动重建或移动已存在的版本 tag；发现 tag 指向其他 commit 必须立即失败
+- `latest` 是唯一允许移动的 Git tag，且只能指向已完成产物验收的稳定版本 tag
+- 正式 GitHub Release 必须非 draft、非 prerelease，标记为最新正式版，并包含该平台约定的全部正式发布资产；不要求附带独立 `.sha256` 文件
+- `releases.json.main.latest`、版本 tag 和 `latest` Git tag 表达不同层次的引用，但最终必须指向同一正式版本
+- 正式版本不得重复发布为不同 commit 或不同产物；需要修复时发布更高的新版本
+
+### 8.8 中断恢复与多节点一致性
+
+- 版本 tag 创建前失败：修复问题后可重新执行正式发布
+- 版本 tag 创建后失败：只允许读取并校验已持久保存的发布 manifest 和 bundle，从失败点以 upload-only/resume 方式恢复；禁止移动 tag、调用构建流程或用重建产物覆盖
+- 上传阶段先完成所有节点和 draft GitHub Release 资产暂存与哈希验证，再推进公开的 GitHub Release、版本索引和 `latest` 引用
+- 任一节点失败时不得宣布成功，也不得只让部分节点长期保留新的 `latest`；修复失败节点后重新执行全节点验收
+- GitHub Release、服务器索引或分支同步任一步失败时，保留已有不可变对象和发布 bundle，从失败点按相同 commit 和产物继续
+- 已完成的正式版本不得通过删除 tag、覆盖资产或回写同版本修复；回滚或修复使用更高版本
+
+### 8.9 正式版完成验收
+
+正式发布只有同时满足以下条件才算完成：
+
+- `dev → main` PR 已合并；本仓发布 skill 声明的适用 required checks 和 release gates 在 PR、合并后 `main`、回同步后 `dev` 三个阶段均成功，且均核对到对应的精确 commit
+- 本地与远端 `main`、本地与远端 `dev`、`v{version}`、`latest`、GitHub Release target 全部指向同一 commit
+- 工作区干净
+- 所有发布节点及统一公网入口的 `main.latest` 均等于本次版本（不带 `v` 前缀）
+- 所有发布节点和 GitHub Release 的规范正式资产集合完整且字节一致，SHA256 与 `releases.json.checksums` 一致；平台声明的 GitHub-only 附加资产也完整
+- GitHub Release 已公开，非 draft、非 prerelease，并标记为最新正式版
+- 产物内注入的版本号正确，平台要求的签名验证通过
+- 至少通过公网入口实际下载一个代表产物并完成 SHA256 校验
 
 ---
 
@@ -766,3 +842,100 @@ GET {release_url}/releases.json
 | 常量       | 值             | 说明                           |
 | ---------- | -------------- | ------------------------------ |
 | 通道白名单 | `main` / `dev` | 允许的升级通道值，防止路径遍历 |
+
+---
+
+## 12. 智能体配置与 Skill 组织
+
+### 12.1 项目级智能体配置
+
+- `AGENTS.md` 是项目级智能体规则的唯一入口和路由文件，适用于 Claude Code、Codex 及其他智能体；具体跨仓规范和领域工作流仍分别以 `deploy-spec.md` 和对应 skill 为权威来源
+- `CLAUDE.md` 是固定的 Claude 兼容入口，只引用 `AGENTS.md`，不得复制或维护独立规则
+- 两个文件均作为普通文件提交，不使用仓库内符号链接，避免 Windows checkout 兼容问题
+- `AGENTS.md` 保持精简，只包含项目定位、不可违反的项目规则、权威资料入口、核心构建/测试命令和平台边界
+- 目录结构、详细实现、发布步骤、检查清单、API 字段说明等内容写入对应 skill、专题文档或脚本，不堆积到 `AGENTS.md`
+- 工具私有的权限、hooks、MCP、插件和 UI 配置保留在各工具自己的配置文件中，不写入共享项目规则
+
+每个仓库的 `AGENTS.md` 必须用精简表述在自身包含以下“更新原则”：
+
+- 只记录长期有效、项目级、会影响智能体行为的规则；临时决策、调试记录、单一模块实现细节不得写入
+- 新增内容前先判断职责归属：跨仓公共行为写入 `deploy-spec.md`，领域知识和工作流写入对应叶子资源，`AGENTS.md` 只提供入口和不可违反的项目约束，不复制两者正文
+- 只直接维护 `AGENTS.md`；`CLAUDE.md` 始终保持固定薄入口，不在其中追加项目规则
+- 新增、删除或重命名 skill 时同步更新 `skills/SKILL.md` 及受影响的引用入口
+- 修改后删除失效或重复内容，并检查 `CLAUDE.md` 固定模板、skill 路由、引用路径和确定性防漂移门禁；未经明确需求不得新增全局约束
+
+`CLAUDE.md` 使用以下固定模板：
+
+```markdown
+# 项目智能体规则
+
+@AGENTS.md
+
+本文件仅为 Claude 兼容入口。禁止在此追加项目规则；需要调整时修改 `AGENTS.md` 或其引用的权威资料。
+```
+
+如果工具修改了 `CLAUDE.md`，不得直接将其内容覆盖到 `AGENTS.md`。应先审查改动：核心规则迁移到 `AGENTS.md`，详细规则迁移到对应 skill，工具私有内容迁移到工具配置，最后恢复固定模板。
+
+### 12.2 skills 目录
+
+`skills/` 使用扁平结构：
+
+```text
+skills/
+├── SKILL.md
+├── remote-release.md
+├── finish-check.md
+├── build-release.md
+└── ...
+```
+
+- `skills/SKILL.md` 是唯一可发现的 skill 入口和路由器；文件名使用标准大写形式，并包含工具要求的入口元数据
+- `SKILL.md` 只维护触发场景、路由规则和叶子文件路径，不承载领域实现细节；`AGENTS.md` 要求智能体在匹配任务中读取该入口及其选中的叶子资源
+- 其他文件是由根入口引用的叶子资源，直接存放在 `skills/` 根目录，不建立领域子目录；不宣称其可被 Claude、Codex 或其他工具原生独立发现
+- 叶子资源文件名统一使用 kebab-case（如 `build-release.md`、`iis-ops.md`），不得再使用 `<name>/SKILL.md` 结构
+- 每个叶子资源只维护一个清晰领域的知识或工作流；公共规则通过引用权威文档复用，不在多个资源中复制
+- `remote-release.md` 是本仓发布流程的唯一权威实现，必须遵守第 8 节，并可引用 `build-release.md` 中的平台构建、签名和产物细节
+- `finish-check.md` 维护本仓完成检查；工具命令不得复制其检查清单
+
+### 12.3 工具自定义指令
+
+- Claude、Codex 及其他工具的自定义指令只作为薄入口：引用一个对应 skill，并将用户参数原样转交
+- 参数校验、执行步骤、命令示例、安全门禁、失败恢复和验收规则全部维护在 skill 中，不得复制到工具指令
+- 同一语义的不同工具入口必须引用同一个 skill；工具仅可因参数占位符或入口格式不同保留最小适配内容
+- 工具不支持自定义指令时，直接通过 `skills/SKILL.md` 路由到对应 skill，不另建重复流程
+
+示例（具体参数占位符按工具语法调整）：
+
+```markdown
+读取并严格遵循 `skills/remote-release.md`。
+
+将用户参数原样作为版本参数传入该流程。
+```
+
+### 12.4 文档职责与优先级
+
+```text
+deploy-spec.md          跨仓统一行为规范
+AGENTS.md               项目核心规则与权威入口
+skills/SKILL.md         skill 路由索引
+skills/*.md             由根 Skill 路由的领域知识和可执行工作流资源
+工具自定义指令          skill 调用与参数适配
+```
+
+- 跨仓公共行为以 `deploy-spec.md` 为准，skill 不得静默改变其语义
+- 平台差异由各仓叶子资源实现；确需偏离公共规范时，必须先在 `deploy-spec.md` 的对应规则或平台豁免中明确记录，叶子资源只引用该豁免及原因
+- `AGENTS.md` 不复制 `deploy-spec.md` 或 skill 正文，只声明权威入口和项目级硬约束
+- 工具自定义指令不拥有业务规则，和 skill 冲突时以 skill 为准
+
+### 12.5 防漂移检查
+
+各仓 CI 必须执行可确定判定的本仓结构检查，`finish-check` 可在本地重复执行；跨仓一致性由统一的多仓同步或审计流程检查：
+
+- `CLAUDE.md` 与 12.1 的固定模板一致
+- `skills/` 下不存在二级 skill 目录，叶子文件名符合 kebab-case
+- `skills/SKILL.md` 中列出的叶子文件全部存在
+- 项目文档不再引用旧的 `skills/<name>/SKILL.md` 路径
+- 固定模板的工具自定义指令与预期模板哈希一致，并引用存在的对应叶子资源
+- 统一多仓流程检查四仓 `deploy-spec.md` 字节一致；单仓 CI 不拉取其他仓库的移动分支进行比较
+
+第 12 节描述四仓完成智能体配置同步后的目标状态。规范可先行同步；在单仓完成结构迁移前，不启用引用尚不存在文件的结构门禁。某仓完成迁移后，本节即成为该仓必须持续满足的现行约束。
