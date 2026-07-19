@@ -16,6 +16,14 @@ LOCAL_LOCK_HELD=false
 LOCK_OWNER=""
 LOCAL_LOCK_DIR=""
 
+file_mode() {
+    python3 -c "import os, sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777)[2:])" "$1"
+}
+
+sha256_stdin() {
+    python3 -c "import hashlib, sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())"
+}
+
 die() {
     echo "错误: $*" >&2
     if [ "${LOCKS_HELD:-false}" = true ]; then
@@ -98,7 +106,7 @@ verify_bundle() {
 canonical_index_hash() {
     local canonical
     canonical="$(python3 "$MANIFEST_TOOL" canonical --index "$1")"
-    printf '%s' "$canonical" | shasum -a 256 | cut -d' ' -f1
+    printf '%s' "$canonical" | sha256_stdin
 }
 
 seal_transaction() {
@@ -197,7 +205,7 @@ prepare_bundle() {
 load_config() {
     [ -f "$CONFIG_FILE" ] || die "缺少 $CONFIG_FILE"
     local config_mode
-    config_mode="$(stat -f '%Lp' "$CONFIG_FILE" 2>/dev/null || stat -c '%a' "$CONFIG_FILE")"
+    config_mode="$(file_mode "$CONFIG_FILE")"
     [ "$config_mode" = 600 ] || die "发布配置权限必须是 600"
     # shellcheck source=/dev/null
     source "$CONFIG_FILE"
@@ -208,7 +216,7 @@ load_config() {
     SSH_KEY="${SSH_KEY/#\~/$HOME}"
     [ -f "$SSH_KEY" ] || die "SSH 密钥不存在"
     local key_mode
-    key_mode="$(stat -f '%Lp' "$SSH_KEY" 2>/dev/null || stat -c '%a' "$SSH_KEY")"
+    key_mode="$(file_mode "$SSH_KEY")"
     [ "$key_mode" = 600 ] || die "SSH 密钥权限必须是 600"
 }
 
@@ -253,7 +261,7 @@ fetch_consistent_index() {
             > "$output" || die "无法读取 $SERVER_NAME 的 releases.json 基线"
         local canonical current_hash
         canonical="$(python3 "$MANIFEST_TOOL" canonical --index "$output")"
-        current_hash="$(printf '%s' "$canonical" | shasum -a 256 | cut -d' ' -f1)"
+        current_hash="$(printf '%s' "$canonical" | sha256_stdin)"
         if [ -z "$canonical_hash" ]; then
             canonical_hash="$current_hash"
             cp "$output" "$BUNDLE_DIR/releases-baseline.json"
@@ -337,7 +345,7 @@ remote_index_hash() {
         > "$tmp" || { rm -f "$tmp"; die "无法读取 $SERVER_NAME 的当前 releases.json"; }
     canonical="$(python3 "$MANIFEST_TOOL" canonical --index "$tmp")"
     rm -f "$tmp"
-    printf '%s' "$canonical" | shasum -a 256 | cut -d' ' -f1
+    printf '%s' "$canonical" | sha256_stdin
 }
 
 acquire_publish_locks() {

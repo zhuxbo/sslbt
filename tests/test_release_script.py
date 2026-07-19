@@ -52,7 +52,7 @@ cp "$previous" "${last#*:}"
     write_executable(bin_dir / 'sha256sum', r'''#!/usr/bin/env bash
 set -eu
 for path in "$@"; do
-    hash=$(shasum -a 256 "$path" | cut -d' ' -f1)
+    hash=$(python3 -c 'import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$path")
     printf '%s  %s\n' "$hash" "$path"
 done
 ''')
