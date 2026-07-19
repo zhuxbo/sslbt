@@ -2,7 +2,7 @@
 
 跨平台 SSL 证书自动部署工具的共通行为规范。定义配置文件结构、API 接口、续签状态机、一键部署、部署流程、升级协议、构建发布、安装/卸载、安全规范、共享常量和智能体协作约定。
 
-适用项目：sslctl（Linux Nginx/Apache）、sslctlw（Windows IIS）、sslbt（宝塔面板）、sslnas（NAS 系统）及未来新平台实现。
+适用项目：sslctl（Linux Nginx/Apache）、sslctlw（Windows IIS）、sslbt（宝塔面板）及未来新平台实现。
 
 ## 定位
 
@@ -61,6 +61,7 @@
 
 - IP 域名不可选 `delegation`（IP 无 DNS 记录，无法完成委托验证）
 - 通配符域名不可选 `file`（通配符无法指向具体站点放置验证文件）
+- SAN 含 IP 的证书在 setup 与续签时自动派生为 `renew_mode=local` + `validation_method=file`（见 §5.2）
 
 ### 1.4 api
 
@@ -78,10 +79,11 @@
 | `last_deploy_at`    | string | 最后部署时间（RFC3339）                                        |
 | `cert_expires_at`   | string | 证书过期时间（RFC3339）                                        |
 | `cert_serial`       | string | 证书序列号                                                     |
-| `csr_submitted_at`  | string | CSR 提交时间（仅 local 模式）                                  |
-| `last_csr_hash`     | string | 上次 CSR 的 SHA256 哈希                                        |
-| `last_issue_state`  | string | 签发状态：`""` / `processing` / 其他（异常状态，等待人工处理） |
-| `issue_retry_count` | int    | CSR 提交重试计数                                               |
+| `csr_submitted_at`     | string | CSR 提交时间（仅 local 模式）                                  |
+| `last_csr_hash`        | string | 上次 CSR 的 SHA256 哈希                                        |
+| `last_issue_state`     | string | 签发/生命周期状态：`""` / `processing` / `CAPPED`（触顶，记录阶段：签发/部署/legacy）/ `EXPIRED`（已过期静默）/ 其他异常（等待人工处理） |
+| `issue_retry_count`    | int    | 签发尝试计数（CSR 提交），`>= 10` 触顶                          |
+| `deploy_attempt_count` | int    | 部署尝试计数，`>= 10` 触顶；与签发计数分离，不从旧混合计数推断  |
 
 ### 1.6 扩展区约定
 
@@ -94,7 +96,6 @@
 | Nginx/Apache | 1:N       | 1:1       | `bindings[]`（按站点）        |
 | IIS          | 1:N       | 1:N       | `bind_rules[]`（按域名:端口） |
 | 宝塔         | 1:N       | 1:1       | `site_name[]`（站点名列表）   |
-| NAS          | 1:1       | 1:1       | 无（直接部署到 NAS 证书存储） |
 
 ### 1.7 配置文件迁移
 
@@ -213,6 +214,11 @@ GET /api/deploy?order={id1,id2,domain1,...}  （批量，逗号分隔，上限 1
 
 `certificate`、`ca_certificate`、`private_key`、`issued_at`、`expires_at` 仅在 `status=active` 时返回。
 
+状态语义：提交 CSR 的成功响应只会是 `pending` / `processing`（均表示服务端已收到 CSR）；查询订单在
+`processing` 与 `active` 之间可能出现短暂中间态 `approving`。客户端将 `pending` / `processing` /
+`approving` 统一归一为 `processing` 继续等待；`active` 之后的状态均为订单终态，客户端持久化后停止
+自动动作，等待人工处理。
+
 ### 2.5 file 结构
 
 | 字段      | 类型   | 说明             |
@@ -242,6 +248,13 @@ Content-Type: application/json
 `processing`（提交暂未完成时可能保持 `pending`），不会在本次请求中同步返回 `active`；客户端应在后续
 查询中等待状态变为 `active` 后再部署。
 
+服务端对重复提交的幂等由现有 Order/Action 状态机保证（订单已进入处理则不再创建新证书、不重复扣费）。客户端收到
+`pending` 或"已在处理"类响应时，统一归一为 `processing` 查询路径：只 GET 查询，不重复 POST，不增加计数，不重新生成
+CSR。
+
+服务端未接收提交（校验失败、订单状态不允许等）时返回错误信息而非状态：客户端按明确业务拒绝处理，清理在途
+pending 后停止。因此提交结果不确定（超时/断连/解析失败）后的恢复只需查询订单状态，无需重复 POST。
+
 ### 2.7 切换自动重签
 
 ```
@@ -265,18 +278,23 @@ POST /api/deploy/callback
 Content-Type: application/json
 ```
 
-请求体：
+请求体（四字段，协议零改动）：
 
 | 字段          | 类型   | 说明                  |
 | ------------- | ------ | --------------------- |
 | `order_id`    | int    | 订单 ID               |
 | `status`      | string | `success` / `failure` |
 | `deployed_at` | string | 部署时间（RFC3339）   |
-| `message`     | string | 可选，仅 `status=failure` 时携带失败原因摘要：客户端截断至 ≤256 字符并经敏感信息脱敏；服务端校验上限 500，超限整条被拒 |
+| `message`     | string | 可选，仅 `status=failure` 时携带失败原因摘要：客户端截断至 ≤256 字符并经敏感信息脱敏；服务端校验上限 500，超限整条被拒；第 10 次（最后一次）部署失败在 `message` 标注"已达重试上限" |
 
-响应 data 包含 `renew_before_days`。
+响应 data 包含 `recorded`（服务端已记录）与 `renew_before_days`。
 
-回调为非关键路径，失败仅记日志，不影响部署结果。
+回调契约：
+
+- 客户端只上报**部署结果**：每次部署成功与每次明确部署失败各尽力上报一次，不做次数筛选、不做节流。签发失败不上报（服务端自行记录），客户端仅记本地日志与本地计数。
+- 上报为非关键路径：传输失败仅由既有传输层重试（3 次退避）兜底，之后只记日志，不持久排队、不补发；无 outbox、无幂等 ID，允许缺行、偶发重复行、迟到行。
+- 回调所有权收敛到编排层：自动续签调用链的底层部署函数不得自行发送回调，只返回结构化结果，由编排层在部署结果原子落盘后统一发送一次；手动 `deploy` / `setup` 回调语义不变。
+- 触顶（计数 `>= 10`）、过期、policy 阻断路径不发送任何回调。
 
 ### 2.9 renew_before_days 的传递
 
@@ -298,14 +316,24 @@ Content-Type: application/json
 
 遍历证书列表，按以下条件跳过：
 
-| 条件                                   | 处理               |
-| -------------------------------------- | ------------------ |
-| `enabled = false`                      | 跳过               |
-| 已过期（剩余天数 < 0）                 | 跳过，等待人工处理 |
-| `issue_retry_count > 10`（local 模式） | 跳过，等待人工处理 |
-| 无 API 配置                            | 跳过               |
+| 条件                                            | 处理                                           |
+| ----------------------------------------------- | ---------------------------------------------- |
+| `enabled = false`                               | 跳过                                           |
+| 已过期（剩余时间 ≤ 0）                          | 静默终止并转 `EXPIRED`，仅留本地日志与人工入口 |
+| 剩余有效期 < 安全余量（默认 24 小时）           | 跳过，不启动新动作                             |
+| `last_issue_state = CAPPED`（已触顶）           | 跳过，等待人工处理                             |
+| `issue_retry_count >= 10`（签发触顶，local 模式）| 进入 `CAPPED`，跳过                            |
+| `deploy_attempt_count >= 10`（部署触顶）        | 进入 `CAPPED`，跳过                            |
+| 无 API 配置                                     | 跳过                                           |
 
-**核心原则：证书到期后不再自动发起任何操作，等待人工处理。**
+**核心原则：证书到期后不再自动发起任何操作，等待人工处理。触顶（任一计数 `>= 10`）与过期均静默终止，不启动新动作、不发送任何回调。**
+
+**计数与终止：**
+
+- 签发尝试（`issue_retry_count`，即 CSR 提交）与部署尝试（`deploy_attempt_count`）分别计数、各自上限 10 次；所有停止判断统一为 `count >= 10`，绝不出现第 11 次尝试。
+- 计数在"持久化一个新的逻辑尝试意图"时递增；同一尝试的崩溃恢复重放、传输层重试、GET 轮询、policy 阻断均不增加计数。
+- 任一阶段触顶后进入客户端本地 `CAPPED` 状态并记录触顶阶段（签发 / 部署 / legacy）：不再启动新动作、不发送任何回调，等待人工处理；证书到期后转 `EXPIRED`。
+- 证书绝对到期时间是自动动作的准入截止点：剩余有效期小于统一安全余量（默认 24 小时）时不再启动新动作；已过期证书静默终止。触顶与过期都不产生任何回调事件。
 
 ### 3.3 续签模式确定
 
@@ -332,20 +360,21 @@ effective_mode = cert.renew_mode || schedule.renew_mode
 检查 metadata.last_issue_state：
 
 == ""（初始/已完成）：
-  ├─ 剩余天数 ≤ renew_before_days → 提交新 CSR
-  │   ├─ 检查重试次数（> 10 → 停止，等待人工处理）
-  │   ├─ 生成 CSR（仅 CN，不含 SAN），保存私钥到 pending-keys/
-  │   ├─ 递增 issue_retry_count
+  ├─ 剩余有效期 ≤ renew_before_days 且 ≥ 安全余量 → 提交新 CSR
+  │   ├─ 检查签发计数（issue_retry_count >= 10 → 进入 CAPPED，停止，等待人工处理）
+  │   ├─ 生成 CSR（仅 CN，不含 SAN）
+  │   ├─ 网络请求前：原子持久化 pending key 与 CSR 哈希，并递增 issue_retry_count（计数 = 持久化一个新的逻辑尝试意图）
   │   ├─ POST /api/deploy 提交 CSR
-  │   └─ 响应 status=processing → 放置验证文件，标记 processing
-  └─ 剩余天数 > renew_before_days → 跳过
+  │   │   └─ 超时 / 断连 / 响应解析失败属"不确定结果"：保留 pending key 作为在途标记，下轮查询订单状态恢复，不重复 POST、不重新生成 CSR
+  │   └─ 响应 status=processing 或 pending → 归一为 processing，放置验证文件，标记 processing
+  └─ 剩余有效期 > renew_before_days → 跳过
 
 == "processing"（等待签发）：
-  ├─ 证书已过期 → 停止，等待人工处理
-  └─ 查询订单状态
+  ├─ 证书已过期或剩余不足安全余量 → 停止（EXPIRED / 等待人工处理），不再动作
+  └─ 查询订单状态（只 GET，不重复 POST，不增加计数）
       ├─ status=active → 读取 pending key，部署，清理
-      ├─ status=processing → 更新验证文件（如有新的），继续等待
-      └─ 其他异常状态 → 持久化实际状态到 `last_issue_state`，停止，等待人工处理
+      ├─ status=processing / pending / approving → 归一为 processing，更新验证文件（如有新的），继续等待
+      └─ 其他状态（订单终态）→ 持久化实际状态到 `last_issue_state`，停止，等待人工处理；后续轮次仍可查询自愈，但状态未变化时不重复记录/落盘
 ```
 
 ### 3.6 文件验证流程（local 模式）
@@ -361,8 +390,6 @@ effective_mode = cert.renew_mode || schedule.renew_mode
 5. 部署成功后自动清理所有验证文件
 ```
 
-**平台豁免**：NAS 平台（sslnas）豁免此流程。NAS 通常部署在家庭宽带环境，80/443 端口不通，无法完成 HTTP 文件验证。遇到 `file` 字段时记录警告日志并跳过。NAS 的 local 模式应使用 `delegation`（DNS 委托）验证。
-
 ### 3.7 并发执行保护
 
 防止多个进程同时执行续签（cron 重叠、手动与自动并发）：
@@ -374,9 +401,9 @@ effective_mode = cert.renew_mode || schedule.renew_mode
 ### 3.8 部署成功后
 
 1. 更新 metadata：`last_deploy_at`、`cert_expires_at`、`cert_serial`
-2. 清零 CSR 状态：`csr_submitted_at`、`last_csr_hash`、`issue_retry_count`、`last_issue_state`
+2. 清零签发与部署状态：`csr_submitted_at`、`last_csr_hash`、`issue_retry_count`、`deploy_attempt_count`、`last_issue_state`
 3. 清理 pending key 和验证文件
-4. 发送回调 `POST /api/deploy/callback`（非关键路径）
+4. 由编排层在结果原子落盘后统一发送 `success` 回调 `POST /api/deploy/callback`（非关键路径，底层部署函数不自行发送）
 
 ---
 
@@ -398,7 +425,7 @@ effective_mode = cert.renew_mode || schedule.renew_mode
 1. 查询证书信息（GET /api/deploy?order=...）
 2. 检测/匹配站点（平台特定扩展点）
 3. 部署证书到匹配的站点
-4. 设置续签模式（调用 toggleAutoReissue）
+4. 按证书派生续签模式并设置 `auto_reissue`（SAN 含 IP 的证书强制 local/file，见 §5.2；调用 toggleAutoReissue）
 5. 写入配置文件（api、domains、metadata 等）
 6. 注册守护服务/计划任务（平台特定扩展点）
 ```
@@ -420,6 +447,8 @@ effective_mode = cert.renew_mode || schedule.renew_mode
 6. 发送部署回调
 ```
 
+自动续签路径：部署尝试在持久化新的部署意图时递增 `deploy_attempt_count`（`>= 10` 触顶进入 `CAPPED`，崩溃恢复重放同一意图不增计数）；底层部署函数只返回结构化结果，由编排层在结果原子落盘后统一发送回调。手动 `deploy` / `setup` 的回调语义不变。
+
 ### 5.2 续签模式与 API 侧行为
 
 | 模式    | API 自动重签                 | 续签发起方             |
@@ -427,7 +456,11 @@ effective_mode = cert.renew_mode || schedule.renew_mode
 | `pull`  | 开启（`auto_reissue=true`）  | 服务端签发，客户端拉取 |
 | `local` | 关闭（`auto_reissue=false`） | 客户端生成 CSR 提交    |
 
-首次部署时调用 `toggleAutoReissue` 接口设置。
+首次部署时调用 `toggleAutoReissue` 接口按模式设置 `auto_reissue`：local 关闭（防服务端 scheduler 抢跑生成服务端私钥），pull 开启；不自动开启付费的 `auto_renew`。
+
+**IP 证书自动 local/file**：SAN 含 IP 的证书在 setup 与续签时自动进入 `renew_mode=local`、`validation_method=file` 并提交 CSR；`pull` 模式不携带 CSR。批量 setup 逐证书派生模式，DNS 证书不受混合批次影响；IP 与通配符不能同时提交的限制沿用服务端现有校验。三平台（Linux / Windows / 宝塔）均支持 IP local/file。
+
+旧的非法 IP 配置（IP + `pull` 或 IP + `delegation`）进入 `policy_blocked_needs_setup`：不自动改配置、不计数、不回调，等待重新 setup。
 
 ### 5.3 私钥来源
 
@@ -450,7 +483,7 @@ effective_mode = cert.renew_mode || schedule.renew_mode
 - `query` 响应中 `order_id` 与本地不同时
 - `update`（CSR 提交）响应中返回新 `order_id` 时
 
-检测到变更后立即更新本地配置中的 `order_id`，保持证书关联不断。
+检测到变更后立即更新本地配置中的 `order_id`，并同步迁移证书配置与 `pending-keys/` 目录（按证书名/订单键改名，无 pending 私钥时为空操作），保持证书关联与在途 CSR 私钥不断。
 
 ### 5.5 部署后域名提取
 
@@ -786,7 +819,7 @@ dev 发布完成至少验证所有发布节点的版本目录可读、产物数�
 
 - **证书验证**：部署前验证证书格式、有效性、证书与私钥匹配
 - **中间证书必需**：API 部署时必须包含中间证书，缺失则拒绝部署
-- **私钥保护**：私钥写入使用原子操作，local 模式下新私钥先存 pending-keys/，证书私钥配对校验通过且部署成功后再移到正式位置（与 3.8 一致；配对校验失败时保留 pending key，线上私钥不受影响）
+- **私钥保护**：私钥写入使用原子操作，local 模式下新私钥先存 pending-keys/，证书私钥配对校验通过且部署成功后再移到正式位置（与 3.8 一致；配对校验失败时保留 pending key，线上私钥不受影响）。POST 超时 / 断连 / 响应解析失败等不确定结果保留 pending key 作为在途标记，下轮查询订单状态恢复（不重复 POST）；仅在明确业务拒绝且确认未创建新证书、或签发部署完成后才清理 pending key
 - **大小限制**：私钥 ≤ 16 KB，证书链 ≤ 64 KB，超过则拒绝
 
 ### 10.4 日志与敏感信息
@@ -811,7 +844,8 @@ dev 发布完成至少验证所有发布节点的版本目录可读、产物数�
 | ---------------- | --- | --------------------------------------------------------------- |
 | 默认提前续签天数 | 14  | `schedule.renew_before_days` 初始值，后续由 API 返回值覆写      |
 | 提前续签天数上限 | 30  | 无论续费或重签都应在到期前 30 天内，超限拒绝并保留本地现值（见 2.9） |
-| CSR 最大重试次数 | 10  | local 模式 CSR 提交失败的上限，每天一次，超过后停止等待人工处理 |
+| 签发/部署尝试上限 | 10  | 签发（CSR 提交，`issue_retry_count`）与部署（`deploy_attempt_count`）分别计数，各自 `>= 10` 触顶后进入 `CAPPED` 停止，等待人工处理 |
+| 自动动作安全余量 | 24 小时 | 证书剩余有效期小于该值时不再启动新的签发/部署动作 |
 | 单次续签批量上限 | 100 | 单次续签检查最多处理的证书数量，防止长时间阻塞                  |
 
 ### 分散延迟
@@ -936,6 +970,6 @@ skills/*.md             由根 Skill 路由的领域知识和可执行工作流�
 - `skills/SKILL.md` 中列出的叶子文件全部存在
 - 项目文档不再引用旧的 `skills/<name>/SKILL.md` 路径
 - 固定模板的工具自定义指令与预期模板哈希一致，并引用存在的对应叶子资源
-- 统一多仓流程检查四仓 `deploy-spec.md` 字节一致；单仓 CI 不拉取其他仓库的移动分支进行比较
+- 统一多仓流程检查四仓（`ssl-manager`、`sslctl`、`sslctlw`、`sslbt`）`deploy-spec.md` 字节一致；单仓 CI 不拉取其他仓库的移动分支进行比较
 
 第 12 节描述四仓完成智能体配置同步后的目标状态。规范可先行同步；在单仓完成结构迁移前，不启用引用尚不存在文件的结构门禁。某仓完成迁移后，本节即成为该仓必须持续满足的现行约束。

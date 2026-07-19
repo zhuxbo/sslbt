@@ -1007,6 +1007,66 @@ class TestSiteQueryFailureNoUnbind:
         assert config.get_cert(12345)['site_name'] == ['s1.com']
 
 
+class TestSendCallbackFlag:
+    """send_callback：手动路径默认发回调（语义不变）；自动续签编排层传 False 抑制底层回调"""
+
+    @staticmethod
+    def _make(tmp_data_dir):
+        config = ConfigManager(tmp_data_dir)
+        api = MagicMock()
+        api.callback.return_value = {'code': 1}
+        return Deployer(config, api, MagicMock()), api, config
+
+    @staticmethod
+    def _mock_ok(mock_cert_utils):
+        mock_cert_utils.validate_cert_pem.return_value = (True, '')
+        mock_cert_utils.validate_key_pem.return_value = (True, '')
+        mock_cert_utils.verify_cert_key_match.return_value = True
+        mock_cert_utils.parse_cert_info.return_value = {'not_after': _FUTURE_EXPIRY, 'serial': 'X'}
+
+    @patch('lib.deployer.cert_utils')
+    @patch('lib.deployer.Deployer._set_ssl')
+    def test_suppressed_on_success_but_clears_counts(self, mock_set_ssl, mock_cert_utils, tmp_data_dir):
+        """send_callback=False：不发回调，但成功仍清零签发与部署计数（deploy-spec §3.8）"""
+        deployer, api, config = self._make(tmp_data_dir)
+        self._mock_ok(mock_cert_utils)
+        mock_set_ssl.return_value = {'status': True}
+        config.add_cert(12345, 'test', ['a.com'], site_names=['s1'])
+        config.update_metadata(12345, {'issue_retry_count': 4, 'deploy_attempt_count': 3,
+                                       'deploy_started': True})
+        results = deployer.deploy_multi(['s1'], 'cert', 'key', order_id=12345, send_callback=False)
+        assert results[0]['status'] is True
+        api.callback.assert_not_called()
+        meta = config.get_cert(12345)['metadata']
+        assert meta['deploy_attempt_count'] == 0
+        assert meta['deploy_started'] is False
+        assert meta['issue_retry_count'] == 0
+
+    @patch('lib.deployer.cert_utils')
+    @patch('lib.deployer.Deployer._set_ssl')
+    def test_suppressed_on_failure(self, mock_set_ssl, mock_cert_utils, tmp_data_dir):
+        """send_callback=False：部署失败也不发底层回调（由编排层发）"""
+        deployer, api, config = self._make(tmp_data_dir)
+        self._mock_ok(mock_cert_utils)
+        mock_set_ssl.side_effect = Exception('boom')
+        config.add_cert(12345, 'test', ['a.com'], site_names=['s1'])
+        results = deployer.deploy_multi(['s1'], 'cert', 'key', order_id=12345, send_callback=False)
+        assert results[0]['status'] is False
+        api.callback.assert_not_called()
+
+    @patch('lib.deployer.cert_utils')
+    @patch('lib.deployer.Deployer._set_ssl')
+    def test_default_still_sends_callback(self, mock_set_ssl, mock_cert_utils, tmp_data_dir):
+        """默认 send_callback=True（手动 deploy/setup 路径）语义不变，底层仍发回调"""
+        deployer, api, config = self._make(tmp_data_dir)
+        self._mock_ok(mock_cert_utils)
+        mock_set_ssl.return_value = {'status': True}
+        config.add_cert(12345, 'test', ['a.com'], site_names=['s1'])
+        deployer.deploy_multi(['s1'], 'cert', 'key', order_id=12345)
+        api.callback.assert_called_once()
+        assert api.callback.call_args.kwargs['status'] == 'success'
+
+
 class TestDeployError:
     def test_error_attributes(self):
         err = DeployError('test error', phase='validate', retryable=True)

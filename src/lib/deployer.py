@@ -71,8 +71,12 @@ class Deployer:
         self._site_manager = site_manager
 
     def deploy_multi(self, site_names, fullchain_pem, key_pem, order_id=None,
-                     domains=None, api_client=None):
+                     domains=None, api_client=None, send_callback=True):
         """部署证书到多个站点，逐一执行，部分失败不中断
+
+        send_callback：手动 deploy/setup 路径为 True（底层自行发回调，语义不变）；自动续签
+        编排层传 False——底层只返回结构化结果、不自行发回调，由编排层在结果落盘后统一发送
+        （deploy-spec §2.8/§5.1）。
 
         Returns: [{'site_name': str, 'status': bool, 'message': str}]
         """
@@ -121,12 +125,15 @@ class Deployer:
             if not cert_info or not cert_info.get('not_after'):
                 meta_error = '证书解析失败，无法记录到期时间'
             else:
+                # 部署成功清零签发与部署状态（deploy-spec §3.8）
                 meta = {
                     'last_deploy_at': now,
                     'cert_expires_at': cert_info['not_after'].strftime('%Y-%m-%dT%H:%M:%SZ'),
                     'cert_serial': cert_info.get('serial', ''),
                     'last_issue_state': '',
                     'issue_retry_count': 0,
+                    'deploy_attempt_count': 0,
+                    'deploy_started': False,
                     'csr_submitted_at': '',
                     'last_csr_hash': '',
                 }
@@ -155,8 +162,9 @@ class Deployer:
                             'site_missing': True})
 
         # 发送部署回调（任一站点失败或 metadata 未落盘即 failure，附各失败原因）
+        # send_callback=False 时底层不发（自动续签编排层在结果落盘后统一发送）
         cb_api = api_client or self._api
-        if order_id and cb_api:
+        if send_callback and order_id and cb_api:
             all_success = all(r['status'] for r in results)
             fail_parts = [
                 '%s: %s' % (r['site_name'], r['message'])

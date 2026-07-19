@@ -490,8 +490,8 @@ class TestUpdateCertConfig:
         })
         assert result['status'] is False
 
-    def test_update_validation_method_ip_rejects_delegation(self, plugin):
-        """IP 域名拒绝 delegation 验证"""
+    def test_update_validation_method_ip_derives_file(self, plugin):
+        """IP 域名自动派生为 local/file（覆盖非法入参 delegation，spec §5.2）"""
         plugin._config.add_cert(order_id=506, cert_name='test', domains=['1.2.3.4'],
                                 api_url='https://api.example.com', api_token=TOKEN)
         result = plugin.update_cert_config({
@@ -499,7 +499,10 @@ class TestUpdateCertConfig:
             'renew_mode': 'local',
             'validation_method': 'delegation',
         })
-        assert result['status'] is False
+        assert result['status'] is True
+        cert = plugin._config.get_cert(506)
+        assert cert['renew_mode'] == 'local'
+        assert cert['validation_method'] == 'file'
 
 
 class TestGetSiteMatches:
@@ -1306,3 +1309,107 @@ class TestBatchSetValidationMethod:
         """无效验证方式被拒绝"""
         result = plugin.batch_set_validation_method({'validation_method': 'invalid'})
         assert result['status'] is False
+
+
+class TestAddCertPolicyDerive:
+    """add_cert 策略派生（SAN 含 IP 强制 local/file）与 auto_reissue（local 关/pull 开）"""
+
+    @patch('sslbt_main.CronManager')
+    @patch('sslbt_main.APIClient')
+    def test_ip_cert_derives_local_file_auto_reissue_off(self, mock_api_cls, mock_cron_cls, plugin):
+        """SAN 含 IP：即使请求 pull 也派生为 local/file，auto_reissue 关闭"""
+        mock_api = MagicMock()
+        mock_api.query_order.return_value = {'status': 'active', 'domains': '1.2.3.4'}
+        mock_api_cls.return_value = mock_api
+        mock_cron = MagicMock()
+        mock_cron.get_status.return_value = {'exists': True}
+        mock_cron_cls.return_value = mock_cron
+        result = plugin.add_cert({
+            'order_id': '1000', 'api_url': 'https://api.example.com', 'api_token': TOKEN,
+            'renew_mode': 'pull',
+        })
+        assert result['status'] is True
+        cert = plugin._config.get_cert(1000)
+        assert cert['renew_mode'] == 'local'
+        assert cert['validation_method'] == 'file'
+        mock_api.toggle_auto_reissue.assert_called_once_with(1000, False)
+
+    @patch('sslbt_main.CronManager')
+    @patch('sslbt_main.APIClient')
+    def test_dns_pull_auto_reissue_on(self, mock_api_cls, mock_cron_cls, plugin):
+        """DNS + pull：保持 pull，auto_reissue 开启"""
+        mock_api = MagicMock()
+        mock_api.query_order.return_value = {'status': 'active', 'domains': 'a.example.com'}
+        mock_api_cls.return_value = mock_api
+        mock_cron = MagicMock()
+        mock_cron.get_status.return_value = {'exists': True}
+        mock_cron_cls.return_value = mock_cron
+        result = plugin.add_cert({
+            'order_id': '1001', 'api_url': 'https://api.example.com', 'api_token': TOKEN,
+            'renew_mode': 'pull',
+        })
+        assert result['status'] is True
+        assert plugin._config.get_cert(1001)['renew_mode'] == 'pull'
+        mock_api.toggle_auto_reissue.assert_called_once_with(1001, True)
+
+
+class TestBatchSetRenewPolicy:
+    """批量续签策略：一次原子后端操作、逐证书派生，DNS 不受混合批次影响"""
+
+    def _add(self, plugin, order_id, name, domains):
+        plugin._config.add_cert(order_id=order_id, cert_name=name, domains=domains,
+                                api_url='https://api.example.com', api_token=TOKEN)
+
+    def test_mixed_batch_per_cert_derivation(self, plugin):
+        """混合批次：DNS→local/file，IP→强制 local/file，wildcard+file 跳过（逐证书派生）"""
+        self._add(plugin, 800, 'dns', ['a.example.com'])
+        self._add(plugin, 801, 'ip', ['1.2.3.4'])
+        self._add(plugin, 802, 'wild', ['*.example.com'])
+        result = plugin.batch_set_renew_policy({'renew_mode': 'local', 'validation_method': 'file'})
+        assert result['status'] is True
+        dns = plugin._config.get_cert(800)
+        assert dns['renew_mode'] == 'local' and dns['validation_method'] == 'file'
+        ip = plugin._config.get_cert(801)
+        assert ip['renew_mode'] == 'local' and ip['validation_method'] == 'file'
+        wild = plugin._config.get_cert(802)
+        assert wild.get('validation_method', '') != 'file'  # 通配符+file 不兼容，跳过
+        assert '跳过' in result['msg']
+
+    def test_pull_batch_ip_still_local(self, plugin):
+        """批次设为 pull：DNS→pull，IP 证书仍独立派生 local/file，不受混合批次影响"""
+        self._add(plugin, 810, 'dns', ['a.example.com'])
+        self._add(plugin, 811, 'ip', ['1.2.3.4'])
+        result = plugin.batch_set_renew_policy({'renew_mode': 'pull'})
+        assert result['status'] is True
+        assert plugin._config.get_cert(810)['renew_mode'] == 'pull'
+        ip = plugin._config.get_cert(811)
+        assert ip['renew_mode'] == 'local'
+        assert ip['validation_method'] == 'file'
+
+    def test_clears_policy_blocked(self, plugin):
+        """重新设置合法策略清除 policy_blocked 终态"""
+        self._add(plugin, 820, 'ip', ['1.2.3.4'])
+        plugin._config.update_metadata(820, {'last_issue_state': 'policy_blocked_needs_setup'})
+        plugin.batch_set_renew_policy({'renew_mode': 'local', 'validation_method': 'file'})
+        assert plugin._config.get_cert(820)['metadata']['last_issue_state'] == ''
+
+    def test_invalid_mode(self, plugin):
+        assert plugin.batch_set_renew_policy({'renew_mode': 'invalid'})['status'] is False
+
+    def test_local_requires_validation(self, plugin):
+        assert plugin.batch_set_renew_policy({'renew_mode': 'local'})['status'] is False
+
+
+class TestUpdateClearsPolicyBlocked:
+    def test_edit_ip_to_local_file_clears_block(self, plugin):
+        """编辑 policy_blocked 的 IP 证书为 local/file → 派生并清除阻断终态"""
+        plugin._config.add_cert(order_id=530, cert_name='ip', domains=['1.2.3.4'],
+                                api_url='https://api.example.com', api_token=TOKEN)
+        plugin._config.update_metadata(530, {'last_issue_state': 'policy_blocked_needs_setup'})
+        result = plugin.update_cert_config({
+            'order_id': '530', 'renew_mode': 'local', 'validation_method': 'file'})
+        assert result['status'] is True
+        cert = plugin._config.get_cert(530)
+        assert cert['renew_mode'] == 'local'
+        assert cert['validation_method'] == 'file'
+        assert cert['metadata']['last_issue_state'] == ''

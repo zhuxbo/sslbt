@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 from lib.config import ConfigManager
 from lib.renew import (
     RenewEngine, needs_renewal,
-    RENEW_DEFAULT_DAYS, MAX_ISSUE_RETRY_COUNT,
+    RENEW_DEFAULT_DAYS, MAX_ISSUE_RETRY_COUNT, MAX_DEPLOY_ATTEMPT_COUNT,
     RENEW_SLEEP_MIN, RENEW_SLEEP_MAX, SPREAD_TOTAL_MAX,
     MAX_RENEW_BATCH,
 )
@@ -100,7 +100,12 @@ class TestRenewEngine:
             'private_key': '---KEY---',
         }
         cert = _make_cert_entry(10)
-        result = engine._renew_pull(cert, engine._mock_api)
+        engine._config.add_cert(
+            order_id=cert['order_id'], cert_name=cert['cert_name'],
+            domains=cert['domains'], site_names=cert['site_name'],
+        )
+        engine._config.update_metadata(cert['order_id'], cert['metadata'])
+        result = engine._renew_pull(engine._config.get_cert(cert['order_id']), engine._mock_api)
         assert result is True
         engine._deployer.deploy_multi.assert_called_once()
 
@@ -240,27 +245,34 @@ class TestRenewEngine:
         assert 'last_run' in data
         assert (os.stat(status_path).st_mode & 0o777) == 0o600
 
-    def test_retry_count_limit(self, engine):
-        """retry_count > MAX_ISSUE_RETRY_COUNT 时拒绝（spec 3.2: > 10）"""
-        cert = _make_cert_entry(10, renew_mode='local', retry_count=MAX_ISSUE_RETRY_COUNT + 1)
-        with pytest.raises(RuntimeError, match='上限'):
-            engine._renew_local(cert, engine._mock_api)
-
-    @patch('lib.renew.cert_utils.generate_csr')
-    def test_retry_count_at_limit_still_allowed(self, mock_csr, engine, tmp_data_dir):
-        """retry_count == MAX_ISSUE_RETRY_COUNT 时仍允许一次（spec: > 10 才停止）"""
-        mock_csr.return_value = ('CSR-PEM', 'KEY-PEM', 'hash123')
-        engine._mock_api.submit_csr.return_value = {'status': 'processing'}
+    def test_issue_count_at_cap_enters_capped(self, engine, tmp_data_dir):
+        """签发计数 >= 10（第 10 次后）：进入 CAPPED(issue) 静默，不提交、无第 11 次（spec §3.2）"""
         cert = _make_cert_entry(10, renew_mode='local', retry_count=MAX_ISSUE_RETRY_COUNT)
         engine._config.add_cert(
-            order_id=cert['order_id'],
-            cert_name=cert['cert_name'],
-            domains=cert['domains'],
-            site_names=cert['site_name'],
-        )
+            order_id=cert['order_id'], cert_name=cert['cert_name'],
+            domains=cert['domains'], site_names=cert['site_name'], renew_mode='local')
         engine._config.update_metadata(cert['order_id'], cert['metadata'])
-        # 不应抛出异常
-        engine._renew_local(cert, engine._mock_api)
+        result = engine._renew_local(engine._config.get_cert(cert['order_id']), engine._mock_api)
+        assert result is False
+        engine._mock_api.submit_csr.assert_not_called()
+        meta = engine._config.get_cert(cert['order_id'])['metadata']
+        assert meta['last_issue_state'] == 'CAPPED'
+        assert meta['cap_stage'] == 'issue'
+
+    @patch('lib.renew.cert_utils.generate_csr')
+    def test_issue_count_below_cap_still_submits(self, mock_csr, engine, tmp_data_dir):
+        """签发计数 = 9（< 10）：仍允许提交第 10 次，提交后计数递增为 10（spec: >= 10 才停止）"""
+        mock_csr.return_value = ('CSR-PEM', 'KEY-PEM', 'hash123')
+        engine._mock_api.submit_csr.return_value = {'status': 'processing'}
+        cert = _make_cert_entry(10, renew_mode='local', retry_count=MAX_ISSUE_RETRY_COUNT - 1)
+        engine._config.add_cert(
+            order_id=cert['order_id'], cert_name=cert['cert_name'],
+            domains=cert['domains'], site_names=cert['site_name'], renew_mode='local')
+        engine._config.update_metadata(cert['order_id'], cert['metadata'])
+        result = engine._renew_local(engine._config.get_cert(cert['order_id']), engine._mock_api)
+        assert result is False
+        engine._mock_api.submit_csr.assert_called_once()
+        assert engine._config.get_cert(cert['order_id'])['metadata']['issue_retry_count'] == 10
 
     @patch('lib.renew.cert_utils.generate_csr')
     def test_local_submit_csr(self, mock_csr, engine, tmp_data_dir):
@@ -330,21 +342,26 @@ class TestRenewEngine:
         engine._mock_api.submit_csr.assert_not_called()
 
     @patch('lib.renew.cert_utils.generate_csr')
-    def test_local_submit_csr_ip_rejects_delegation(self, mock_csr, engine, tmp_data_dir):
-        """Local 模式：IP 域名拒绝 delegation 验证"""
+    def test_local_submit_csr_ip_derives_file(self, mock_csr, engine, tmp_data_dir):
+        """Local 模式：IP 域名自动派生 file 验证并提交（覆盖入参 delegation，spec §5.2）"""
         mock_csr.return_value = ('CSR-PEM', 'KEY-PEM', 'hash123')
+        engine._mock_api.submit_csr.return_value = {'status': 'processing'}
         cert = _make_cert_entry(10, renew_mode='local')
         cert['domains'] = ['1.2.3.4']
-        cert['validation_method'] = 'delegation'
+        cert['validation_method'] = 'delegation'  # 非法组合，应被派生覆盖为 file
         engine._config.add_cert(
             order_id=cert['order_id'],
             cert_name=cert['cert_name'],
             domains=cert['domains'],
             site_names=cert['site_name'],
+            renew_mode='local',
         )
-        with pytest.raises(RuntimeError, match='IP'):
-            engine._submit_new_csr(cert, engine._mock_api)
-        assert not os.path.exists(engine._pending_key_path(cert))
+        engine._submit_new_csr(cert, engine._mock_api)
+        engine._mock_api.submit_csr.assert_called_once()
+        call = engine._mock_api.submit_csr.call_args
+        submitted_vm = call[1].get('validation_method') if call[1].get('validation_method') is not None \
+            else (call[0][3] if len(call[0]) > 3 else None)
+        assert submitted_vm == 'file'
 
     def test_local_handle_processing_active(self, engine, tmp_data_dir):
         """Local 模式：processing → active → 部署"""
@@ -394,21 +411,23 @@ class TestRenewEngine:
         # 仍然查询 API（无超时逻辑）
         engine._mock_api.query_order.assert_called_once()
 
-    def test_retry_count_no_auto_reset(self, engine, tmp_data_dir):
-        """重试次数超限后等待人工处理，不自动重置"""
-        cert = _make_cert_entry(10, renew_mode='local', retry_count=MAX_ISSUE_RETRY_COUNT + 1)
+    def test_issue_cap_no_auto_reset(self, engine, tmp_data_dir):
+        """签发触顶后进入 CAPPED 静默等待人工，不自动重置计数、不提交、不发回调"""
+        cert = _make_cert_entry(10, renew_mode='local', retry_count=MAX_ISSUE_RETRY_COUNT)
         engine._config.add_cert(
-            order_id=cert['order_id'],
-            cert_name=cert['cert_name'],
-            domains=cert['domains'],
-            site_names=cert['site_name'],
-        )
-        # 超过上限直接抛出，不自动重置
-        with pytest.raises(RuntimeError, match='上限'):
-            engine._renew_local(cert, engine._mock_api)
+            order_id=cert['order_id'], cert_name=cert['cert_name'],
+            domains=cert['domains'], site_names=cert['site_name'], renew_mode='local')
+        engine._config.update_metadata(cert['order_id'], cert['metadata'])
+        result = engine._renew_local(engine._config.get_cert(cert['order_id']), engine._mock_api)
+        assert result is False
+        meta = engine._config.get_cert(cert['order_id'])['metadata']
+        assert meta['issue_retry_count'] == MAX_ISSUE_RETRY_COUNT  # 未自动重置
+        assert meta['last_issue_state'] == 'CAPPED'
+        engine._mock_api.submit_csr.assert_not_called()
+        engine._mock_api.callback.assert_not_called()
 
-    def test_front_filter_skips_retry_exceeded(self, tmp_data_dir):
-        """前置过滤阶段跳过 local 模式重试超限的证书（spec 3.2）"""
+    def test_front_filter_caps_issue_retry_exceeded(self, tmp_data_dir):
+        """前置过滤：local 签发计数 >= 10 → 进入 CAPPED(issue) 静默跳过，不建 API、不发回调（spec §3.2）"""
         config = ConfigManager(tmp_data_dir)
         mock_api = MagicMock()
         api_factory = MagicMock(return_value=mock_api)
@@ -416,7 +435,7 @@ class TestRenewEngine:
         logger = MagicMock()
         engine = RenewEngine(config, api_factory, deployer, logger)
 
-        cert = _make_cert_entry(10, renew_mode='local', retry_count=MAX_ISSUE_RETRY_COUNT + 1)
+        cert = _make_cert_entry(10, renew_mode='local', retry_count=MAX_ISSUE_RETRY_COUNT)
         config.add_cert(
             order_id=cert['order_id'],
             cert_name=cert['cert_name'],
@@ -427,8 +446,13 @@ class TestRenewEngine:
         config.update_metadata(cert['order_id'], cert['metadata'])
         results = engine.check_and_renew_all()
         assert results == []
-        # 不应创建 API 客户端（前置过滤即跳过）
+        # 不应创建 API 客户端（前置过滤即跳过），不发任何回调
         api_factory.assert_not_called()
+        mock_api.callback.assert_not_called()
+        # 已置 CAPPED(issue) 终态
+        meta = config.get_cert(cert['order_id'])['metadata']
+        assert meta['last_issue_state'] == 'CAPPED'
+        assert meta['cap_stage'] == 'issue'
 
     def test_check_and_renew_all_api_none(self, tmp_data_dir):
         """api_factory 返回 None 时证书被跳过且记录 warn"""
@@ -1294,3 +1318,449 @@ class TestRenewStatusFileHardening:
         # 不残留临时文件
         leftovers = [n for n in os.listdir(tmp_data_dir) if n.endswith('.tmp')]
         assert leftovers == []
+
+
+class TestDeployCountAndCap:
+    """部署计数分离、触顶 CAPPED(deploy) 静默、第 10 次失败标注（deploy-spec §3.2/§5.1）"""
+
+    @pytest.fixture
+    def engine(self, tmp_data_dir):
+        config = ConfigManager(tmp_data_dir)
+        mock_api = MagicMock()
+        mock_api.last_renew_before_days = 0
+        deployer = MagicMock()
+        logger = MagicMock()
+        eng = RenewEngine(config, MagicMock(return_value=mock_api), deployer, logger)
+        eng._mock_api = mock_api
+        return eng
+
+    def _add_pull_cert(self, engine, order_id=6001, days=10, deploy_count=0, issue_count=0):
+        cert = _make_cert_entry(days, order_id=order_id)
+        engine._config.add_cert(order_id=order_id, cert_name=cert['cert_name'],
+                                domains=cert['domains'], site_names=cert['site_name'])
+        meta = dict(cert['metadata'])
+        meta['deploy_attempt_count'] = deploy_count
+        meta['issue_retry_count'] = issue_count
+        engine._config.update_metadata(order_id, meta)
+        return engine._config.get_cert(order_id)
+
+    def _active(self):
+        return {'status': 'active', 'certificate': '---C---',
+                'ca_certificate': '---CA---', 'private_key': '---K---'}
+
+    def test_deploy_uses_orchestrator_callback(self, engine):
+        """自动续签：deploy_multi 以 send_callback=False 调用，回调由编排层发一次"""
+        self._add_pull_cert(engine, 6001)
+        engine._mock_api.query_order.return_value = self._active()
+        engine._deployer.deploy_multi.return_value = [
+            {'site_name': 'example.com', 'status': True, 'message': 'ok'}]
+        result = engine._renew_pull(engine._config.get_cert(6001), engine._mock_api)
+        assert result is True
+        assert engine._deployer.deploy_multi.call_args[1]['send_callback'] is False
+        engine._mock_api.callback.assert_called_once()
+        assert engine._mock_api.callback.call_args[1]['status'] == 'success'
+
+    def test_deploy_cap_front_filter_capped_no_callback(self, engine):
+        """部署计数 >= 10：前置过滤进入 CAPPED(deploy) 静默，不查询、不部署、不发回调"""
+        self._add_pull_cert(engine, 6002, deploy_count=MAX_DEPLOY_ATTEMPT_COUNT)
+        results = engine.check_and_renew_all()
+        assert results == []
+        engine._mock_api.query_order.assert_not_called()
+        engine._mock_api.callback.assert_not_called()
+        meta = engine._config.get_cert(6002)['metadata']
+        assert meta['last_issue_state'] == 'CAPPED'
+        assert meta['cap_stage'] == 'deploy'
+
+    def test_deploy_failure_increments_deploy_count(self, engine):
+        """部署失败递增 deploy_attempt_count，签发计数不受污染（计数分离）"""
+        self._add_pull_cert(engine, 6004, deploy_count=0, issue_count=3)
+        engine._mock_api.query_order.return_value = self._active()
+        engine._deployer.deploy_multi.return_value = [
+            {'site_name': 'example.com', 'status': False, 'message': 'x'}]
+        with pytest.raises(RuntimeError):
+            engine._renew_pull(engine._config.get_cert(6004), engine._mock_api)
+        meta = engine._config.get_cert(6004)['metadata']
+        assert meta['deploy_attempt_count'] == 1  # 部署计数递增
+        assert meta['issue_retry_count'] == 3      # 签发计数不变
+
+    def test_deploy_intent_persist_failure_blocks_external_action(self, engine):
+        """部署意图未持久化时不得调用面板部署或发送回调。"""
+        self._add_pull_cert(engine, 6005)
+        engine._mock_api.query_order.return_value = self._active()
+        engine._config.update_metadata = MagicMock(side_effect=OSError('disk full'))
+
+        with pytest.raises(OSError, match='disk full'):
+            engine._renew_pull(engine._config.get_cert(6005), engine._mock_api)
+
+        engine._deployer.deploy_multi.assert_not_called()
+        engine._mock_api.callback.assert_not_called()
+
+    def test_deploy_result_persist_failure_keeps_started_and_skips_callback(self, engine):
+        """明确失败结果未落盘时保留 started 供重放，且不得提前发送回调。"""
+        self._add_pull_cert(engine, 6006)
+        engine._mock_api.query_order.return_value = self._active()
+        engine._deployer.deploy_multi.return_value = [
+            {'site_name': 'example.com', 'status': False, 'message': 'x'}]
+        real_update = engine._config.update_metadata
+
+        def fail_when_concluding(order_id, updates):
+            if updates == {'deploy_started': False}:
+                raise OSError('disk full')
+            return real_update(order_id, updates)
+
+        engine._config.update_metadata = MagicMock(side_effect=fail_when_concluding)
+
+        with pytest.raises(OSError, match='disk full'):
+            engine._renew_pull(engine._config.get_cert(6006), engine._mock_api)
+
+        meta = engine._config.get_cert(6006)['metadata']
+        assert meta['deploy_attempt_count'] == 1
+        assert meta['deploy_started'] is True
+        engine._mock_api.callback.assert_not_called()
+
+    def test_last_deploy_failure_annotated_and_failure_callback(self, engine):
+        """第 10 次（最后一次）部署失败：编排层发 failure 回调并标注'已达重试上限'"""
+        self._add_pull_cert(engine, 6003, deploy_count=MAX_DEPLOY_ATTEMPT_COUNT - 1)
+        engine._mock_api.query_order.return_value = self._active()
+        engine._deployer.deploy_multi.return_value = [
+            {'site_name': 'example.com', 'status': False, 'message': '部署超时'}]
+        with pytest.raises(RuntimeError):
+            engine._renew_pull(engine._config.get_cert(6003), engine._mock_api)
+        cb = engine._mock_api.callback.call_args
+        assert cb.kwargs['status'] == 'failure'
+        assert '已达重试上限' in cb.kwargs['message']
+        assert '部署超时' in cb.kwargs['message']
+        assert engine._config.get_cert(6003)['metadata']['deploy_attempt_count'] == MAX_DEPLOY_ATTEMPT_COUNT
+
+    def test_ten_deploy_failures_then_cap_no_eleventh(self, engine):
+        """部署连续失败 10 轮：deploy_attempt_count 递增至 10，第 11 轮 CAPPED(deploy) 不再部署（§4.1.2）"""
+        self._add_pull_cert(engine, 7400)
+        engine._mock_api.query_order.return_value = self._active()
+        engine._deployer.deploy_multi.return_value = [
+            {'site_name': 'example.com', 'status': False, 'message': 'x'}]
+        for _ in range(10):
+            engine.check_and_renew_all()
+        assert engine._deployer.deploy_multi.call_count == 10
+        assert engine._config.get_cert(7400)['metadata']['deploy_attempt_count'] == MAX_DEPLOY_ATTEMPT_COUNT
+        engine.check_and_renew_all()  # 第 11 轮
+        assert engine._deployer.deploy_multi.call_count == 10  # 无第 11 次部署
+        meta = engine._config.get_cert(7400)['metadata']
+        assert meta['last_issue_state'] == 'CAPPED'
+        assert meta['cap_stage'] == 'deploy'
+
+    def test_deploy_started_replay_no_double_increment(self, engine):
+        """崩溃恢复：deploy_started 已置位 → 重放同一部署意图不再自增计数（spec §4.1.2）"""
+        self._add_pull_cert(engine, 6301, deploy_count=5)
+        engine._config.update_metadata(6301, {'deploy_started': True})
+        engine._mock_api.query_order.return_value = self._active()
+        engine._deployer.deploy_multi.return_value = [
+            {'site_name': 'example.com', 'status': False, 'message': 'x'}]
+        with pytest.raises(RuntimeError):
+            engine._renew_pull(engine._config.get_cert(6301), engine._mock_api)
+        meta = engine._config.get_cert(6301)['metadata']
+        assert meta['deploy_attempt_count'] == 5   # 复用同一尝试，未自增为 6
+        assert meta['deploy_started'] is False       # 结束后清除 started
+
+    def test_expired_transitions_expired_no_callback(self, engine):
+        """已过期 → 转 EXPIRED 静默，不查询、不部署、不发回调"""
+        cert = _make_cert_entry(-2, order_id=6201)
+        engine._config.add_cert(order_id=6201, cert_name=cert['cert_name'],
+                                domains=cert['domains'], site_names=cert['site_name'])
+        engine._config.update_metadata(6201, cert['metadata'])
+        results = engine.check_and_renew_all()
+        assert results == []
+        engine._mock_api.query_order.assert_not_called()
+        engine._mock_api.callback.assert_not_called()
+        assert engine._config.get_cert(6201)['metadata']['last_issue_state'] == 'EXPIRED'
+
+    def test_safety_margin_skips_near_expiry_no_action(self, engine):
+        """剩余有效期 < 24h 但未过期 → 本轮不启动新动作，不查询/不部署/不回调，状态不变"""
+        cert = _make_cert_entry(0.5, order_id=6205)  # 约 12 小时
+        engine._config.add_cert(order_id=6205, cert_name=cert['cert_name'],
+                                domains=cert['domains'], site_names=cert['site_name'])
+        engine._config.update_metadata(6205, cert['metadata'])
+        results = engine.check_and_renew_all()
+        assert results == []
+        engine._mock_api.query_order.assert_not_called()
+        engine._mock_api.callback.assert_not_called()
+        # 未过期，不转 EXPIRED
+        assert engine._config.get_cert(6205)['metadata']['last_issue_state'] == ''
+
+    def test_terminal_capped_skipped_silently(self, engine):
+        """已 CAPPED 的证书前置过滤直接跳过，不查询、不部署、不回调"""
+        self._add_pull_cert(engine, 6206)
+        engine._config.update_metadata(6206, {'last_issue_state': 'CAPPED', 'cap_stage': 'deploy'})
+        results = engine.check_and_renew_all()
+        assert results == []
+        engine._mock_api.query_order.assert_not_called()
+        engine._mock_api.callback.assert_not_called()
+
+    def test_policy_blocked_skipped_silently(self, engine):
+        """policy_blocked_needs_setup 的证书前置过滤跳过，不计数、不回调"""
+        self._add_pull_cert(engine, 6207)
+        engine._config.update_metadata(6207, {'last_issue_state': 'policy_blocked_needs_setup'})
+        results = engine.check_and_renew_all()
+        assert results == []
+        engine._mock_api.query_order.assert_not_called()
+        engine._mock_api.callback.assert_not_called()
+        # 计数不变
+        assert engine._config.get_cert(6207)['metadata']['deploy_attempt_count'] == 0
+
+    def test_processing_cert_at_issue_cap_still_polls(self, engine):
+        """签发计数 == 10 但已 processing（CSR 已被接受）→ 继续轮询签发，不因签发触顶停止"""
+        cert = _make_cert_entry(10, renew_mode='local', issue_state='processing',
+                                retry_count=MAX_ISSUE_RETRY_COUNT, order_id=6210)
+        engine._config.add_cert(order_id=6210, cert_name=cert['cert_name'],
+                                domains=cert['domains'], site_names=cert['site_name'], renew_mode='local')
+        engine._config.update_metadata(6210, cert['metadata'])
+        engine._mock_api.query_order.return_value = {'status': 'processing'}
+        engine.check_and_renew_all()
+        # 进入了查询流程（未被签发触顶前置拦截），状态仍 processing、未置 CAPPED
+        engine._mock_api.query_order.assert_called_once()
+        assert engine._config.get_cert(6210)['metadata']['last_issue_state'] == 'processing'
+
+
+class TestIssueDeployCountSeparation:
+    """签发计数与部署计数严格分离"""
+
+    @pytest.fixture
+    def engine(self, tmp_data_dir):
+        config = ConfigManager(tmp_data_dir)
+        mock_api = MagicMock()
+        mock_api.last_renew_before_days = 0
+        deployer = MagicMock()
+        eng = RenewEngine(config, MagicMock(return_value=mock_api), deployer, MagicMock())
+        eng._mock_api = mock_api
+        return eng
+
+    @patch('lib.renew.cert_utils.generate_csr')
+    def test_issue_submit_does_not_touch_deploy_count(self, mock_csr, engine):
+        """CSR 提交（签发尝试）只递增 issue_retry_count，不动 deploy_attempt_count"""
+        mock_csr.return_value = ('CSR', 'KEY', 'hash')
+        engine._mock_api.submit_csr.return_value = {'status': 'processing'}
+        engine._config.add_cert(order_id=7201, cert_name='order-7201', domains=['a.com'],
+                                site_names=['a.com'], renew_mode='local')
+        engine._submit_new_csr(engine._config.get_cert(7201), engine._mock_api)
+        meta = engine._config.get_cert(7201)['metadata']
+        assert meta['issue_retry_count'] == 1
+        assert meta['deploy_attempt_count'] == 0
+
+
+class TestResponseLossRecovery:
+    """CSR 提交响应丢失恢复：保留 pending 作为在途标记，下轮只查询订单恢复，绝不重复 POST"""
+
+    @pytest.fixture
+    def engine(self, tmp_data_dir):
+        config = ConfigManager(tmp_data_dir)
+        mock_api = MagicMock()
+        mock_api.last_renew_before_days = 0
+        deployer = MagicMock()
+        deployer.deploy_multi.return_value = [
+            {'site_name': 'a.com', 'status': True, 'message': 'ok'}]
+        eng = RenewEngine(config, MagicMock(return_value=mock_api), deployer, MagicMock())
+        eng._mock_api = mock_api
+        return eng
+
+    def _add_local(self, engine, order_id):
+        engine._config.add_cert(order_id=order_id, cert_name='order-%d' % order_id,
+                                domains=['a.com'], site_names=['a.com'], renew_mode='local')
+        return engine._config.get_cert(order_id)
+
+    @patch('lib.renew.cert_utils.generate_csr')
+    def test_transport_failure_keeps_pending_state_empty(self, mock_csr, engine):
+        """POST 传输不确定（transport）→ 保留 pending key + CSR，state 仍 ''，计数=1（本次意图）"""
+        from lib.api_client import APIError
+        mock_csr.return_value = ('CSR-PEM', 'KEY-PEM', 'hash')
+        engine._mock_api.submit_csr.side_effect = APIError('网络超时', transport=True)
+        cert = self._add_local(engine, 7101)
+        result = engine._submit_new_csr(cert, engine._mock_api)
+        assert result is False
+        assert engine._has_pending_csr(engine._config.get_cert(7101))
+        meta = engine._config.get_cert(7101)['metadata']
+        assert meta['issue_retry_count'] == 1
+        assert meta['last_issue_state'] == ''
+
+    @patch('lib.renew.cert_utils.generate_csr')
+    def test_definitive_rejection_cleans_pending(self, mock_csr, engine):
+        """明确业务拒绝（非 transport）→ 清理 pending key + CSR 并抛出"""
+        from lib.api_client import APIError
+        mock_csr.return_value = ('CSR-PEM', 'KEY-PEM', 'hash')
+        engine._mock_api.submit_csr.side_effect = APIError('订单状态非法', code=40001)
+        cert = self._add_local(engine, 7104)
+        with pytest.raises(APIError):
+            engine._submit_new_csr(cert, engine._mock_api)
+        assert not engine._has_pending_csr(engine._config.get_cert(7104))
+
+    def test_recovery_normalizes_processing_no_resubmit(self, engine):
+        """在途 CSR + 服务端已在处理 → 归一 processing，不重复 POST、不增计数"""
+        cert = self._add_local(engine, 7102)
+        engine._save_pending_key(cert, 'KEY')
+        engine._save_pending_csr(cert, 'CSR')
+        engine._config.update_metadata(7102, {'issue_retry_count': 1, 'last_csr_hash': 'h'})
+        engine._mock_api.query_order.return_value = {'status': 'processing'}
+        result = engine._renew_local(engine._config.get_cert(7102), engine._mock_api)
+        assert result is False
+        engine._mock_api.submit_csr.assert_not_called()
+        meta = engine._config.get_cert(7102)['metadata']
+        assert meta['last_issue_state'] == 'processing'
+        assert meta['issue_retry_count'] == 1
+
+    def test_recovery_pending_response_normalizes_processing(self, engine):
+        """在途 CSR + 服务端返回 pending → 归一 processing（不重复 POST）"""
+        cert = self._add_local(engine, 7105)
+        engine._save_pending_key(cert, 'KEY')
+        engine._save_pending_csr(cert, 'CSR')
+        engine._config.update_metadata(7105, {'issue_retry_count': 2})
+        engine._mock_api.query_order.return_value = {'status': 'pending'}
+        result = engine._renew_local(engine._config.get_cert(7105), engine._mock_api)
+        assert result is False
+        engine._mock_api.submit_csr.assert_not_called()
+        assert engine._config.get_cert(7105)['metadata']['last_issue_state'] == 'processing'
+
+    def test_recovery_abnormal_status_persists_and_does_not_resubmit(self, engine):
+        """在途 CSR 查询到异常业务状态时持久化并停止，不推断为未收到后重复 POST。"""
+        cert = self._add_local(engine, 7103)
+        engine._save_pending_key(cert, 'KEY')
+        engine._save_pending_csr(cert, 'CSR-ORIG')
+        engine._config.update_metadata(7103, {'issue_retry_count': 1})
+        engine._mock_api.query_order.return_value = {'status': 'unpaid'}
+        engine._mock_api.submit_csr.return_value = {'status': 'processing'}
+        result = engine._renew_local(engine._config.get_cert(7103), engine._mock_api)
+        assert result is False
+        engine._mock_api.submit_csr.assert_not_called()
+        meta = engine._config.get_cert(7103)['metadata']
+        assert meta['last_issue_state'] == 'unpaid'
+        assert meta['issue_retry_count'] == 1
+        assert engine._has_pending_csr(engine._config.get_cert(7103))
+
+    def test_processing_abnormal_status_persists_actual_state(self, engine):
+        """processing 查询到异常状态时保留实际状态，停止等待人工处理。"""
+        cert = self._add_local(engine, 7106)
+        engine._save_pending_key(cert, 'KEY')
+        engine._save_pending_csr(cert, 'CSR')
+        engine._config.update_metadata(7106, {
+            'issue_retry_count': 2,
+            'last_issue_state': 'processing',
+        })
+        engine._mock_api.query_order.return_value = {'status': 'cancelled'}
+
+        result = engine._renew_local(engine._config.get_cert(7106), engine._mock_api)
+
+        assert result is False
+        engine._mock_api.submit_csr.assert_not_called()
+        meta = engine._config.get_cert(7106)['metadata']
+        assert meta['last_issue_state'] == 'cancelled'
+        assert meta['issue_retry_count'] == 2
+
+    def test_processing_approving_treated_as_waiting(self, engine):
+        """processing 查询到短暂中间态 approving → 视同 processing 继续等待，不判异常不清文件"""
+        cert = self._add_local(engine, 7107)
+        engine._save_pending_key(cert, 'KEY')
+        engine._save_pending_csr(cert, 'CSR')
+        engine._config.update_metadata(7107, {
+            'issue_retry_count': 1,
+            'last_issue_state': 'processing',
+            'pending_verify_paths': ['/tmp/v.txt'],
+        })
+        engine._mock_api.query_order.return_value = {'status': 'approving'}
+
+        result = engine._renew_local(engine._config.get_cert(7107), engine._mock_api)
+
+        assert result is False
+        engine._mock_api.submit_csr.assert_not_called()
+        meta = engine._config.get_cert(7107)['metadata']
+        assert meta['last_issue_state'] == 'processing'
+        assert meta['pending_verify_paths'] == ['/tmp/v.txt']  # 验证文件记录未被清理
+        engine._logger.error.assert_not_called()
+
+    def test_recovery_approving_normalizes_processing(self, engine):
+        """在途 CSR + 服务端返回 approving → 归一 processing（不重复 POST、不增计数）"""
+        cert = self._add_local(engine, 7108)
+        engine._save_pending_key(cert, 'KEY')
+        engine._save_pending_csr(cert, 'CSR')
+        engine._config.update_metadata(7108, {'issue_retry_count': 1})
+        engine._mock_api.query_order.return_value = {'status': 'approving'}
+
+        result = engine._renew_local(engine._config.get_cert(7108), engine._mock_api)
+
+        assert result is False
+        engine._mock_api.submit_csr.assert_not_called()
+        meta = engine._config.get_cert(7108)['metadata']
+        assert meta['last_issue_state'] == 'processing'
+        assert meta['issue_retry_count'] == 1
+
+    def test_terminal_status_unchanged_no_repeat_error_or_persist(self, engine):
+        """订单终态持续多轮：仅首轮记 error 并落盘，后续轮次不重复记 error、不重复写 metadata"""
+        cert = self._add_local(engine, 7109)
+        engine._save_pending_key(cert, 'KEY')
+        engine._save_pending_csr(cert, 'CSR')
+        engine._config.update_metadata(7109, {
+            'issue_retry_count': 2,
+            'last_issue_state': 'processing',
+        })
+        engine._mock_api.query_order.return_value = {'status': 'cancelled'}
+
+        engine._renew_local(engine._config.get_cert(7109), engine._mock_api)  # 首轮：processing → cancelled
+        assert engine._logger.error.call_count == 1
+        assert engine._config.get_cert(7109)['metadata']['last_issue_state'] == 'cancelled'
+
+        with patch.object(engine._config, 'update_metadata') as mock_update:
+            engine._renew_local(engine._config.get_cert(7109), engine._mock_api)  # 次轮：状态未变化
+            mock_update.assert_not_called()
+        assert engine._logger.error.call_count == 1  # 未重复记 error
+        engine._mock_api.submit_csr.assert_not_called()
+
+    @patch('lib.renew.cert_utils.generate_csr')
+    def test_ten_definitive_failures_then_cap_no_eleventh(self, mock_csr, engine):
+        """签发定义性失败连续 10 轮：计数递增至 10，第 11 轮 CAPPED(issue) 无第 11 次提交（§4.1.1）"""
+        from lib.api_client import APIError
+        mock_csr.return_value = ('CSR', 'KEY', 'h')
+        self._add_local(engine, 7300)
+        engine._config.update_metadata(7300, _make_cert_entry(10, order_id=7300)['metadata'])
+        engine._mock_api.submit_csr.side_effect = APIError('订单不可提交', code=40001)
+        for _ in range(10):
+            engine.check_and_renew_all()
+        assert engine._mock_api.submit_csr.call_count == 10
+        assert engine._config.get_cert(7300)['metadata']['issue_retry_count'] == MAX_ISSUE_RETRY_COUNT
+        engine.check_and_renew_all()  # 第 11 轮
+        assert engine._mock_api.submit_csr.call_count == 10  # 无第 11 次提交
+        meta = engine._config.get_cert(7300)['metadata']
+        assert meta['last_issue_state'] == 'CAPPED'
+        assert meta['cap_stage'] == 'issue'
+
+
+class TestCallbackOwnershipConvergence:
+    """回调所有权收敛：自动续签底层不发回调，编排层结果落盘后统一发一次"""
+
+    @patch('lib.deployer.cert_utils')
+    @patch('lib.deployer.Deployer._set_ssl')
+    def test_orchestrator_sends_single_success_callback(self, mock_set_ssl, mock_cert_utils, tmp_data_dir):
+        from lib.deployer import Deployer
+        config = ConfigManager(tmp_data_dir)
+        api = MagicMock()
+        api.last_renew_before_days = 0
+        api.callback.return_value = {'code': 1}
+        api.query_order.return_value = {
+            'status': 'active', 'certificate': '---C---',
+            'ca_certificate': '---CA---', 'private_key': '---K---'}
+        mock_cert_utils.validate_cert_pem.return_value = (True, '')
+        mock_cert_utils.validate_key_pem.return_value = (True, '')
+        mock_cert_utils.verify_cert_key_match.return_value = True
+        mock_cert_utils.parse_cert_info.return_value = {
+            'not_after': datetime(2035, 1, 1, tzinfo=timezone.utc), 'serial': 'X'}
+        mock_set_ssl.return_value = {'status': True}
+        deployer = Deployer(config, None, MagicMock())  # 无 site_manager
+        engine = RenewEngine(config, MagicMock(return_value=api), deployer, MagicMock())
+        config.add_cert(order_id=6401, cert_name='order-6401',
+                        domains=['example.com'], site_names=['example.com'])
+        config.update_metadata(6401, _make_cert_entry(10, order_id=6401)['metadata'])
+
+        result = engine._renew_pull(config.get_cert(6401), api)
+        assert result is True
+        # 恰好一次回调（编排层发），success
+        api.callback.assert_called_once()
+        assert api.callback.call_args.kwargs['status'] == 'success'
+        # 部署成功后 deploy_attempt_count 清零、started 清除
+        meta = config.get_cert(6401)['metadata']
+        assert meta['deploy_attempt_count'] == 0
+        assert meta.get('deploy_started') is False

@@ -4,7 +4,29 @@ import os
 import json
 import copy
 import pytest
-from lib.config import ConfigManager, DEFAULT_CONFIG, DEFAULT_CERT_ENTRY, validate_validation_method
+from lib.config import (
+    ConfigManager, DEFAULT_CONFIG, DEFAULT_CERT_ENTRY, validate_validation_method,
+    derive_or_validate_renew_policy, domains_contain_ip,
+)
+
+
+def _write_legacy_config(data_dir, cert_meta, domains=None, renew_mode='',
+                         validation_method='', global_mode='pull'):
+    """写入含单个 legacy 证书的 config.json（构造后由 ConfigManager 触发迁移）"""
+    cfg = {
+        'release_url': '', 'upgrade_channel': 'main',
+        'schedule': {'renew_mode': global_mode, 'renew_before_days': 14},
+        'certificates': [{
+            'order_id': 5000, 'cert_name': 'order-5000',
+            'domains': domains if domains is not None else ['a.com'], 'enabled': True,
+            'renew_mode': renew_mode, 'validation_method': validation_method,
+            'api': {'url': 'https://api.example.com', 'token': 'x'},
+            'site_name': ['a.com'], 'server_type': 'nginx',
+            'metadata': cert_meta,
+        }],
+    }
+    with open(os.path.join(data_dir, 'config.json'), 'w') as f:
+        json.dump(cfg, f)
 
 
 class TestConfigManager:
@@ -411,3 +433,122 @@ class TestValidateValidationMethod:
     def test_mixed_domains_with_wildcard_rejects_file(self):
         """混合域名列表中含通配符时，file 应被拒绝"""
         assert validate_validation_method(['example.com', '*.example.com'], 'file') != ''
+
+
+class TestDomainsContainIp:
+    def test_ipv4(self):
+        assert domains_contain_ip(['1.2.3.4']) is True
+
+    def test_ipv6(self):
+        assert domains_contain_ip(['a.com', '2001:db8::1']) is True
+
+    def test_dns_only(self):
+        assert domains_contain_ip(['a.com', '*.a.com']) is False
+
+    def test_empty(self):
+        assert domains_contain_ip([]) is False
+
+
+class TestDeriveOrValidateRenewPolicy:
+    """唯一权威的续签策略派生（deploy-spec §5.2）"""
+
+    def test_ip_forces_local_file_over_pull(self):
+        assert derive_or_validate_renew_policy(['1.2.3.4'], 'pull', '') == ('local', 'file', '')
+
+    def test_ip_forces_local_file_over_delegation(self):
+        assert derive_or_validate_renew_policy(['1.2.3.4'], 'local', 'delegation') == ('local', 'file', '')
+
+    def test_ipv6_forces_local_file(self):
+        assert derive_or_validate_renew_policy(['2001:db8::1'], '', '') == ('local', 'file', '')
+
+    def test_mixed_dns_ip_forces_local_file(self):
+        """DNS + IP 混合仍视为含 IP，强制 local/file"""
+        assert derive_or_validate_renew_policy(['a.com', '1.2.3.4'], 'pull', '') == ('local', 'file', '')
+
+    def test_dns_pull_unchanged(self):
+        assert derive_or_validate_renew_policy(['a.com'], 'pull', '') == ('pull', '', '')
+
+    def test_dns_local_file_valid(self):
+        assert derive_or_validate_renew_policy(['a.com'], 'local', 'file') == ('local', 'file', '')
+
+    def test_wildcard_file_returns_error(self):
+        mode, vm, err = derive_or_validate_renew_policy(['*.a.com'], 'local', 'file')
+        assert err != ''
+
+    def test_wildcard_delegation_valid(self):
+        assert derive_or_validate_renew_policy(['*.a.com'], 'local', 'delegation') == ('local', 'delegation', '')
+
+
+class TestSemanticMigration:
+    """计算型语义迁移：pending 归一、legacy 触顶、policy 阻断、部署计数从零（deploy-spec §3.4/§5.2）"""
+
+    def test_deploy_attempt_count_default_zero(self, tmp_data_dir):
+        """新字段 deploy_attempt_count 由默认值补 0（不从旧混合计数推断）"""
+        _write_legacy_config(tmp_data_dir, {'cert_expires_at': '', 'issue_retry_count': 7})
+        cm = ConfigManager(tmp_data_dir)
+        assert cm.get_cert(5000)['metadata']['deploy_attempt_count'] == 0
+
+    @pytest.mark.parametrize('count,state,expected_state,expected_stage', [
+        (0, '', '', None),
+        (1, '', '', None),
+        (5, '', '', None),
+        (0, 'pending', 'processing', None),
+        (5, 'pending', 'processing', None),
+        (1, 'processing', 'processing', None),
+        (5, 'active', 'active', None),
+        (10, '', 'CAPPED', 'legacy'),
+        (11, '', 'CAPPED', 'legacy'),
+        (10, 'pending', 'CAPPED', 'legacy'),
+        (11, 'processing', 'CAPPED', 'legacy'),
+        (10, 'active', 'CAPPED', 'legacy'),
+    ])
+    def test_count_state_matrix(self, tmp_data_dir, count, state, expected_state, expected_stage):
+        """计数 0/1/5/10/11 × 状态 空/pending/processing/active 表驱动迁移"""
+        _write_legacy_config(tmp_data_dir, {
+            'cert_expires_at': '', 'issue_retry_count': count, 'last_issue_state': state})
+        cm = ConfigManager(tmp_data_dir)
+        meta = cm.get_cert(5000)['metadata']
+        assert meta['last_issue_state'] == expected_state
+        if expected_stage:
+            assert meta.get('cap_stage') == expected_stage
+        # 部署计数始终从零，不从旧签发计数推断
+        assert meta['deploy_attempt_count'] == 0
+
+    def test_legacy_cap_is_idempotent(self, tmp_data_dir):
+        """已 CAPPED(legacy) 的证书再次加载不改写、不补发历史"""
+        _write_legacy_config(tmp_data_dir, {
+            'cert_expires_at': '', 'issue_retry_count': 12, 'last_issue_state': ''})
+        ConfigManager(tmp_data_dir)
+        cm2 = ConfigManager(tmp_data_dir)  # 二次加载
+        meta = cm2.get_cert(5000)['metadata']
+        assert meta['last_issue_state'] == 'CAPPED'
+        assert meta['cap_stage'] == 'legacy'
+
+    @pytest.mark.parametrize('domains,mode,vm,expected', [
+        (['1.2.3.4'], 'pull', '', 'policy_blocked_needs_setup'),          # IP + pull
+        (['1.2.3.4'], 'local', 'delegation', 'policy_blocked_needs_setup'),  # IP + delegation
+        (['2001:db8::1'], 'pull', '', 'policy_blocked_needs_setup'),      # IPv6 + pull
+        (['1.2.3.4'], '', '', 'policy_blocked_needs_setup'),              # IP + 继承全局 pull
+        (['1.2.3.4'], 'local', 'file', ''),                              # IP + local/file 合法
+        (['a.com'], 'pull', '', ''),                                     # DNS + pull 合法
+        (['a.com'], 'local', 'delegation', ''),                         # DNS + local/delegation 合法
+    ])
+    def test_policy_blocked_matrix(self, tmp_data_dir, domains, mode, vm, expected):
+        """旧非法 IP 配置（IP+pull / IP+delegation）进入 policy_blocked_needs_setup，不自动改配置"""
+        _write_legacy_config(tmp_data_dir, {
+            'cert_expires_at': '', 'issue_retry_count': 0, 'last_issue_state': ''},
+            domains=domains, renew_mode=mode, validation_method=vm)
+        cm = ConfigManager(tmp_data_dir)
+        cert = cm.get_cert(5000)
+        assert cert['metadata']['last_issue_state'] == expected
+        # 不自动改配置：renew_mode / validation_method 保持原值
+        assert cert['renew_mode'] == mode
+        assert cert['validation_method'] == vm
+
+    def test_policy_blocked_not_applied_when_capped(self, tmp_data_dir):
+        """已因计数触顶 CAPPED 的 IP+pull 证书不再叠加 policy_blocked（CAPPED 优先，终态）"""
+        _write_legacy_config(tmp_data_dir, {
+            'cert_expires_at': '', 'issue_retry_count': 11, 'last_issue_state': ''},
+            domains=['1.2.3.4'], renew_mode='pull')
+        cm = ConfigManager(tmp_data_dir)
+        assert cm.get_cert(5000)['metadata']['last_issue_state'] == 'CAPPED'

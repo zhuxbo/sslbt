@@ -112,19 +112,26 @@ SetSSL 部署：写入前 pre-flight 校验既有配置（checkWebConfig，损�
 
 ## 续签引擎关键逻辑
 
+- 行为契约以 `deploy-spec.md`（§1.5/§2.6/§2.8/§3.2/§3.5/§5.1/§5.2）为准，本节仅记实现要点
 - Pull 模式：查询订单，active 且证书完整则直接部署
-- Local 模式：生成 CSR → 校验 validation_method 与域名兼容性 → 提交 → processing 状态轮询 → active 后部署
+- Local 模式：派生策略 → 生成 CSR → 提交 → processing 状态轮询 → active 后部署
+- 计数分离与终止（`config` 常量）：签发 `issue_retry_count`（CSR 提交）与部署 `deploy_attempt_count` 分别计数、各自 `>= 10` 触顶；触顶置 `last_issue_state=CAPPED` 并记 `metadata.cap_stage`（issue/deploy/legacy）静默；已过期置 `EXPIRED` 静默；剩余有效期 < `SAFETY_MARGIN_HOURS=24` 不启动新动作。触顶/过期/policy 阻断均不发回调。前置过滤对 `processing` 证书豁免签发触顶（CSR 已被接受，继续轮询）
+- 计数递增时机 = 持久化新逻辑尝试意图：`_submit_new_csr` 提交前递增签发计数；`_begin_deploy_attempt` 部署前递增部署计数并置 `deploy_started`，崩溃恢复重放（`deploy_started` 已置位）不自增
+- 回调所有权收敛：自动续签底层 `deploy_multi(send_callback=False)` 只返回结构化结果，编排层 `_deploy_and_report` 在结果落盘后统一发一次；每次成功/明确失败各尽力一报，第 10 次（最后一次）失败 message 追加「已达重试上限」；签发失败不上报（仅本地日志与计数）。手动 `deploy`/`setup` 默认 `send_callback=True`，语义不变
+- 恢复纪律（response-loss）：CSR 提交前原子持久化 pending key + `pending-csr.pem` 作为在途标记；`submit_csr` 传输不确定（`APIError.transport=True`：超时/断连/解析失败）保留 pending，明确业务拒绝（含服务端未接收提交，以错误信息而非状态表达）才清理；下轮 `_has_pending_csr` → `_recover_pending_submit` 只查询订单、绝不重复 POST：`pending`/`processing`/`approving`/`active` 归一 `processing`（不增计数、不重生 CSR），其他状态为订单终态，持久化后停止等待人工处理
+- 查询状态归一：服务端提交响应只会是 `pending`/`processing`；查询在 `processing → active` 之间可能出现短暂中间态 `approving`，三者统一归一 `processing` 继续等待；`active` 之后的状态为订单终态。终态持久化到 `last_issue_state` 后每轮仍查询一次（可自愈），但状态未变化时不重复记 error、不重复落盘
+- 策略派生 `derive_or_validate_renew_policy`（`config`，唯一权威）：SAN 含 IP 强制 `renew_mode=local` + `validation_method=file`；DNS 校验兼容性。add_cert/update_cert_config/batch_set_renew_policy/续签提交统一调用
 - 私钥回退（deploy-spec §5.3）：deploy_cert 中按 API → 参数路径 → 站点已有私钥(GetSSL) → 弹窗粘贴 四级回退，所有来源均需 verify_cert_key_match 校验
 - 文件验证：CSR 提交返回 file 字段时自动放置，签发/超时/异常时自动清理
 - `_check_deploy_results()`：全部失败抛异常，部分失败记警告
-- callback：全部站点成功=success，任一失败=failure（message 仅 failure 携带各站点失败原因摘要，含回滚状态；上限 `CALLBACK_MESSAGE_MAX=256`，**先脱敏后截断**——`sanitize()` 复用日志脱敏规则过滤 Bearer/私钥/token 后再截断，避免截断切出半个凭证残留；success 不带 message）
+- callback message：仅 failure 携带各站点失败原因摘要（含回滚状态、可能的「已达重试上限」标注）；上限 `CALLBACK_MESSAGE_MAX=256`，**先脱敏后截断**（`sanitize()` 过滤 Bearer/私钥/token 后再截断）；success 不带 message
 - 分散续签：`check_and_renew_all(spread=True)` 在证书间加动态延迟，根据需续签数量自动缩短间隔（总延迟上限 600s），仅 cron 调用启用
 - 汇总日志：续签完成后记录成功/等待/失败数量
 - cron 注册：`_build_script()` 用注册时进程的解释器（`sys.executable`，面板 pyenv）而非裸 python3，避免环境不一致导致续签不可运行；旧条目经 `setup()` 的 remove+重建替换
 - 续签状态：每次运行结束写 `data/renew_status.json`（last_run/total/success/pending/failure，原子写 0600），面板经 `get_renew_status` 展示「最近续签」
 - 站点删除自愈（两轮确认）：`deploy_multi` 部署前查一次 `SiteManager.get_sites()` 复用清单检测站点存在；`get_sites` 查询失败（DB 缺失/锁定/表结构漂移）抛 `SiteQueryError` 与「确认零站点」严格区分，失败或清单为空时放弃本轮删除判定（保守视为全部存在，不计数、不解绑）；仅当清单查询成功且非空时才对不在清单中的站点计数——首轮仅记「疑似删除」（`site_missing`，按 failure 上报但不解绑），连续第二轮（计数达 `SITE_MISSING_CONFIRM_THRESHOLD=2`，且两轮间隔 ≥ `SITE_MISSING_MIN_INTERVAL_HOURS=12` 小时）确认后才解除绑定并持久化，缩小迁移/重装中途不完整快照误清绑定的破坏半径；缺失计数存于证书 `metadata.site_missing_counts`，站点恢复/解绑后自动清零；`site_missing`/`site_removed` 均按 failure 上报（与部署回调 failure 语义一致），其余站点继续部署，解绑后不再重复失败
-- 常量：RENEW_DEFAULT_DAYS=14, MAX_ISSUE_RETRY_COUNT=10, RENEW_SLEEP_MIN=5, RENEW_SLEEP_MAX=120, SPREAD_TOTAL_MAX=600
-- 已过期证书（days_remaining < 0）不再触发续签
+- 常量：RENEW_DEFAULT_DAYS=14, MAX_ISSUE_RETRY_COUNT=10, MAX_DEPLOY_ATTEMPT_COUNT=10, SAFETY_MARGIN_HOURS=24, RENEW_SLEEP_MIN=5, RENEW_SLEEP_MAX=120, SPREAD_TOTAL_MAX=600（计数与状态常量集中在 `config`，`renew` 复用）
+- 已过期证书（剩余 ≤ 0）转 `EXPIRED` 静默终止，不再触发续签、不发回调
 - deploy_multi 全部站点失败时不更新 metadata（保留重试状态）
 - 单次续签上限 MAX_RENEW_BATCH=100，超出按配置文件顺序截断，剩余下次 cron 处理；紧急证书由用户手动触发
 - 续费订单 ID 更新：API 返回的 `order_id` 与本地不同时，`_check_order_update` 原子更新 config（order_id + cert_name）+ 重命名 pending key 目录 + 更新内存 cert_entry，后续操作使用新 ID；冲突（新 ID 已存在）时 warn 并沿用旧 ID
@@ -144,9 +151,10 @@ SetSSL 部署：写入前 pre-flight 校验既有配置（checkWebConfig，损�
 - `schedule.renew_before_days`：提前续签天数，默认 14，API 返回值覆写
 - `schedule.renew_mode`：全局续签模式（pull/local），证书级优先
 - `release_url` / `upgrade_channel`：升级地址和通道（main/dev）
-- `validation_method`：证书级验证方式（`delegation` 或 `file`），空值默认服务端决定；受域名类型约束（IP 不可 delegation，通配符不可 file），由 `validate_validation_method()` 在 add/update/renew 三处统一校验
+- `validation_method`：证书级验证方式（`delegation` 或 `file`），空值默认服务端决定；受域名类型约束（IP 不可 delegation，通配符不可 file）。派生统一走 `derive_or_validate_renew_policy()`（SAN 含 IP 强制 local/file），add_cert/update_cert_config/batch_set_renew_policy/续签提交均调用
+- `metadata`：新增 `deploy_attempt_count`（部署计数，从零起算）；`last_issue_state` 取值扩为 `""`/`processing`/`CAPPED`/`EXPIRED`/`policy_blocked_needs_setup`；触顶阶段记于 `cap_stage`（见 deploy-spec §1.5）
 - 站点唯一绑定：一个站点只能绑定一个证书，add_cert / update_cert / update_cert_config 均校验
-- 数据驱动迁移引擎：支持 delete/rename/move/spread 四种操作，升级后自动迁移旧字段
+- 数据驱动迁移引擎：delete/rename/move/spread 字段迁移 + 计算型语义迁移（`_migrate_cert_semantics`：pending 归一 processing、旧计数 `>=10` 立即 CAPPED(legacy)、旧非法 IP 配置 IP+pull/IP+delegation 进 `policy_blocked_needs_setup` 不自动改配置），仅在 `_ensure_config` 加载时一次性执行并持久化，不补发历史
 - ConfigManager 支持可选 `logger` 参数，JSON 损坏时记录 error 并创建 .bak 备份
 - `add_cert` / `update_cert` / `remove_cert` / `update_order_id` 使用 `_update_json` 原子读-改-写（独立锁文件防止竞态）
 
@@ -166,8 +174,8 @@ SetSSL 部署：写入前 pre-flight 校验既有配置（checkWebConfig，损�
 ## 前端约定
 
 - `sslbt_main.py` 方法名 = 前端 `P._call('method_name', params, callback)` 的 method_name
-- 证书编辑用 `update_cert_config`（原子更新 site_name/renew_mode/validation_method，站点唯一绑定校验 + 验证方式域名兼容性校验）
-- `batch_set_validation_method`：批量设置验证方式，不兼容的证书自动跳过并报告
+- 证书编辑用 `update_cert_config`（原子更新 site_name/renew_mode/validation_method，站点唯一绑定校验 + 策略派生；IP 证书 UI 禁用 pull/delegation，后端 `derive_or_validate_renew_policy` 兜底强制 local/file）
+- 批量续签策略用 `batch_set_renew_policy`（一次原子后端操作、逐证书派生：含 IP 强制 local/file，DNS 采用请求值，不兼容跳过并报告）；`batch_set_renew_mode`/`batch_set_validation_method` 为兼容旧入口
 - `_parse_cert_domains` 优先从证书 PEM 提取域名（DNS + IP SAN），未签发时回退 API 域名
 - 部署时若无匹配私钥，返回 `need_key: true`，前端弹窗让用户粘贴 PEM 后重新调用 `deploy_cert(private_key=...)`
 - 证书列表支持 checkbox 多选，顶部按钮（部署/删除）操作选中证书

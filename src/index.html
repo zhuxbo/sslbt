@@ -1056,11 +1056,12 @@
             '<div style="padding:20px 30px">' +
             '<div ' + row + '><label ' + lbl + '>绑定站点</label>' + sitesHtml + '</div>' +
             '<div ' + row + '><label ' + lbl + '>续签模式</label><select id="edit-renew-mode" ' + ipt + ' onchange="sslbt._toggleVmRow()">' +
-            '<option value="pull"' + (effectiveMode !== 'local' ? ' selected' : '') + '>自动签发</option>' +
-            '<option value="local"' + (effectiveMode === 'local' ? ' selected' : '') + '>本机提交</option></select></div>' +
-            '<div id="edit-vm-row" style="margin-bottom:14px;display:' + (effectiveMode === 'local' ? 'block' : 'none') + '"><label ' + lbl + '>验证方式</label><select id="edit-validation-method" ' + ipt + '>' +
+            // SAN 含 IP 的证书强制 local/file（禁用 pull/delegation，安全约束仍在后端派生）
+            '<option value="pull"' + (hasIP ? ' disabled' : '') + (effectiveMode !== 'local' && !hasIP ? ' selected' : '') + '>自动签发</option>' +
+            '<option value="local"' + (effectiveMode === 'local' || hasIP ? ' selected' : '') + '>本机提交</option></select></div>' +
+            '<div id="edit-vm-row" style="margin-bottom:14px;display:' + ((effectiveMode === 'local' || hasIP) ? 'block' : 'none') + '"><label ' + lbl + '>验证方式</label><select id="edit-validation-method" ' + ipt + '>' +
             '<option value="delegation"' + (hasIP ? ' disabled' : '') + (validationMethod !== 'file' && !hasIP ? ' selected' : '') + '>委托验证</option>' +
-            '<option value="file"' + (hasWildcard ? ' disabled' : '') + (validationMethod === 'file' && !hasWildcard ? ' selected' : '') + '>文件验证</option>' +
+            '<option value="file"' + (hasWildcard ? ' disabled' : '') + ((validationMethod === 'file' || hasIP) && !hasWildcard ? ' selected' : '') + '>文件验证</option>' +
             '</select></div>' +
             '<div ' + row + '><label ' + lbl + '>API URL</label><input id="edit-api-url" value="' + P._e(apiUrl) + '" placeholder="https://..." ' + ipt + ' /></div>' +
             '<div ' + row + '><label ' + lbl + '>API Token' + (apiTokenMasked ? ' <span style="color:#c0c4cc;font-weight:400">当前: ' + P._e(apiTokenMasked) + '</span>' : '') + '</label><input id="edit-api-token" value="" placeholder="留空则不修改" ' + ipt + ' /></div>' +
@@ -1221,21 +1222,19 @@
     batchSetRenewMode: function () {
       var mode = $('#batch-renew-mode').val();
       var label = mode === 'local' ? '本机提交' : '自动签发';
-      var confirmMsg = '确定将所有证书的续签模式设为「' + label + '」？';
+      var confirmMsg = '确定将所有证书的续签策略设为「' + label + '」？';
       if (mode === 'local') {
         var vmLabel = $('#batch-validation-method').val() === 'file' ? '文件验证' : '委托验证';
-        confirmMsg += '\n验证方式：' + vmLabel + '（不兼容的证书将跳过）';
+        confirmMsg += '\n验证方式：' + vmLabel + '（含 IP 的证书强制文件验证，不兼容的证书将跳过）';
       }
       layer.confirm(confirmMsg, { offset: 'auto', closeBtn: 2 }, function (idx) {
         layer.close(idx);
-        P._call('batch_set_renew_mode', { renew_mode: mode }, function (r) {
+        // 一次原子后端操作，逐证书派生（含 IP 的证书强制 local/file）
+        var params = { renew_mode: mode };
+        if (mode === 'local') params.validation_method = $('#batch-validation-method').val();
+        P._call('batch_set_renew_policy', params, function (r) {
           layer.msg(r.msg, { icon: r.status ? 1 : 2 });
-          if (r.status) P._certCache = {};
-          if (r.status && mode === 'local') {
-            P._call('batch_set_validation_method', { validation_method: $('#batch-validation-method').val() }, function (r2) {
-              if (r2.msg) layer.msg(r2.msg, { icon: r2.status ? 1 : 2 });
-            });
-          }
+          if (r.status) { P._certCache = {}; P.loadCerts(); }
         });
       });
     },

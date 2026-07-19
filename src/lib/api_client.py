@@ -23,11 +23,17 @@ TOKEN_PATTERN = re.compile(r'^[A-Za-z0-9\-_\.]+$')
 
 
 class APIError(Exception):
-    """API 调用异常"""
-    def __init__(self, message, code=0, status_code=0):
+    """API 调用异常。
+
+    transport=True 表示"不确定结果"（网络超时/断连、重试耗尽、响应解析失败）：请求可能已
+    到达服务端但结果未知，调用方（如 CSR 提交）应保留 pending key 待下轮查询订单状态恢复，
+    不得据此判定业务失败并清理在途状态（deploy-spec §1.3/§10.3）。
+    """
+    def __init__(self, message, code=0, status_code=0, transport=False):
         super().__init__(message)
         self.code = code
         self.status_code = status_code
+        self.transport = transport
 
 
 def validate_token(token):
@@ -135,7 +141,11 @@ class APIClient:
                     timeout = TIMEOUT_POST if method == 'POST' else TIMEOUT_GET
                 resp = self._opener.open(req, timeout=timeout)
                 resp_data = resp.read(max_size)
-                return json.loads(resp_data.decode('utf-8'))
+                try:
+                    return json.loads(resp_data.decode('utf-8'))
+                except (json.JSONDecodeError, UnicodeDecodeError) as pe:
+                    # 响应已到达但无法解析：属"不确定结果"，标记 transport 供上层保留 pending 恢复
+                    raise APIError("响应解析失败: %s" % str(pe), transport=True)
             except HTTPError as e:
                 last_err = e
                 status = e.code
@@ -154,7 +164,9 @@ class APIClient:
             except (URLError, OSError) as e:
                 last_err = e
 
-        raise APIError("API 请求失败（已重试 %d 次）: %s" % (MAX_RETRIES, str(last_err)))
+        # 网络失败重试耗尽：结果不确定（请求可能已到达服务端），标记 transport
+        raise APIError("API 请求失败（已重试 %d 次）: %s" % (MAX_RETRIES, str(last_err)),
+                       transport=True)
 
     def _parse_data(self, result):
         """解析 API 响应，提取 data 字段"""

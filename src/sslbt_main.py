@@ -23,7 +23,9 @@ if hasattr(sys.modules.get('sslbt_main'), 'sslbt_main'):
     for _mod in [k for k in sys.modules if k == 'lib' or k.startswith('lib.')]:
         del sys.modules[_mod]
 
-from lib.config import ConfigManager  # noqa: E402
+from lib.config import (  # noqa: E402
+    ConfigManager, derive_or_validate_renew_policy, ISSUE_STATE_POLICY_BLOCKED,
+)
 from lib.logger import Logger  # noqa: E402
 from lib.api_client import APIClient, APIError  # noqa: E402
 from lib.cert_utils import build_fullchain, parse_cert_info, verify_cert_key_match, validate_key_pem  # noqa: E402
@@ -312,12 +314,12 @@ class sslbt_main:
             cert_data = api.query_order(order_id)
             domains = self._parse_cert_domains(cert_data)
 
-            if validation_method:
-                from lib.config import validate_validation_method
-                err_msg = validate_validation_method(domains, validation_method)
-                if err_msg:
-                    self._logger.warning("add_cert 早返回: validation_method 校验失败 order_id=%s err=%s", order_id, err_msg)
-                    return _err(err_msg)
+            # 派生续签策略（SAN 含 IP 强制 local/file；DNS 校验兼容性）——唯一权威
+            renew_mode, validation_method, err_msg = derive_or_validate_renew_policy(
+                domains, renew_mode, validation_method)
+            if err_msg:
+                self._logger.warning("add_cert 早返回: 策略派生失败 order_id=%s err=%s", order_id, err_msg)
+                return _err(err_msg)
 
             cert_name = 'order-%d' % order_id
             entry = self._config.add_cert(
@@ -332,7 +334,7 @@ class sslbt_main:
 
             self._logger.info("添加证书: order_id=%s, domains=%s", order_id, ','.join(domains))
 
-            # 根据续签模式设置 auto_reissue
+            # 按派生模式设置 auto_reissue（local 关 / pull 开；不自动开付费 auto_renew）
             effective_mode = renew_mode or self._config.get_config().get('schedule', {}).get('renew_mode', 'pull')
             try:
                 api.toggle_auto_reissue(order_id, effective_mode == 'pull')
@@ -402,19 +404,25 @@ class sslbt_main:
                     return _err('站点已被其他证书绑定: %s' % ', '.join(conflict))
                 updates['site_name'] = requested
 
+            # 续签策略：以请求值（缺省沿用现值）统一派生（SAN 含 IP 强制 local/file）——唯一权威
+            cert0 = self._config.get_cert(order_id)
+            domains0 = cert0.get('domains', []) if cert0 else []
             renew_mode = _get_param(args, 'renew_mode', '')
-            if renew_mode in ('pull', 'local', ''):
-                updates['renew_mode'] = renew_mode
-
             validation_method = _get_param(args, 'validation_method', '')
-            if validation_method in ('file', 'delegation'):
-                cert = self._config.get_cert(order_id)
-                if cert:
-                    from lib.config import validate_validation_method
-                    err_msg = validate_validation_method(cert.get('domains', []), validation_method)
-                    if err_msg:
-                        return _err(err_msg)
-                updates['validation_method'] = validation_method
+            mode_provided = renew_mode in ('pull', 'local', '')
+            vm_provided = validation_method in ('file', 'delegation')
+            if mode_provided or vm_provided:
+                base_mode = renew_mode if mode_provided else (cert0.get('renew_mode', '') if cert0 else '')
+                base_vm = validation_method if vm_provided else (cert0.get('validation_method', '') if cert0 else '')
+                # pull 模式 validation 不参与（避免旧值触发误报）；IP 会被派生强制为 local/file
+                d_mode, d_vm, err_msg = derive_or_validate_renew_policy(
+                    domains0, base_mode, base_vm if base_mode != 'pull' else '')
+                if err_msg:
+                    return _err(err_msg)
+                if mode_provided:
+                    updates['renew_mode'] = d_mode
+                if d_mode == 'local' and (vm_provided or d_vm != base_vm):
+                    updates['validation_method'] = d_vm
 
             api_url = _get_param(args, 'api_url', '')
             api_token = _get_param(args, 'api_token', '')
@@ -434,6 +442,11 @@ class sslbt_main:
                 return _err('无更新内容')
 
             self._config.update_cert(order_id, updates)
+            # 原为 policy_blocked（旧非法 IP 配置）且本次已设为合法策略 → 清除阻断终态（重新 setup）
+            if cert0 and 'renew_mode' in updates \
+                    and cert0.get('metadata', {}).get('last_issue_state') == ISSUE_STATE_POLICY_BLOCKED:
+                self._config.update_metadata(order_id, {'last_issue_state': ''})
+                self._logger.info("证书重新设置合法策略，清除 policy_blocked: order_id=%s", order_id)
             self._logger.info("更新证书配置: order_id=%s", order_id)
             return _ok(msg='配置更新成功')
         except ValueError as e:
@@ -827,8 +840,46 @@ class sslbt_main:
         except Exception as e:
             return _err('获取站点匹配失败: %s' % str(e))
 
+    def batch_set_renew_policy(self, args=None):
+        """批量设置续签策略（一次原子后端操作，逐证书派生）。
+
+        对每个证书按其域名派生 (renew_mode, validation_method)：SAN 含 IP 强制 local/file，
+        DNS 证书采用请求值并做兼容性校验（不兼容跳过）。DNS 证书不受混合批次中 IP 证书影响。
+        原为 policy_blocked（旧非法 IP 配置）的证书本次设为合法策略后清除阻断终态。
+        """
+        try:
+            mode = _get_param(args, 'renew_mode', '')
+            if mode not in ('pull', 'local'):
+                return _err('无效的续签模式')
+            validation = _get_param(args, 'validation_method', '')
+            if mode == 'local' and validation not in ('file', 'delegation'):
+                return _err('本机提交模式需指定验证方式')
+            certs = self._config.get_certs()
+            count = 0
+            skipped = []
+            for c in certs:
+                domains = c.get('domains', [])
+                d_mode, d_vm, err = derive_or_validate_renew_policy(
+                    domains, mode, validation if mode == 'local' else '')
+                if err:
+                    skipped.append(c.get('cert_name') or str(c.get('order_id', '')))
+                    continue
+                updates = {'renew_mode': d_mode}
+                if d_mode == 'local':  # pull 模式 validation 由服务端决定，不改写
+                    updates['validation_method'] = d_vm
+                self._config.update_cert(c['order_id'], updates)
+                if c.get('metadata', {}).get('last_issue_state') == ISSUE_STATE_POLICY_BLOCKED:
+                    self._config.update_metadata(c['order_id'], {'last_issue_state': ''})
+                count += 1
+            msg = '已为 %d 个证书设置续签策略' % count
+            if skipped:
+                msg += '，%d 个因域名限制跳过：%s' % (len(skipped), ', '.join(skipped))
+            return _ok(msg=msg)
+        except Exception as e:
+            return _err('批量设置失败: %s' % str(e))
+
     def batch_set_renew_mode(self, args=None):
-        """批量设置所有证书的续签模式"""
+        """批量设置所有证书的续签模式（逐证书派生，SAN 含 IP 强制 local/file）"""
         try:
             mode = _get_param(args, 'renew_mode', '')
             if mode not in ('pull', 'local'):
@@ -836,7 +887,11 @@ class sslbt_main:
             certs = self._config.get_certs()
             count = 0
             for c in certs:
-                self._config.update_cert(c['order_id'], {'renew_mode': mode})
+                d_mode, d_vm, _ = derive_or_validate_renew_policy(c.get('domains', []), mode, '')
+                updates = {'renew_mode': d_mode}
+                if d_mode == 'local' and d_vm:
+                    updates['validation_method'] = d_vm
+                self._config.update_cert(c['order_id'], updates)
                 count += 1
             return _ok(msg='已将 %d 个证书设为 %s' % (count, '自动签发' if mode == 'pull' else '本机提交'))
         except Exception as e:
