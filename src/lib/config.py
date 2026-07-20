@@ -7,6 +7,41 @@ import fcntl
 import shutil
 import ipaddress
 
+# 续签模式与验证方式（deploy-spec §1.2/§1.3）
+RENEW_MODE_PULL = 'pull'
+RENEW_MODE_LOCAL = 'local'
+VALIDATION_METHOD_FILE = 'file'
+VALIDATION_METHOD_DELEGATION = 'delegation'
+
+# 签发/部署尝试上限（deploy-spec §11：各自 >= 10 触顶）。renew.py 复用同一常量
+MAX_ISSUE_RETRY_COUNT = 10
+MAX_DEPLOY_ATTEMPT_COUNT = 10
+
+# last_issue_state 取值（deploy-spec §1.5）
+ISSUE_STATE_PROCESSING = 'processing'
+ISSUE_STATE_CAPPED = 'CAPPED'            # 触顶静默，记录阶段：issue/deploy/legacy
+ISSUE_STATE_EXPIRED = 'EXPIRED'          # 已过期静默
+ISSUE_STATE_POLICY_BLOCKED = 'policy_blocked_needs_setup'  # 旧非法 IP 配置，待重新 setup
+# CAPPED 触顶阶段（记录到 metadata.cap_stage）
+CAP_STAGE_ISSUE = 'issue'
+CAP_STAGE_DEPLOY = 'deploy'
+CAP_STAGE_LEGACY = 'legacy'
+# 触顶/过期/policy 阻断为终态：不再启动新动作、不发回调、迁移不再改写
+TERMINAL_ISSUE_STATES = (ISSUE_STATE_CAPPED, ISSUE_STATE_EXPIRED, ISSUE_STATE_POLICY_BLOCKED)
+
+
+def domains_contain_ip(domains):
+    """判断域名列表是否含 IP（IPv4/IPv6）"""
+    if not domains:
+        return False
+    for d in domains:
+        try:
+            ipaddress.ip_address(d)
+            return True
+        except (ValueError, TypeError):
+            continue
+    return False
+
 
 def validate_validation_method(domains, method):
     """校验域名列表与验证方式的兼容性，返回错误信息或空串"""
@@ -16,14 +51,30 @@ def validate_validation_method(domains, method):
         try:
             ipaddress.ip_address(d)
             is_ip = True
-        except ValueError:
+        except (ValueError, TypeError):
             is_ip = False
         is_wildcard = len(d) > 2 and d[:2] == '*.'
-        if is_ip and method == 'delegation':
+        if is_ip and method == VALIDATION_METHOD_DELEGATION:
             return 'IP 地址不支持委托验证'
-        if is_wildcard and method == 'file':
+        if is_wildcard and method == VALIDATION_METHOD_FILE:
             return '通配符域名不支持文件验证'
     return ''
+
+
+def derive_or_validate_renew_policy(domains, renew_mode='', validation_method=''):
+    """派生或校验证书续签策略（deploy-spec §5.2，唯一权威）。
+
+    返回 (renew_mode, validation_method, error)：
+    - SAN 含 IP：强制 renew_mode=local + validation_method=file（覆盖入参）；
+      local 走 CSR 提交，pull 不带 CSR 的差异由续签引擎按模式处理。IP 永不返回 error。
+    - 非 IP：沿用入参 renew_mode；validation_method 经域名兼容性校验，不兼容返回 error。
+    """
+    if domains_contain_ip(domains):
+        return RENEW_MODE_LOCAL, VALIDATION_METHOD_FILE, ''
+    err = validate_validation_method(domains, validation_method)
+    if err:
+        return renew_mode, validation_method, err
+    return renew_mode, validation_method, ''
 
 
 DEFAULT_CONFIG = {
@@ -57,6 +108,7 @@ DEFAULT_CERT_ENTRY = {
         'last_csr_hash': '',
         'last_issue_state': '',
         'issue_retry_count': 0,
+        'deploy_attempt_count': 0,
     },
 }
 
@@ -180,6 +232,54 @@ def _fill_defaults(data, defaults):
     return changed
 
 
+def _migrate_cert_semantics(cert, global_renew_mode):
+    """对单个证书应用计算型语义迁移（幂等），返回 changed 标志（deploy-spec §3.4/§5.2）。
+
+    - 旧 `pending` 归一为 `processing`（只查询、不重复提交、不增计数、不重生 CSR）
+    - 旧计数触顶（issue/deploy >= 10）升级后立即进入 CAPPED(legacy) 静默，不补发历史事件
+    - 旧非法 IP 配置（IP + pull 或 IP + delegation）进入 policy_blocked_needs_setup：
+      不自动改配置、不计数、不回调，等待重新 setup
+    部署计数从零开始由默认值补 0 保证，不从旧混合计数推断。触顶/过期/policy 均为终态，
+    迁移只置状态、不产生任何回调。
+    """
+    meta = cert.get('metadata')
+    if not isinstance(meta, dict):
+        return False
+    changed = False
+    state = meta.get('last_issue_state', '')
+
+    # 1. 旧 pending 归一 processing
+    if state == 'pending':
+        state = ISSUE_STATE_PROCESSING
+        meta['last_issue_state'] = state
+        changed = True
+
+    # 2. 旧计数触顶 → CAPPED(legacy)，不补发历史
+    if state not in TERMINAL_ISSUE_STATES:
+        try:
+            issue_count = int(meta.get('issue_retry_count', 0) or 0)
+        except (TypeError, ValueError):
+            issue_count = 0
+        try:
+            deploy_count = int(meta.get('deploy_attempt_count', 0) or 0)
+        except (TypeError, ValueError):
+            deploy_count = 0
+        if issue_count >= MAX_ISSUE_RETRY_COUNT or deploy_count >= MAX_DEPLOY_ATTEMPT_COUNT:
+            meta['last_issue_state'] = ISSUE_STATE_CAPPED
+            meta['cap_stage'] = CAP_STAGE_LEGACY
+            state = ISSUE_STATE_CAPPED
+            changed = True
+
+    # 3. 旧非法 IP 配置 → policy_blocked_needs_setup（不改 renew_mode/validation_method）
+    if state not in TERMINAL_ISSUE_STATES and domains_contain_ip(cert.get('domains', [])):
+        effective_mode = cert.get('renew_mode', '') or global_renew_mode
+        if effective_mode == RENEW_MODE_PULL or cert.get('validation_method', '') == VALIDATION_METHOD_DELEGATION:
+            meta['last_issue_state'] = ISSUE_STATE_POLICY_BLOCKED
+            changed = True
+
+    return changed
+
+
 class ConfigManager:
     """配置读写管理，文件锁保护"""
 
@@ -216,10 +316,12 @@ class ConfigManager:
         changed = _apply_spread_rules(raw, _SPREAD_RULES) or changed
         changed = _fill_defaults(raw, DEFAULT_CONFIG) or changed
 
-        # 证书字段迁移
+        # 证书字段迁移 + 计算型语义迁移（pending 归一、legacy 触顶、policy 阻断）
+        global_renew_mode = raw.get('schedule', {}).get('renew_mode', RENEW_MODE_PULL)
         for cert in raw.get('certificates', []):
             changed = _apply_field_rules(cert, _CERT_FIELD_RULES) or changed
             changed = _fill_defaults(cert, DEFAULT_CERT_ENTRY) or changed
+            changed = _migrate_cert_semantics(cert, global_renew_mode) or changed
 
         if changed:
             try:

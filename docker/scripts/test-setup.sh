@@ -36,31 +36,34 @@ docker exec "$CONTAINER" test -d /www/server/panel/plugin/sslbt/data/logs && \
 PERM=$(docker exec "$CONTAINER" stat -c '%a' /www/server/panel/plugin/sslbt/data/config.json 2>/dev/null || echo "unknown")
 [ "$PERM" = "600" ] && pass "config.json 权限 0600" || fail "config.json 权限错误: $PERM"
 
-# 4. 测试 API 连接
-RESULT=$(call_plugin "$CONTAINER" "test_connection" "{}")
+# 4. 读取插件配置
+RESULT=$(call_plugin "$CONTAINER" "get_config" "{}")
 echo "$RESULT" | python3 -c "
 import sys, json
 r = json.load(sys.stdin)
-if r.get('status'):
-    print('CONN_OK')
+if r.get('status') and r.get('data', {}).get('plugin_version'):
+    print('OK')
 else:
-    print('CONN_FAIL: ' + r.get('msg', ''))
+    print('FAIL: ' + r.get('msg', ''))
 " | while read line; do
     case "$line" in
-        CONN_OK)   pass "API 连接测试成功" ;;
-        CONN_FAIL*) fail "API 连接测试失败: $line" ;;
+        OK)   pass "插件配置读取成功" ;;
+        FAIL*) fail "插件配置读取失败: $line" ;;
     esac
 done
 
-# 5. 获取仪表板数据
-RESULT=$(call_plugin "$CONTAINER" "get_dashboard" "{}")
+# 5. 获取证书列表（初始为空列表）
+RESULT=$(call_plugin "$CONTAINER" "get_cert_list" "{}")
 echo "$RESULT" | python3 -c "
 import sys, json
 r = json.load(sys.stdin)
-if r.get('status') and r.get('data', {}).get('api_configured'):
+if r.get('status') and isinstance(r.get('data'), list):
     print('OK')
 else:
-    print('FAIL')
+    print('FAIL: ' + r.get('msg', ''))
 " | while read line; do
-    [ "$line" = "OK" ] && pass "仪表板数据加载成功" || fail "仪表板数据加载失败"
+    case "$line" in
+        OK)   pass "证书列表接口正常" ;;
+        FAIL*) fail "证书列表接口异常: $line" ;;
+    esac
 done

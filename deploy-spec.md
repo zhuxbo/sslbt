@@ -1,8 +1,8 @@
 # SSL 证书部署工具统一规范
 
-跨平台 SSL 证书自动部署工具的共通行为规范。定义配置文件结构、API 接口、续签状态机、一键部署、部署流程、升级协议、安装/卸载、安全规范和共享常量。
+跨平台 SSL 证书自动部署工具的共通行为规范。定义配置文件结构、API 接口、续签状态机、一键部署、部署流程、升级协议、构建发布、安装/卸载、安全规范、共享常量和智能体协作约定。
 
-适用项目：sslctl（Linux Nginx/Apache）、sslctlw（Windows IIS）、sslbt（宝塔面板）、sslnas（NAS 系统）及未来新平台实现。
+适用项目：sslctl（Linux Nginx/Apache）、sslctlw（Windows IIS）、sslbt（宝塔面板）及未来新平台实现。
 
 ## 定位
 
@@ -61,6 +61,7 @@
 
 - IP 域名不可选 `delegation`（IP 无 DNS 记录，无法完成委托验证）
 - 通配符域名不可选 `file`（通配符无法指向具体站点放置验证文件）
+- SAN 含 IP 的证书在 setup 与续签时自动派生为 `renew_mode=local` + `validation_method=file`（见 §5.2）
 
 ### 1.4 api
 
@@ -78,10 +79,11 @@
 | `last_deploy_at`    | string | 最后部署时间（RFC3339）                                        |
 | `cert_expires_at`   | string | 证书过期时间（RFC3339）                                        |
 | `cert_serial`       | string | 证书序列号                                                     |
-| `csr_submitted_at`  | string | CSR 提交时间（仅 local 模式）                                  |
-| `last_csr_hash`     | string | 上次 CSR 的 SHA256 哈希                                        |
-| `last_issue_state`  | string | 签发状态：`""` / `processing` / 其他（异常状态，等待人工处理） |
-| `issue_retry_count` | int    | CSR 提交重试计数                                               |
+| `csr_submitted_at`     | string | CSR 提交时间（仅 local 模式）                                  |
+| `last_csr_hash`        | string | 上次 CSR 的 SHA256 哈希                                        |
+| `last_issue_state`     | string | 签发/生命周期状态：`""` / `processing` / `CAPPED`（触顶，记录阶段：签发/部署/legacy）/ `EXPIRED`（已过期静默）/ 其他异常（等待人工处理） |
+| `issue_retry_count`    | int    | 签发尝试计数（CSR 提交），`>= 10` 触顶                          |
+| `deploy_attempt_count` | int    | 部署尝试计数，`>= 10` 触顶；与签发计数分离，不从旧混合计数推断  |
 
 ### 1.6 扩展区约定
 
@@ -94,7 +96,6 @@
 | Nginx/Apache | 1:N       | 1:1       | `bindings[]`（按站点）        |
 | IIS          | 1:N       | 1:N       | `bind_rules[]`（按域名:端口） |
 | 宝塔         | 1:N       | 1:1       | `site_name[]`（站点名列表）   |
-| NAS          | 1:1       | 1:1       | 无（直接部署到 NAS 证书存储） |
 
 ### 1.7 配置文件迁移
 
@@ -213,6 +214,11 @@ GET /api/deploy?order={id1,id2,domain1,...}  （批量，逗号分隔，上限 1
 
 `certificate`、`ca_certificate`、`private_key`、`issued_at`、`expires_at` 仅在 `status=active` 时返回。
 
+状态语义：提交 CSR 的成功响应只会是 `pending` / `processing`（均表示服务端已收到 CSR）；查询订单在
+`processing` 与 `active` 之间可能出现短暂中间态 `approving`。客户端将 `pending` / `processing` /
+`approving` 统一归一为 `processing` 继续等待；`active` 之后的状态均为订单终态，客户端持久化后停止
+自动动作，等待人工处理。
+
 ### 2.5 file 结构
 
 | 字段      | 类型   | 说明             |
@@ -238,7 +244,16 @@ Content-Type: application/json
 
 `validation_method` 限制见 §1.3。
 
-响应 data：单个 CertData + `renew_before_days`。
+响应 data：单个 CertData + `renew_before_days`。提交 CSR 后服务端先进入验证流程，响应状态为
+`processing`（提交暂未完成时可能保持 `pending`），不会在本次请求中同步返回 `active`；客户端应在后续
+查询中等待状态变为 `active` 后再部署。
+
+服务端对重复提交的幂等由现有 Order/Action 状态机保证（订单已进入处理则不再创建新证书、不重复扣费）。客户端收到
+`pending` 或"已在处理"类响应时，统一归一为 `processing` 查询路径：只 GET 查询，不重复 POST，不增加计数，不重新生成
+CSR。
+
+服务端未接收提交（校验失败、订单状态不允许等）时返回错误信息而非状态：客户端按明确业务拒绝处理，清理在途
+pending 后停止。因此提交结果不确定（超时/断连/解析失败）后的恢复只需查询订单状态，无需重复 POST。
 
 ### 2.7 切换自动重签
 
@@ -263,21 +278,29 @@ POST /api/deploy/callback
 Content-Type: application/json
 ```
 
-请求体：
+请求体（四字段，协议零改动）：
 
 | 字段          | 类型   | 说明                  |
 | ------------- | ------ | --------------------- |
 | `order_id`    | int    | 订单 ID               |
 | `status`      | string | `success` / `failure` |
 | `deployed_at` | string | 部署时间（RFC3339）   |
+| `message`     | string | 可选，仅 `status=failure` 时携带失败原因摘要：客户端截断至 ≤256 字符并经敏感信息脱敏；服务端校验上限 500，超限整条被拒；第 10 次（最后一次）部署失败在 `message` 标注"已达重试上限" |
 
-响应 data 包含 `renew_before_days`。
+响应 data 包含 `recorded`（服务端已记录）与 `renew_before_days`。
 
-回调为非关键路径，失败仅记日志，不影响部署结果。
+回调契约：
+
+- 客户端只上报**部署结果**：每次部署成功与每次明确部署失败各尽力上报一次，不做次数筛选、不做节流。签发失败不上报（服务端自行记录），客户端仅记本地日志与本地计数。
+- 上报为非关键路径：传输失败仅由既有传输层重试（3 次退避）兜底，之后只记日志，不持久排队、不补发；无 outbox、无幂等 ID，允许缺行、偶发重复行、迟到行。
+- 回调所有权收敛到编排层：自动续签调用链的底层部署函数不得自行发送回调，只返回结构化结果，由编排层在部署结果原子落盘后统一发送一次；手动 `deploy` / `setup` 回调语义不变。
+- 触顶（计数 `>= 10`）、过期、policy 阻断路径不发送任何回调。
 
 ### 2.9 renew_before_days 的传递
 
 服务端在所有接口的响应 data 中返回 `renew_before_days`。客户端每次收到后更新本地 `schedule.renew_before_days`。
+
+客户端对返回值做上限校验：`renew_before_days` 上限为 **30**——无论续费还是重签，续签动作都应发生在到期前 30 天以内；超过 30 视为服务端异常值，拒绝更新并保留本地现值，防止异常大值把全部证书拉入需续签状态、触发每日全量续签。
 
 ---
 
@@ -293,14 +316,24 @@ Content-Type: application/json
 
 遍历证书列表，按以下条件跳过：
 
-| 条件                                   | 处理               |
-| -------------------------------------- | ------------------ |
-| `enabled = false`                      | 跳过               |
-| 已过期（剩余天数 < 0）                 | 跳过，等待人工处理 |
-| `issue_retry_count > 10`（local 模式） | 跳过，等待人工处理 |
-| 无 API 配置                            | 跳过               |
+| 条件                                            | 处理                                           |
+| ----------------------------------------------- | ---------------------------------------------- |
+| `enabled = false`                               | 跳过                                           |
+| 已过期（剩余时间 ≤ 0）                          | 静默终止并转 `EXPIRED`，仅留本地日志与人工入口 |
+| 剩余有效期 < 安全余量（默认 24 小时）           | 跳过，不启动新动作                             |
+| `last_issue_state = CAPPED`（已触顶）           | 跳过，等待人工处理                             |
+| `issue_retry_count >= 10`（签发触顶，local 模式）| 进入 `CAPPED`，跳过                            |
+| `deploy_attempt_count >= 10`（部署触顶）        | 进入 `CAPPED`，跳过                            |
+| 无 API 配置                                     | 跳过                                           |
 
-**核心原则：证书到期后不再自动发起任何操作，等待人工处理。**
+**核心原则：证书到期后不再自动发起任何操作，等待人工处理。触顶（任一计数 `>= 10`）与过期均静默终止，不启动新动作、不发送任何回调。**
+
+**计数与终止：**
+
+- 签发尝试（`issue_retry_count`，即 CSR 提交）与部署尝试（`deploy_attempt_count`）分别计数、各自上限 10 次；所有停止判断统一为 `count >= 10`，绝不出现第 11 次尝试。
+- 计数在"持久化一个新的逻辑尝试意图"时递增；同一尝试的崩溃恢复重放、传输层重试、GET 轮询、policy 阻断均不增加计数。
+- 任一阶段触顶后进入客户端本地 `CAPPED` 状态并记录触顶阶段（签发 / 部署 / legacy）：不再启动新动作、不发送任何回调，等待人工处理；证书到期后转 `EXPIRED`。
+- 证书绝对到期时间是自动动作的准入截止点：剩余有效期小于统一安全余量（默认 24 小时）时不再启动新动作；已过期证书静默终止。触顶与过期都不产生任何回调事件。
 
 ### 3.3 续签模式确定
 
@@ -327,21 +360,21 @@ effective_mode = cert.renew_mode || schedule.renew_mode
 检查 metadata.last_issue_state：
 
 == ""（初始/已完成）：
-  ├─ 剩余天数 ≤ renew_before_days → 提交新 CSR
-  │   ├─ 检查重试次数（> 10 → 停止，等待人工处理）
-  │   ├─ 生成 CSR（仅 CN，不含 SAN），保存私钥到 pending-keys/
-  │   ├─ 递增 issue_retry_count
+  ├─ 剩余有效期 ≤ renew_before_days 且 ≥ 安全余量 → 提交新 CSR
+  │   ├─ 检查签发计数（issue_retry_count >= 10 → 进入 CAPPED，停止，等待人工处理）
+  │   ├─ 生成 CSR（仅 CN，不含 SAN）
+  │   ├─ 网络请求前：原子持久化 pending key 与 CSR 哈希，并递增 issue_retry_count（计数 = 持久化一个新的逻辑尝试意图）
   │   ├─ POST /api/deploy 提交 CSR
-  │   ├─ 响应 status=processing → 放置验证文件，标记 processing
-  │   └─ 响应 status=active → 立即部署
-  └─ 剩余天数 > renew_before_days → 跳过
+  │   │   └─ 超时 / 断连 / 响应解析失败属"不确定结果"：保留 pending key 作为在途标记，下轮查询订单状态恢复，不重复 POST、不重新生成 CSR
+  │   └─ 响应 status=processing 或 pending → 归一为 processing，放置验证文件，标记 processing
+  └─ 剩余有效期 > renew_before_days → 跳过
 
 == "processing"（等待签发）：
-  ├─ 证书已过期 → 停止，等待人工处理
-  └─ 查询订单状态
+  ├─ 证书已过期或剩余不足安全余量 → 停止（EXPIRED / 等待人工处理），不再动作
+  └─ 查询订单状态（只 GET，不重复 POST，不增加计数）
       ├─ status=active → 读取 pending key，部署，清理
-      ├─ status=processing → 更新验证文件（如有新的），继续等待
-      └─ 其他异常状态 → 持久化实际状态到 `last_issue_state`，停止，等待人工处理
+      ├─ status=processing / pending / approving → 归一为 processing，更新验证文件（如有新的），继续等待
+      └─ 其他状态（订单终态）→ 持久化实际状态到 `last_issue_state`，停止，等待人工处理；后续轮次仍可查询自愈，但状态未变化时不重复记录/落盘
 ```
 
 ### 3.6 文件验证流程（local 模式）
@@ -357,8 +390,6 @@ effective_mode = cert.renew_mode || schedule.renew_mode
 5. 部署成功后自动清理所有验证文件
 ```
 
-**平台豁免**：NAS 平台（sslnas）豁免此流程。NAS 通常部署在家庭宽带环境，80/443 端口不通，无法完成 HTTP 文件验证。遇到 `file` 字段时记录警告日志并跳过。NAS 的 local 模式应使用 `delegation`（DNS 委托）验证。
-
 ### 3.7 并发执行保护
 
 防止多个进程同时执行续签（cron 重叠、手动与自动并发）：
@@ -370,9 +401,9 @@ effective_mode = cert.renew_mode || schedule.renew_mode
 ### 3.8 部署成功后
 
 1. 更新 metadata：`last_deploy_at`、`cert_expires_at`、`cert_serial`
-2. 清零 CSR 状态：`csr_submitted_at`、`last_csr_hash`、`issue_retry_count`、`last_issue_state`
+2. 清零签发与部署状态：`csr_submitted_at`、`last_csr_hash`、`issue_retry_count`、`deploy_attempt_count`、`last_issue_state`
 3. 清理 pending key 和验证文件
-4. 发送回调 `POST /api/deploy/callback`（非关键路径）
+4. 由编排层在结果原子落盘后统一发送 `success` 回调 `POST /api/deploy/callback`（非关键路径，底层部署函数不自行发送）
 
 ---
 
@@ -394,7 +425,7 @@ effective_mode = cert.renew_mode || schedule.renew_mode
 1. 查询证书信息（GET /api/deploy?order=...）
 2. 检测/匹配站点（平台特定扩展点）
 3. 部署证书到匹配的站点
-4. 设置续签模式（调用 toggleAutoReissue）
+4. 按证书派生续签模式并设置 `auto_reissue`（SAN 含 IP 的证书强制 local/file，见 §5.2；调用 toggleAutoReissue）
 5. 写入配置文件（api、domains、metadata 等）
 6. 注册守护服务/计划任务（平台特定扩展点）
 ```
@@ -416,6 +447,8 @@ effective_mode = cert.renew_mode || schedule.renew_mode
 6. 发送部署回调
 ```
 
+自动续签路径：部署尝试在持久化新的部署意图时递增 `deploy_attempt_count`（`>= 10` 触顶进入 `CAPPED`，崩溃恢复重放同一意图不增计数）；底层部署函数只返回结构化结果，由编排层在结果原子落盘后统一发送回调。手动 `deploy` / `setup` 的回调语义不变。
+
 ### 5.2 续签模式与 API 侧行为
 
 | 模式    | API 自动重签                 | 续签发起方             |
@@ -423,7 +456,11 @@ effective_mode = cert.renew_mode || schedule.renew_mode
 | `pull`  | 开启（`auto_reissue=true`）  | 服务端签发，客户端拉取 |
 | `local` | 关闭（`auto_reissue=false`） | 客户端生成 CSR 提交    |
 
-首次部署时调用 `toggleAutoReissue` 接口设置。
+首次部署时调用 `toggleAutoReissue` 接口按模式设置 `auto_reissue`：local 关闭（防服务端 scheduler 抢跑生成服务端私钥），pull 开启；不自动开启付费的 `auto_renew`。
+
+**IP 证书自动 local/file**：SAN 含 IP 的证书在 setup 与续签时自动进入 `renew_mode=local`、`validation_method=file` 并提交 CSR；`pull` 模式不携带 CSR。批量 setup 逐证书派生模式，DNS 证书不受混合批次影响；IP 与通配符不能同时提交的限制沿用服务端现有校验。三平台（Linux / Windows / 宝塔）均支持 IP local/file。
+
+旧的非法 IP 配置（IP + `pull` 或 IP + `delegation`）进入 `policy_blocked_needs_setup`：不自动改配置、不计数、不回调，等待重新 setup。
 
 ### 5.3 私钥来源
 
@@ -432,7 +469,8 @@ effective_mode = cert.renew_mode || schedule.renew_mode
 1. API 返回的 `private_key`
 2. 调用参数指定的私钥路径
 3. 本地已有的私钥（绑定站点的已部署私钥）
-4. 交互提示用户提供私钥
+4. `pending-keys/` 待确认私钥（本地私钥与目标证书不配对时，配对校验通过才用；部署成功后转正，与 3.8 一致）
+5. 交互提示用户提供私钥
 
 所有来源均需验证与证书匹配后才使用。
 
@@ -445,7 +483,7 @@ effective_mode = cert.renew_mode || schedule.renew_mode
 - `query` 响应中 `order_id` 与本地不同时
 - `update`（CSR 提交）响应中返回新 `order_id` 时
 
-检测到变更后立即更新本地配置中的 `order_id`，保持证书关联不断。
+检测到变更后立即更新本地配置中的 `order_id`，并同步迁移证书配置与 `pending-keys/` 目录（按证书名/订单键改名，无 pending 私钥时为空操作），保持证书关联与在途 CSR 私钥不断。
 
 ### 5.5 部署后域名提取
 
@@ -538,6 +576,8 @@ GET {release_url}/releases.json
 | `version`              | 版本号（不带 v 前缀），目录名加 v 前缀（`v1.2.0`）    |
 | `released_at`          | 发布日期（YYYY-MM-DD）                                 |
 | `checksums`            | 按文件名索引的 SHA256 哈希，支持多平台产物              |
+| `source_commit`        | 可选；产物来源 Git commit，dev 发布必须记录             |
+| `dirty`                | 可选；产物是否包含未提交改动，dev 发布必须记录           |
 
 平台可在版本条目中增加扩展字段（如 sslctl 的 `signature`），与 `checksums` 同级。
 
@@ -624,8 +664,8 @@ GET {release_url}/releases.json
 各平台构建方式不同（Go binary / Python zip），但遵守统一约定：
 
 - **版本号注入**：构建时注入版本号（语义化版本 x.y.z），运行时可通过 `--version` 查看
-- **产物命名**：`{product}-{os}-{arch}.{ext}`，版本在目录路径 `{channel}/v{version}/` 中体现。单二进制产物仅 gz 压缩（如 `sslctl-linux-amd64.gz`），多文件产物使用 tar.gz 或 zip
-- **校验文件**：每个产物附带 SHA256 校验文件（`{filename}.sha256`）
+- **产物命名**：由各仓发布 skill 按平台安装与升级契约定义；同一平台和版本内必须稳定，版本统一在目录路径 `{channel}/v{version}/` 中体现，`checksums` 必须以实际公开文件名为 key
+- **完整性信息**：每个发布产物的 SHA256 必须写入 `releases.json` 对应版本条目的 `checksums`；不要求生成或上传独立 `.sha256` 文件，平台可按需额外提供
 
 ### 8.2 发布目录结构
 
@@ -649,18 +689,92 @@ GET {release_url}/releases.json
 
 ```
 1. 构建产物，注入版本号
-2. 生成 SHA256 校验文件
-3. 上传产物和校验文件到对应通道目录
-4. 更新 releases.json（追加版本、更新 latest 字段）
-5. 各平台可增加额外签名步骤（Ed25519、Authenticode 等）
+2. 计算所有产物的 SHA256；平台可增加额外签名步骤（Ed25519、Authenticode 等）
+3. 上传同一批产物到所有发布节点的对应通道目录
+4. 核对各节点产物数量、SHA256 和平台签名（如适用）
+5. 所有节点验证通过后更新 releases.json（追加或更新版本、更新 latest 字段）
 ```
+
+同一次发布中，各发布节点和 GitHub Release 上属于“规范正式资产集合”的产物必须来自同一次构建且字节一致，不得为不同目标分别重建；`releases.json.checksums` 必须与该资产集合的实际文件名和 SHA256 一致。平台如需 GitHub-only 附加资产，必须在本仓发布 skill 中明确列出，且不得替代规范正式资产。
 
 ### 8.4 releases.json 维护
 
 格式定义见 6.1 节。发布脚本负责：
 - 根据版本类型写入对应通道（正式版 → `main`，pre-release → `dev`）
-- 追加新版本条目（含 checksums、released_at）到对应通道 `versions` 首位，更新 `latest`
+- 追加或更新版本条目（含 checksums、released_at）到对应通道 `versions` 首位，更新 `latest`
 - 每通道保留最近 5 个版本条目，清理超出的旧条目及 `{channel}/v{version}/` 产物目录
+- 版本条目和 `latest` 均不带 `v` 前缀；发布目录、版本 Git tag 使用 `v{version}`
+- 通过同目录临时文件写入并原子替换 `releases.json`，避免中断产生半写文件
+
+`dev` 通道允许同一版本重复发布并覆盖原条目；`main` 通道版本不可覆盖，规则见 8.6 和 8.7。
+
+### 8.5 dev 测试版发布
+
+`dev` 用于真机验证和快速反馈，优先保证发布灵活性：
+
+- 版本号必须是带预发布段的 SemVer（如 `1.2.0-beta.1`、`1.2.0-rc.2`）
+- 可直接发布当前工作区快照，允许存在未提交改动
+- 不要求等待本地或 GitHub CI，不因当前 HEAD 已推送而增加 CI 门禁
+- 不提交、不推送、不合并、不切换分支，不改变 `main` / `dev` 引用
+- 不创建或移动任何 Git tag，不创建 GitHub Release
+- 允许同一版本重复发布；重新发布时覆盖该版本产物和索引条目，并刷新 `released_at`、`checksums` 和 `latest`
+- 版本条目必须写入 `source_commit` 和 `dirty`；工作区不干净时 `dirty` 必须为 `true`，明确该产物不完全对应 Git commit
+- 构建、签名（平台要求时）、上传、远端哈希或索引更新任一步失败，均不得报告发布成功
+
+dev 发布完成至少验证所有发布节点的版本目录可读、产物数量正确，且 `releases.json.dev.latest` 与实际产物 SHA256 一致。
+
+### 8.6 main 正式版发布
+
+`main` 用于可复现、可审计、不可变的正式发布。一个正式版本必须唯一对应一个 Git commit、一批确定的产物字节、一组 SHA256 和一个 GitHub Release。
+
+正式发布按以下顺序执行：
+
+1. 校验稳定 SemVer（不得含预发布段），且版本高于当前 `main.latest`
+2. 确认工作区干净，本地 `dev` 与 `origin/dev` 指向同一 commit
+3. 通过 `dev → main` Pull Request 发布；等待该仓发布 skill 明确列出且适用于该 PR commit 的 required checks 和 release gates 全部成功后合并
+4. 同步本地 `main`，确认本地 `main` 与 `origin/main` 指向合并后的同一 commit，且工作区仍干净
+5. 等待该仓发布 skill 明确列出且适用于该精确 `main` commit 的 required checks 和 release gates 全部成功
+6. 从该 commit 只构建一次正式产物，完成签名，生成绑定版本、commit、规范资产集合和 SHA256 的发布 manifest
+7. 将发布 manifest 和完整产物 bundle 持久保存到发布恢复期间不会被清理或重建的位置；将同一 bundle 暂存到所有发布节点并完成哈希与签名验证
+8. 创建并推送不可变版本 tag `v{version}`；tag 必须指向该 `main` commit
+9. 创建指向该 tag 和 commit 的 draft GitHub Release，从已保存 bundle 上传规范正式资产及平台声明的附加资产，并完成验收
+10. 使用已暂存内容原子更新各节点的 `releases.json.main`，发布 GitHub Release；完成全节点对账后，将唯一可移动的 `latest` Git tag 更新到 `v{version}`
+11. 将 `main` 以 fast-forward 方式同步回 `dev` 并推送，等待该仓发布 skill 明确列出且适用于该精确 `dev` commit 的 required checks 和 release gates 全部成功
+12. 执行 8.9 的最终验收；验收完成前不得清理发布 bundle，全部通过后才可宣布发布完成
+
+从 PR 合并开始到 `main` 同步回 `dev` 完成为正式发布窗口。该窗口内不得向 `dev` 添加新提交；如果 `dev` 已前进导致无法 fast-forward，必须停止收尾并处理分支差异，禁止通过 force-push 对齐。
+
+### 8.7 正式版本与 Git 引用不可变性
+
+- 初次发布前，`v{version}`、对应 GitHub Release 和 `main/v{version}/` 正式产物必须不存在
+- `v{version}` 一旦推送不得删除、移动或覆盖；正式产物和已发布 GitHub Release 资产同样不得替换
+- 发布脚本不得自动重建或移动已存在的版本 tag；发现 tag 指向其他 commit 必须立即失败
+- `latest` 是唯一允许移动的 Git tag，且只能指向已完成产物验收的稳定版本 tag
+- 正式 GitHub Release 必须非 draft、非 prerelease，标记为最新正式版，并包含该平台约定的全部正式发布资产；不要求附带独立 `.sha256` 文件
+- `releases.json.main.latest`、版本 tag 和 `latest` Git tag 表达不同层次的引用，但最终必须指向同一正式版本
+- 正式版本不得重复发布为不同 commit 或不同产物；需要修复时发布更高的新版本
+
+### 8.8 中断恢复与多节点一致性
+
+- 版本 tag 创建前失败：修复问题后可重新执行正式发布
+- 版本 tag 创建后失败：只允许读取并校验已持久保存的发布 manifest 和 bundle，从失败点以 upload-only/resume 方式恢复；禁止移动 tag、调用构建流程或用重建产物覆盖
+- 上传阶段先完成所有节点和 draft GitHub Release 资产暂存与哈希验证，再推进公开的 GitHub Release、版本索引和 `latest` 引用
+- 任一节点失败时不得宣布成功，也不得只让部分节点长期保留新的 `latest`；修复失败节点后重新执行全节点验收
+- GitHub Release、服务器索引或分支同步任一步失败时，保留已有不可变对象和发布 bundle，从失败点按相同 commit 和产物继续
+- 已完成的正式版本不得通过删除 tag、覆盖资产或回写同版本修复；回滚或修复使用更高版本
+
+### 8.9 正式版完成验收
+
+正式发布只有同时满足以下条件才算完成：
+
+- `dev → main` PR 已合并；本仓发布 skill 声明的适用 required checks 和 release gates 在 PR、合并后 `main`、回同步后 `dev` 三个阶段均成功，且均核对到对应的精确 commit
+- 本地与远端 `main`、本地与远端 `dev`、`v{version}`、`latest`、GitHub Release target 全部指向同一 commit
+- 工作区干净
+- 所有发布节点及统一公网入口的 `main.latest` 均等于本次版本（不带 `v` 前缀）
+- 所有发布节点和 GitHub Release 的规范正式资产集合完整且字节一致，SHA256 与 `releases.json.checksums` 一致；平台声明的 GitHub-only 附加资产也完整
+- GitHub Release 已公开，非 draft、非 prerelease，并标记为最新正式版
+- 产物内注入的版本号正确，平台要求的签名验证通过
+- 至少通过公网入口实际下载一个代表产物并完成 SHA256 校验
 
 ---
 
@@ -705,7 +819,7 @@ GET {release_url}/releases.json
 
 - **证书验证**：部署前验证证书格式、有效性、证书与私钥匹配
 - **中间证书必需**：API 部署时必须包含中间证书，缺失则拒绝部署
-- **私钥保护**：私钥写入使用原子操作，local 模式下新私钥先存 pending-keys/，签发成功后再移到正式位置
+- **私钥保护**：私钥写入使用原子操作，local 模式下新私钥先存 pending-keys/，证书私钥配对校验通过且部署成功后再移到正式位置（与 3.8 一致；配对校验失败时保留 pending key，线上私钥不受影响）。POST 超时 / 断连 / 响应解析失败等不确定结果保留 pending key 作为在途标记，下轮查询订单状态恢复（不重复 POST）；仅在明确业务拒绝且确认未创建新证书、或签发部署完成后才清理 pending key
 - **大小限制**：私钥 ≤ 16 KB，证书链 ≤ 64 KB，超过则拒绝
 
 ### 10.4 日志与敏感信息
@@ -729,7 +843,9 @@ GET {release_url}/releases.json
 | 常量             | 值  | 说明                                                            |
 | ---------------- | --- | --------------------------------------------------------------- |
 | 默认提前续签天数 | 14  | `schedule.renew_before_days` 初始值，后续由 API 返回值覆写      |
-| CSR 最大重试次数 | 10  | local 模式 CSR 提交失败的上限，每天一次，超过后停止等待人工处理 |
+| 提前续签天数上限 | 30  | 无论续费或重签都应在到期前 30 天内，超限拒绝并保留本地现值（见 2.9） |
+| 签发/部署尝试上限 | 10  | 签发（CSR 提交，`issue_retry_count`）与部署（`deploy_attempt_count`）分别计数，各自 `>= 10` 触顶后进入 `CAPPED` 停止，等待人工处理 |
+| 自动动作安全余量 | 24 小时 | 证书剩余有效期小于该值时不再启动新的签发/部署动作 |
 | 单次续签批量上限 | 100 | 单次续签检查最多处理的证书数量，防止长时间阻塞                  |
 
 ### 分散延迟
@@ -760,3 +876,100 @@ GET {release_url}/releases.json
 | 常量       | 值             | 说明                           |
 | ---------- | -------------- | ------------------------------ |
 | 通道白名单 | `main` / `dev` | 允许的升级通道值，防止路径遍历 |
+
+---
+
+## 12. 智能体配置与 Skill 组织
+
+### 12.1 项目级智能体配置
+
+- `AGENTS.md` 是项目级智能体规则的唯一入口和路由文件，适用于 Claude Code、Codex 及其他智能体；具体跨仓规范和领域工作流仍分别以 `deploy-spec.md` 和对应 skill 为权威来源
+- `CLAUDE.md` 是固定的 Claude 兼容入口，只引用 `AGENTS.md`，不得复制或维护独立规则
+- 两个文件均作为普通文件提交，不使用仓库内符号链接，避免 Windows checkout 兼容问题
+- `AGENTS.md` 保持精简，只包含项目定位、不可违反的项目规则、权威资料入口、核心构建/测试命令和平台边界
+- 目录结构、详细实现、发布步骤、检查清单、API 字段说明等内容写入对应 skill、专题文档或脚本，不堆积到 `AGENTS.md`
+- 工具私有的权限、hooks、MCP、插件和 UI 配置保留在各工具自己的配置文件中，不写入共享项目规则
+
+每个仓库的 `AGENTS.md` 必须用精简表述在自身包含以下“更新原则”：
+
+- 只记录长期有效、项目级、会影响智能体行为的规则；临时决策、调试记录、单一模块实现细节不得写入
+- 新增内容前先判断职责归属：跨仓公共行为写入 `deploy-spec.md`，领域知识和工作流写入对应叶子资源，`AGENTS.md` 只提供入口和不可违反的项目约束，不复制两者正文
+- 只直接维护 `AGENTS.md`；`CLAUDE.md` 始终保持固定薄入口，不在其中追加项目规则
+- 新增、删除或重命名 skill 时同步更新 `skills/SKILL.md` 及受影响的引用入口
+- 修改后删除失效或重复内容，并检查 `CLAUDE.md` 固定模板、skill 路由、引用路径和确定性防漂移门禁；未经明确需求不得新增全局约束
+
+`CLAUDE.md` 使用以下固定模板：
+
+```markdown
+# 项目智能体规则
+
+@AGENTS.md
+
+本文件仅为 Claude 兼容入口。禁止在此追加项目规则；需要调整时修改 `AGENTS.md` 或其引用的权威资料。
+```
+
+如果工具修改了 `CLAUDE.md`，不得直接将其内容覆盖到 `AGENTS.md`。应先审查改动：核心规则迁移到 `AGENTS.md`，详细规则迁移到对应 skill，工具私有内容迁移到工具配置，最后恢复固定模板。
+
+### 12.2 skills 目录
+
+`skills/` 使用扁平结构：
+
+```text
+skills/
+├── SKILL.md
+├── remote-release.md
+├── finish-check.md
+├── build-release.md
+└── ...
+```
+
+- `skills/SKILL.md` 是唯一可发现的 skill 入口和路由器；文件名使用标准大写形式，并包含工具要求的入口元数据
+- `SKILL.md` 只维护触发场景、路由规则和叶子文件路径，不承载领域实现细节；`AGENTS.md` 要求智能体在匹配任务中读取该入口及其选中的叶子资源
+- 其他文件是由根入口引用的叶子资源，直接存放在 `skills/` 根目录，不建立领域子目录；不宣称其可被 Claude、Codex 或其他工具原生独立发现
+- 叶子资源文件名统一使用 kebab-case（如 `build-release.md`、`iis-ops.md`），不得再使用 `<name>/SKILL.md` 结构
+- 每个叶子资源只维护一个清晰领域的知识或工作流；公共规则通过引用权威文档复用，不在多个资源中复制
+- `remote-release.md` 是本仓发布流程的唯一权威实现，必须遵守第 8 节，并可引用 `build-release.md` 中的平台构建、签名和产物细节
+- `finish-check.md` 维护本仓完成检查；工具命令不得复制其检查清单
+
+### 12.3 工具自定义指令
+
+- Claude、Codex 及其他工具的自定义指令只作为薄入口：引用一个对应 skill，并将用户参数原样转交
+- 参数校验、执行步骤、命令示例、安全门禁、失败恢复和验收规则全部维护在 skill 中，不得复制到工具指令
+- 同一语义的不同工具入口必须引用同一个 skill；工具仅可因参数占位符或入口格式不同保留最小适配内容
+- 工具不支持自定义指令时，直接通过 `skills/SKILL.md` 路由到对应 skill，不另建重复流程
+
+示例（具体参数占位符按工具语法调整）：
+
+```markdown
+读取并严格遵循 `skills/remote-release.md`。
+
+将用户参数原样作为版本参数传入该流程。
+```
+
+### 12.4 文档职责与优先级
+
+```text
+deploy-spec.md          跨仓统一行为规范
+AGENTS.md               项目核心规则与权威入口
+skills/SKILL.md         skill 路由索引
+skills/*.md             由根 Skill 路由的领域知识和可执行工作流资源
+工具自定义指令          skill 调用与参数适配
+```
+
+- 跨仓公共行为以 `deploy-spec.md` 为准，skill 不得静默改变其语义
+- 平台差异由各仓叶子资源实现；确需偏离公共规范时，必须先在 `deploy-spec.md` 的对应规则或平台豁免中明确记录，叶子资源只引用该豁免及原因
+- `AGENTS.md` 不复制 `deploy-spec.md` 或 skill 正文，只声明权威入口和项目级硬约束
+- 工具自定义指令不拥有业务规则，和 skill 冲突时以 skill 为准
+
+### 12.5 防漂移检查
+
+各仓 CI 必须执行可确定判定的本仓结构检查，`finish-check` 可在本地重复执行；跨仓一致性由统一的多仓同步或审计流程检查：
+
+- `CLAUDE.md` 与 12.1 的固定模板一致
+- `skills/` 下不存在二级 skill 目录，叶子文件名符合 kebab-case
+- `skills/SKILL.md` 中列出的叶子文件全部存在
+- 项目文档不再引用旧的 `skills/<name>/SKILL.md` 路径
+- 固定模板的工具自定义指令与预期模板哈希一致，并引用存在的对应叶子资源
+- 统一多仓流程检查四仓（`ssl-manager`、`sslctl`、`sslctlw`、`sslbt`）`deploy-spec.md` 字节一致；单仓 CI 不拉取其他仓库的移动分支进行比较
+
+第 12 节描述四仓完成智能体配置同步后的目标状态。规范可先行同步；在单仓完成结构迁移前，不启用引用尚不存在文件的结构门禁。某仓完成迁移后，本节即成为该仓必须持续满足的现行约束。

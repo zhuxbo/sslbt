@@ -1,7 +1,66 @@
 """站点管理器域名匹配测试"""
 
+import sqlite3
 import pytest
-from lib.site_manager import SiteManager
+from unittest.mock import patch
+
+from lib.site_manager import SiteManager, SiteQueryError
+
+
+class TestGetSitesFailureSemantics:
+    """get_sites 区分「查询失败」与「确认零站点」（P0）：失败抛 SiteQueryError，绝不与空列表同形"""
+
+    def test_db_missing_raises(self, tmp_path):
+        mgr = SiteManager()
+        with patch.object(SiteManager, '_get_db_path', return_value=str(tmp_path / 'no-such.db')):
+            with pytest.raises(SiteQueryError):
+                mgr.get_sites()
+
+    def test_schema_drift_raises(self, tmp_path):
+        """表结构漂移（缺 sites 表 → sqlite3.OperationalError）转为 SiteQueryError"""
+        db_path = str(tmp_path / 'drifted.db')
+        conn = sqlite3.connect(db_path)
+        conn.execute('CREATE TABLE unrelated (id INTEGER)')
+        conn.commit()
+        conn.close()
+        mgr = SiteManager()
+        with patch.object(SiteManager, '_get_db_path', return_value=db_path):
+            with pytest.raises(SiteQueryError):
+                mgr.get_sites()
+
+    def test_get_site_propagates_failure(self, tmp_path):
+        """get_site 查询失败冒泡 SiteQueryError，而非返回 None（None 仅代表站点不存在）"""
+        mgr = SiteManager()
+        with patch.object(SiteManager, '_get_db_path', return_value=str(tmp_path / 'no-such.db')):
+            with pytest.raises(SiteQueryError):
+                mgr.get_site('a.com')
+
+    @staticmethod
+    def _make_site_db(tmp_path, rows=()):
+        db_path = str(tmp_path / 'site.db')
+        conn = sqlite3.connect(db_path)
+        conn.execute('CREATE TABLE sites (id INTEGER PRIMARY KEY, name TEXT, path TEXT, status TEXT)')
+        conn.execute('CREATE TABLE domain (id INTEGER PRIMARY KEY, pid INTEGER, name TEXT)')
+        for r in rows:
+            conn.execute('INSERT INTO sites (id, name, path, status) VALUES (?, ?, ?, ?)', r)
+        conn.commit()
+        conn.close()
+        return db_path
+
+    def test_empty_db_returns_empty_list(self, tmp_path):
+        """表结构正常但零站点 → 返回空列表（与查询失败区分）"""
+        db_path = self._make_site_db(tmp_path)
+        mgr = SiteManager()
+        with patch.object(SiteManager, '_get_db_path', return_value=db_path):
+            assert mgr.get_sites() == []
+
+    def test_normal_db_returns_sites(self, tmp_path):
+        db_path = self._make_site_db(tmp_path, rows=[(1, 'a.com', '/www/wwwroot/a.com', '1')])
+        mgr = SiteManager()
+        with patch.object(SiteManager, '_get_db_path', return_value=db_path):
+            sites = mgr.get_sites()
+        assert len(sites) == 1
+        assert sites[0]['name'] == 'a.com'
 
 
 class TestDomainMatching:
@@ -87,3 +146,20 @@ class TestMatchSitesForCert:
         # site3: not in results
         site3_names = [r['site_name'] for r in results]
         assert 'site3' not in site3_names
+
+
+class TestCheckSslPathGuard:
+    """_check_ssl 的 site_name 穿越防护：非法名视为未启用，不探测目录外路径"""
+
+    @pytest.mark.parametrize('bad', ['../x', '/etc/passwd', 'a/b', '..', '', 'a\\b'])
+    def test_malicious_site_name_returns_false(self, bad):
+        mgr = SiteManager()
+        with patch('os.path.exists') as mock_exists:
+            assert mgr._check_ssl(bad) is False
+            mock_exists.assert_not_called()
+
+    def test_normal_site_name_probes_paths(self):
+        mgr = SiteManager()
+        with patch('os.path.exists', return_value=True) as mock_exists:
+            assert mgr._check_ssl('www.example.com') is True
+            assert mock_exists.called

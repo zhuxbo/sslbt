@@ -13,6 +13,7 @@ services:
       retries: 5
 
   baota-nginx:
+    container_name: baota-nginx
     build:
       context: ./baota
       args:
@@ -25,7 +26,8 @@ services:
       - ../src:/plugin-src:ro
       - ./reports:/reports
     environment:
-      - MOCK_API_URL=http://mock-api:8080
+      - MOCK_API_HOST=mock-api
+      - MOCK_API_PORT=8080
       - TEST_DOMAIN=test.example.com
     depends_on:
       mock-api:
@@ -35,6 +37,7 @@ services:
     privileged: true
 
   baota-apache:
+    container_name: baota-apache
     build:
       context: ./baota
       args:
@@ -47,7 +50,8 @@ services:
       - ../src:/plugin-src:ro
       - ./reports:/reports
     environment:
-      - MOCK_API_URL=http://mock-api:8080
+      - MOCK_API_HOST=mock-api
+      - MOCK_API_PORT=8080
       - TEST_DOMAIN=test.example.com
     depends_on:
       mock-api:

@@ -4,8 +4,6 @@ import os
 import time
 import glob
 import logging
-import pytest
-from unittest.mock import patch
 
 from lib.logger import Logger, sanitize, MAX_LOG_FILES
 
@@ -56,6 +54,21 @@ class TestSanitize:
         result = sanitize(text)
         assert '***REDACTED PRIVATE KEY***' in result
 
+    def test_single_quote_dict_token(self):
+        """dict repr 的单引号 token 字段被脱敏（覆盖 args=%s 传入的 dict）"""
+        text = "args={'order_id': '123', 'api_token': 'my-secret-token'}"
+        result = sanitize(text)
+        assert 'my-secret-token' not in result
+        assert "'api_token': '***REDACTED***'" in result
+        assert "'order_id': '123'" in result  # 非敏感字段保留
+
+    def test_compound_token_field_double_quote(self):
+        """复合词 token 字段（双引号 access_token）被脱敏"""
+        text = '"access_token": "xyz789value"'
+        result = sanitize(text)
+        assert 'xyz789value' not in result
+        assert 'REDACTED' in result
+
 
 class TestLogger:
     def test_log_to_file(self, tmp_data_dir):
@@ -96,6 +109,25 @@ class TestLogger:
         assert 'abc123' not in content
         assert 'REDACTED' in content
 
+    def test_dict_arg_sanitized(self, tmp_data_dir):
+        """dict 参数（含 token）经 args 传入时也被脱敏（BT-07）"""
+        log_dir = os.path.join(tmp_data_dir, 'logs')
+        logger = Logger(log_dir)
+        logger.info("add_cert 调用: args=%s", {'order_id': '1', 'api_token': 'plaintext-secret'})
+        content = logger.get_logs()
+        assert 'plaintext-secret' not in content
+        assert 'REDACTED' in content
+
+    def test_private_key_dict_arg_sanitized(self, tmp_data_dir):
+        """dict 参数中的私钥经 args 传入时被脱敏（BT-07）"""
+        log_dir = os.path.join(tmp_data_dir, 'logs')
+        logger = Logger(log_dir)
+        pem = '-----BEGIN RSA PRIVATE KEY-----\nSECRETKEYMATERIAL\n-----END RSA PRIVATE KEY-----'
+        logger.info("deploy: args=%s", {'private_key': pem})
+        content = logger.get_logs()
+        assert 'SECRETKEYMATERIAL' not in content
+        assert 'REDACTED' in content
+
     def test_cleanup_old_logs(self, tmp_data_dir):
         """超过 MAX_LOG_FILES 个文件自动清理"""
         log_dir = os.path.join(tmp_data_dir, 'logs')
@@ -105,7 +137,7 @@ class TestLogger:
             path = os.path.join(log_dir, 'sslbt-2020-01-%02d.log' % (i + 1))
             with open(path, 'w') as f:
                 f.write('test')
-        logger = Logger(log_dir)
+        Logger(log_dir)
         files = glob.glob(os.path.join(log_dir, 'sslbt-*.log'))
         assert len(files) <= MAX_LOG_FILES + 1  # +1 for today's log
 

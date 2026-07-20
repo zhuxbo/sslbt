@@ -175,25 +175,27 @@ except: pass
 " <<< "$RELEASES_JSON" 2>/dev/null)
 fi
 
-if [ -n "$EXPECTED_HASH" ]; then
-    ACTUAL_HASH=$(sha256sum "$TMP_FILE" 2>/dev/null | cut -d' ' -f1)
-    [ -z "$ACTUAL_HASH" ] && ACTUAL_HASH=$(shasum -a 256 "$TMP_FILE" 2>/dev/null | cut -d' ' -f1)
-    if [ -z "$ACTUAL_HASH" ]; then
-        echo_error "无法计算 SHA256"
-        rm -f "$TMP_FILE"
-        exit 1
-    fi
-    if [ "$ACTUAL_HASH" != "$EXPECTED_HASH" ]; then
-        echo_error "SHA256 校验失败"
-        echo_error "  期望: $EXPECTED_HASH"
-        echo_error "  实际: $ACTUAL_HASH"
-        rm -f "$TMP_FILE"
-        exit 1
-    fi
-    echo_info "SHA256 校验通过"
-else
-    echo_warn "无法获取校验和，跳过 SHA256 校验"
+if [ -z "$EXPECTED_HASH" ]; then
+    echo_error "版本索引缺少 sslbt.zip 的 SHA256，拒绝安装"
+    rm -f "$TMP_FILE"
+    exit 1
 fi
+
+ACTUAL_HASH=$(sha256sum "$TMP_FILE" 2>/dev/null | cut -d' ' -f1)
+[ -z "$ACTUAL_HASH" ] && ACTUAL_HASH=$(shasum -a 256 "$TMP_FILE" 2>/dev/null | cut -d' ' -f1)
+if [ -z "$ACTUAL_HASH" ]; then
+    echo_error "无法计算 SHA256"
+    rm -f "$TMP_FILE"
+    exit 1
+fi
+if [ "$ACTUAL_HASH" != "$EXPECTED_HASH" ]; then
+    echo_error "SHA256 校验失败"
+    echo_error "  期望: $EXPECTED_HASH"
+    echo_error "  实际: $ACTUAL_HASH"
+    rm -f "$TMP_FILE"
+    exit 1
+fi
+echo_info "SHA256 校验通过"
 
 echo_info "安装中..."
 
@@ -265,21 +267,23 @@ if [ -f "$CONFIG_FILE" ]; then
 import json, os, tempfile
 path = '$CONFIG_FILE'
 url = '$RELEASE_URL'
+channel = '$CHANNEL'
 try:
     with open(path, 'r', encoding='utf-8') as f:
         cfg = json.load(f)
 except (json.JSONDecodeError, FileNotFoundError):
     cfg = {}
 cfg['release_url'] = url
+cfg['upgrade_channel'] = channel
 d = os.path.dirname(path) or '.'
 fd, tmp = tempfile.mkstemp(dir=d)
 with os.fdopen(fd, 'w', encoding='utf-8') as f:
     json.dump(cfg, f, indent=2, ensure_ascii=False)
 os.replace(tmp, path)
 os.chmod(path, 0o600)
-" 2>/dev/null || echo_warn "写入 release_url 失败"
+" 2>/dev/null || echo_warn "写入 release_url 和升级通道失败"
 else
-    printf '{\n  "release_url": "%s"\n}\n' "$RELEASE_URL" > "$CONFIG_FILE"
+    printf '{\n  "release_url": "%s",\n  "upgrade_channel": "%s"\n}\n' "$RELEASE_URL" "$CHANNEL" > "$CONFIG_FILE"
     chmod 600 "$CONFIG_FILE"
 fi
 

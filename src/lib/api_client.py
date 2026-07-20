@@ -9,22 +9,31 @@ from urllib.request import Request, HTTPHandler, HTTPSHandler, build_opener
 from urllib.error import URLError, HTTPError
 from urllib.parse import urlencode, urlparse
 
+from .logger import sanitize
+
 API_CODE_SUCCESS = 1
 MAX_RETRIES = 3
 TIMEOUT_GET = 30
 TIMEOUT_POST = 60
 MAX_RESPONSE_SIZE = 512 * 1024  # 512KB
 MAX_CALLBACK_RESPONSE_SIZE = 64 * 1024  # 64KB
+CALLBACK_MESSAGE_MAX = 256  # 客户端回调 message 截断上限（服务端校验上限 500，客户端更严格截断至 256）
 BATCH_MAX_RESPONSE_SIZE = 5 * 1024 * 1024  # 5MB
 TOKEN_PATTERN = re.compile(r'^[A-Za-z0-9\-_\.]+$')
 
 
 class APIError(Exception):
-    """API 调用异常"""
-    def __init__(self, message, code=0, status_code=0):
+    """API 调用异常。
+
+    transport=True 表示"不确定结果"（网络超时/断连、重试耗尽、响应解析失败）：请求可能已
+    到达服务端但结果未知，调用方（如 CSR 提交）应保留 pending key 待下轮查询订单状态恢复，
+    不得据此判定业务失败并清理在途状态（deploy-spec §1.3/§10.3）。
+    """
+    def __init__(self, message, code=0, status_code=0, transport=False):
         super().__init__(message)
         self.code = code
         self.status_code = status_code
+        self.transport = transport
 
 
 def validate_token(token):
@@ -132,7 +141,11 @@ class APIClient:
                     timeout = TIMEOUT_POST if method == 'POST' else TIMEOUT_GET
                 resp = self._opener.open(req, timeout=timeout)
                 resp_data = resp.read(max_size)
-                return json.loads(resp_data.decode('utf-8'))
+                try:
+                    return json.loads(resp_data.decode('utf-8'))
+                except (json.JSONDecodeError, UnicodeDecodeError) as pe:
+                    # 响应已到达但无法解析：属"不确定结果"，标记 transport 供上层保留 pending 恢复
+                    raise APIError("响应解析失败: %s" % str(pe), transport=True)
             except HTTPError as e:
                 last_err = e
                 status = e.code
@@ -151,7 +164,9 @@ class APIClient:
             except (URLError, OSError) as e:
                 last_err = e
 
-        raise APIError("API 请求失败（已重试 %d 次）: %s" % (MAX_RETRIES, str(last_err)))
+        # 网络失败重试耗尽：结果不确定（请求可能已到达服务端），标记 transport
+        raise APIError("API 请求失败（已重试 %d 次）: %s" % (MAX_RETRIES, str(last_err)),
+                       transport=True)
 
     def _parse_data(self, result):
         """解析 API 响应，提取 data 字段"""
@@ -201,8 +216,13 @@ class APIClient:
             self.last_renew_before_days = int(renew_before_days)
         return cert_data
 
-    def callback(self, order_id, status, deployed_at=''):
-        """部署结果回调"""
+    def callback(self, order_id, status, deployed_at='', message=''):
+        """部署结果回调（spec 2.8）。
+
+        message 仅在 status=failure 时携带失败原因摘要：先复用 logger 的脱敏规则
+        过滤敏感信息（Bearer/Basic/私钥/token 等），再截断至 ≤256 字符（先脱敏后
+        截断，避免截断切断凭证残留半个 token；success 不带 message）。
+        """
         url = _build_api_url(self._base_url, '/callback')
         if self._logger:
             self._logger.info("部署回调: order_id=%s, status=%s", order_id, status)
@@ -211,6 +231,8 @@ class APIClient:
             'status': status,
             'deployed_at': deployed_at,
         }
+        if message and status == 'failure':
+            data['message'] = sanitize(str(message))[:CALLBACK_MESSAGE_MAX]
         result = self._request('POST', url, data=data, max_size=MAX_CALLBACK_RESPONSE_SIZE)
         if isinstance(result, dict) and result.get('code') == API_CODE_SUCCESS:
             resp_data = result.get('data') or {}

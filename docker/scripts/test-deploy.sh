@@ -15,7 +15,7 @@ switch_scenario "active"
 pass "Mock API 切换到 active 场景"
 
 # 2. 添加证书
-RESULT=$(call_plugin "$CONTAINER" "add_cert" '{"order_id": "1001", "site_name": "'$TEST_DOMAIN'"}')
+RESULT=$(call_plugin "$CONTAINER" "add_cert" '{"order_id": "1001", "site_names": "'$TEST_DOMAIN'", "api_url": "'$API_URL'", "api_token": "'$API_TOKEN'"}')
 echo "$RESULT" | python3 -c "
 import sys, json
 r = json.load(sys.stdin)
@@ -63,18 +63,71 @@ else:
     esac
 done
 
-# 5. 验证回调已发送
+# 5. 验证回调已发送且状态为 success
 sleep 1
 CALLBACKS=$(get_callbacks)
 echo "$CALLBACKS" | python3 -c "
 import sys, json
 data = json.load(sys.stdin)
 callbacks = data if isinstance(data, list) else data.get('callbacks', [])
-found = any(c.get('order_id') == 1001 or str(c.get('order_id')) == '1001' for c in callbacks)
-print('OK' if found else 'FAIL')
+entries = [c for c in callbacks if str(c.get('order_id')) == '1001']
+if not entries:
+    print('FAIL')
+elif any(c.get('status') == 'success' for c in entries):
+    print('OK')
+else:
+    print('BAD_STATUS: ' + ','.join(str(c.get('status')) for c in entries))
 " 2>/dev/null | while read line; do
-    [ "$line" = "OK" ] && pass "部署回调已发送" || fail "未收到部署回调"
+    case "$line" in
+        OK)   pass "部署回调已发送且状态为 success" ;;
+        FAIL) fail "未收到部署回调" ;;
+        *)    fail "部署回调状态异常: $line" ;;
+    esac
 done
+
+# 5.1 失败路径：部署到面板不存在的站点应判失败并回调 failure（P1-13 白名单判定）
+RESULT=$(call_plugin "$CONTAINER" "add_cert" '{"order_id": "1004", "site_names": "ghost.example.com", "api_url": "'$API_URL'", "api_token": "'$API_TOKEN'"}')
+echo "$RESULT" | python3 -c "
+import sys, json
+r = json.load(sys.stdin)
+print('OK' if r.get('status') else 'FAIL: ' + r.get('msg', ''))
+" | while read line; do
+    case "$line" in
+        OK)   pass "添加失败路径测试证书 order_id=1004" ;;
+        FAIL*) fail "添加失败路径证书失败: $line" ;;
+    esac
+done
+
+RESULT=$(call_plugin "$CONTAINER" "deploy_cert" '{"order_id": "1004"}')
+echo "$RESULT" | python3 -c "
+import sys, json
+r = json.load(sys.stdin)
+results = r.get('data') or []
+site_failed = bool(results) and all(not item.get('status') for item in results)
+print('OK' if site_failed else 'FAIL: %r' % (r,))
+" | while read line; do
+    case "$line" in
+        OK)   pass "不存在站点的部署被正确判为失败" ;;
+        FAIL*) fail "失败路径误判: $line" ;;
+    esac
+done
+
+sleep 1
+CALLBACKS=$(get_callbacks)
+echo "$CALLBACKS" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+callbacks = data if isinstance(data, list) else data.get('callbacks', [])
+entries = [c for c in callbacks if str(c.get('order_id')) == '1004']
+print('OK' if any(c.get('status') == 'failure' for c in entries) else 'FAIL: %r' % (entries,))
+" 2>/dev/null | while read line; do
+    case "$line" in
+        OK)   pass "失败部署回调 failure 已送达" ;;
+        *)    fail "未收到 failure 回调: $line" ;;
+    esac
+done
+
+call_plugin "$CONTAINER" "remove_cert" '{"order_id": "1004"}' > /dev/null 2>&1
 
 # 6. 验证证书列表
 RESULT=$(call_plugin "$CONTAINER" "get_cert_list" "{}")

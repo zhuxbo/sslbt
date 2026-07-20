@@ -12,7 +12,7 @@ echo "=== 续签测试: $CONTAINER ==="
 
 # 1. 准备：添加一个证书并部署
 switch_scenario "active"
-call_plugin "$CONTAINER" "add_cert" '{"order_id": "1001", "site_name": "'$TEST_DOMAIN'"}' > /dev/null 2>&1
+call_plugin "$CONTAINER" "add_cert" '{"order_id": "1001", "site_names": "'$TEST_DOMAIN'", "api_url": "'$API_URL'", "api_token": "'$API_TOKEN'"}' > /dev/null 2>&1
 call_plugin "$CONTAINER" "deploy_cert" '{"order_id": "1001"}' > /dev/null 2>&1
 pass "准备测试数据完成"
 

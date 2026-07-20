@@ -41,6 +41,24 @@ def validate_key_pem(pem_text):
     return True, ''
 
 
+def validate_site_name_component(site_name):
+    """校验 site_name 用作文件路径组件的安全性，合法返回 None，否则返回错误原因。
+
+    site_name 在部分场景直接拼入证书目录路径（deployer 回退读证书、site_manager
+    SSL 检测），须拒绝可造成目录穿越或绝对路径逃逸的取值：空值、路径分隔符
+    （/ 与 \\）、上级目录引用（..）、绝对路径。纯展示/匹配用途不受此约束。
+    """
+    if not site_name or not isinstance(site_name, str):
+        return '站点名为空或类型非法'
+    if '/' in site_name or '\\' in site_name:
+        return '站点名含路径分隔符'
+    if '..' in site_name:
+        return '站点名含上级目录引用'
+    if os.path.isabs(site_name):
+        return '站点名为绝对路径'
+    return None
+
+
 def parse_cert_info(pem_text):
     """解析证书信息，返回 dict: common_name, domains, not_before, not_after, serial, issuer"""
     tmp = None

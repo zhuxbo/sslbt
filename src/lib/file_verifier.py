@@ -50,7 +50,13 @@ class FileVerifier:
 
         placed = []
         for site_name in site_names:
-            site = self._site_mgr.get_site(site_name)
+            try:
+                site = self._site_mgr.get_site(site_name)
+            except Exception as e:
+                # 站点清单查询失败（SiteQueryError 等）对所有站点都失败，直接结束
+                if self._logger:
+                    self._logger.error("站点清单查询失败，跳过验证文件放置: %s", str(e))
+                break
             if not site:
                 if self._logger:
                     self._logger.warning("站点不存在，跳过: %s", site_name)

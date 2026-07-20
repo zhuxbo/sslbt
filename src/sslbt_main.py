@@ -4,7 +4,9 @@ import os
 import sys
 import json
 import time
+import fcntl
 import secrets
+import contextlib
 
 # 插件路径
 PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -21,7 +23,9 @@ if hasattr(sys.modules.get('sslbt_main'), 'sslbt_main'):
     for _mod in [k for k in sys.modules if k == 'lib' or k.startswith('lib.')]:
         del sys.modules[_mod]
 
-from lib.config import ConfigManager  # noqa: E402
+from lib.config import (  # noqa: E402
+    ConfigManager, derive_or_validate_renew_policy, ISSUE_STATE_POLICY_BLOCKED,
+)
 from lib.logger import Logger  # noqa: E402
 from lib.api_client import APIClient, APIError  # noqa: E402
 from lib.cert_utils import build_fullchain, parse_cert_info, verify_cert_key_match, validate_key_pem  # noqa: E402
@@ -120,7 +124,35 @@ class sslbt_main:
         return (api_url, api_token), None
 
     def _get_deployer(self):
-        return Deployer(self._config, None, self._logger)
+        return Deployer(self._config, None, self._logger, self._site_mgr)
+
+    @contextlib.contextmanager
+    def _renew_lock(self):
+        """获取续签互斥锁（与 cron 续签共用 data/renew.lock，非阻塞，进程内可重入）
+
+        手动部署与 cron 续签共用同一把锁，避免并发交错执行 SetSSL/reload。
+        批量部署（deploy_all）持锁后嵌套调用单证书部署（deploy_cert）会重入放行；
+        被其他进程/实例占用时 yield False，调用方应返回 busy 提示。
+        """
+        # 可重入：本实例已持锁则直接放行（deploy_all 内部嵌套 deploy_cert）
+        if getattr(self, '_renew_lock_fd', None) is not None:
+            yield True
+            return
+        lock_path = os.path.join(self._data_dir, 'renew.lock')
+        lock_fd = open(lock_path, 'w')
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            lock_fd.close()
+            yield False
+            return
+        self._renew_lock_fd = lock_fd
+        try:
+            yield True
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            lock_fd.close()
+            self._renew_lock_fd = None
 
     def _resolve_private_key(self, cert_data, args, fullchain_pem, site_names):
         """按优先级尝试获取与证书匹配的私钥（deploy-spec §5.3）
@@ -282,12 +314,12 @@ class sslbt_main:
             cert_data = api.query_order(order_id)
             domains = self._parse_cert_domains(cert_data)
 
-            if validation_method:
-                from lib.config import validate_validation_method
-                err_msg = validate_validation_method(domains, validation_method)
-                if err_msg:
-                    self._logger.warning("add_cert 早返回: validation_method 校验失败 order_id=%s err=%s", order_id, err_msg)
-                    return _err(err_msg)
+            # 派生续签策略（SAN 含 IP 强制 local/file；DNS 校验兼容性）——唯一权威
+            renew_mode, validation_method, err_msg = derive_or_validate_renew_policy(
+                domains, renew_mode, validation_method)
+            if err_msg:
+                self._logger.warning("add_cert 早返回: 策略派生失败 order_id=%s err=%s", order_id, err_msg)
+                return _err(err_msg)
 
             cert_name = 'order-%d' % order_id
             entry = self._config.add_cert(
@@ -302,7 +334,7 @@ class sslbt_main:
 
             self._logger.info("添加证书: order_id=%s, domains=%s", order_id, ','.join(domains))
 
-            # 根据续签模式设置 auto_reissue
+            # 按派生模式设置 auto_reissue（local 关 / pull 开；不自动开付费 auto_renew）
             effective_mode = renew_mode or self._config.get_config().get('schedule', {}).get('renew_mode', 'pull')
             try:
                 api.toggle_auto_reissue(order_id, effective_mode == 'pull')
@@ -372,19 +404,25 @@ class sslbt_main:
                     return _err('站点已被其他证书绑定: %s' % ', '.join(conflict))
                 updates['site_name'] = requested
 
+            # 续签策略：以请求值（缺省沿用现值）统一派生（SAN 含 IP 强制 local/file）——唯一权威
+            cert0 = self._config.get_cert(order_id)
+            domains0 = cert0.get('domains', []) if cert0 else []
             renew_mode = _get_param(args, 'renew_mode', '')
-            if renew_mode in ('pull', 'local', ''):
-                updates['renew_mode'] = renew_mode
-
             validation_method = _get_param(args, 'validation_method', '')
-            if validation_method in ('file', 'delegation'):
-                cert = self._config.get_cert(order_id)
-                if cert:
-                    from lib.config import validate_validation_method
-                    err_msg = validate_validation_method(cert.get('domains', []), validation_method)
-                    if err_msg:
-                        return _err(err_msg)
-                updates['validation_method'] = validation_method
+            mode_provided = renew_mode in ('pull', 'local', '')
+            vm_provided = validation_method in ('file', 'delegation')
+            if mode_provided or vm_provided:
+                base_mode = renew_mode if mode_provided else (cert0.get('renew_mode', '') if cert0 else '')
+                base_vm = validation_method if vm_provided else (cert0.get('validation_method', '') if cert0 else '')
+                # pull 模式 validation 不参与（避免旧值触发误报）；IP 会被派生强制为 local/file
+                d_mode, d_vm, err_msg = derive_or_validate_renew_policy(
+                    domains0, base_mode, base_vm if base_mode != 'pull' else '')
+                if err_msg:
+                    return _err(err_msg)
+                if mode_provided:
+                    updates['renew_mode'] = d_mode
+                if d_mode == 'local' and (vm_provided or d_vm != base_vm):
+                    updates['validation_method'] = d_vm
 
             api_url = _get_param(args, 'api_url', '')
             api_token = _get_param(args, 'api_token', '')
@@ -404,6 +442,11 @@ class sslbt_main:
                 return _err('无更新内容')
 
             self._config.update_cert(order_id, updates)
+            # 原为 policy_blocked（旧非法 IP 配置）且本次已设为合法策略 → 清除阻断终态（重新 setup）
+            if cert0 and 'renew_mode' in updates \
+                    and cert0.get('metadata', {}).get('last_issue_state') == ISSUE_STATE_POLICY_BLOCKED:
+                self._config.update_metadata(order_id, {'last_issue_state': ''})
+                self._logger.info("证书重新设置合法策略，清除 policy_blocked: order_id=%s", order_id)
             self._logger.info("更新证书配置: order_id=%s", order_id)
             return _ok(msg='配置更新成功')
         except ValueError as e:
@@ -424,7 +467,15 @@ class sslbt_main:
             return _err('删除失败: %s' % str(e))
 
     def deploy_cert(self, args=None):
-        """部署指定证书到多个站点"""
+        """部署指定证书到多个站点（与 cron 续签互斥）"""
+        with self._renew_lock() as acquired:
+            if not acquired:
+                self._logger.warning("deploy_cert 早返回: 续签任务占用锁")
+                return _err('续签任务正在执行，请稍后再试')
+            return self._deploy_cert_locked(args)
+
+    def _deploy_cert_locked(self, args=None):
+        """部署指定证书到多个站点（已持有续签锁）"""
         self._logger.info("deploy_cert 调用: args=%s", args)
         try:
             order_id = _get_param(args, 'order_id', '')
@@ -494,6 +545,12 @@ class sslbt_main:
                 self._logger.warning("deploy_cert 早返回: order_id=%s 证书内容为空", order_id)
                 return _err('证书内容为空')
 
+            # 缺少中间证书守卫：避免残链覆盖站点原有完整链导致信任链断裂
+            # （与 renew.py 自动路径 _renew_pull/_handle_processing 一致）
+            if not ca_certificate:
+                self._logger.warning("deploy_cert 早返回: order_id=%s 缺少中间证书", order_id)
+                return _err('缺少中间证书，无法部署')
+
             fullchain = build_fullchain(certificate, ca_certificate)
 
             # 私钥回退链（deploy-spec §5.3）
@@ -531,7 +588,11 @@ class sslbt_main:
 
             if fail_count == 0:
                 return _ok(results, msg='部署成功（%d 个站点）' % success_count)
-            return _ok(results, msg='部署完成：%d 成功，%d 失败' % (success_count, fail_count))
+            return {
+                'status': False,
+                'msg': '部署完成：%d 成功，%d 失败' % (success_count, fail_count),
+                'data': results,
+            }
         except DeployError as e:
             self._logger.error("部署失败: %s", str(e))
             return _err('部署失败: %s' % str(e))
@@ -543,7 +604,14 @@ class sslbt_main:
             return _err('部署失败: %s' % str(e))
 
     def deploy_all(self, args=None):
-        """部署证书，支持 order_ids 过滤"""
+        """部署证书，支持 order_ids 过滤（与 cron 续签互斥）"""
+        with self._renew_lock() as acquired:
+            if not acquired:
+                return _err('续签任务正在执行，请稍后再试')
+            return self._deploy_all_locked(args)
+
+    def _deploy_all_locked(self, args=None):
+        """批量部署（已持有续签锁），复用 _deploy_cert_locked 避免重复获取锁"""
         try:
             certs = self._config.get_certs()
             # 支持选中部署
@@ -582,6 +650,8 @@ class sslbt_main:
                 names = [r['cert_name'] or str(r['order_id']) for r in need_key]
                 parts.append('%d 需要私钥（%s）' % (len(need_key), ', '.join(names)))
             msg = '批量部署：' + '，'.join(parts) if parts else '无可部署的证书'
+            if failed or need_key:
+                return {'status': False, 'msg': msg, 'data': results}
             return _ok(results, msg=msg)
         except Exception as e:
             return _err('批量部署失败: %s' % str(e))
@@ -632,15 +702,10 @@ class sslbt_main:
             if not url:
                 return _err('请提供部署链接')
 
-            from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+            from urllib.parse import urlparse, parse_qs
             parsed = urlparse(url)
             if parsed.scheme not in ('http', 'https'):
                 return _err('不支持的 URL 协议')
-
-            from lib.net_guard import check_ssrf
-            ssrf_reason = check_ssrf(url)
-            if ssrf_reason:
-                return _err('URL 不安全: %s' % ssrf_reason)
 
             # 从 URL 中解析 token 和 order
             params = parse_qs(parsed.query)
@@ -654,44 +719,17 @@ class sslbt_main:
                 return _err('URL 中缺少 order 参数')
             order_value = order_list[0]
 
-            # 构造 api_url（scheme + netloc）
-            api_url = '%s://%s' % (parsed.scheme, parsed.netloc)
+            # 构造 api_url，交给项目统一 API 客户端发请求：HTTPS 强制（拒绝 http，仅
+            # localhost 例外）+ SSRF/DNS Rebinding 防护 + token 校验，避免绕过统一安全出口。
+            # 保留链接路径以兼容反代子路径部署（如 https://host/manager/api/deploy?...），
+            # APIClient._build_api_url 对含 /api/ 的 base_url 直接追加后缀，不重复拼路径
+            api_url = '%s://%s%s' % (parsed.scheme, parsed.netloc, parsed.path.rstrip('/'))
+            try:
+                api = APIClient(api_url, token, self._logger)
+            except ValueError as e:
+                return _err('部署链接不安全: %s' % str(e))
 
-            # 重建请求 URL：保留路径和 order 参数，去掉 token（通过 Bearer 传递）
-            query_params = {k: v[0] for k, v in params.items() if k != 'token'}
-            request_url = urlunparse((
-                parsed.scheme, parsed.netloc, parsed.path,
-                '', urlencode(query_params), '',
-            ))
-
-            # GET 请求
-            import json as _json
-            from urllib.request import Request, urlopen
-            import ssl as _ssl
-            headers = {
-                'Authorization': 'Bearer %s' % token,
-                'Accept': 'application/json',
-            }
-            req = Request(request_url, headers=headers, method='GET')
-            ctx = _ssl.create_default_context() if url.startswith('https') else None
-            resp = urlopen(req, timeout=30, context=ctx)
-            data = _json.loads(resp.read(5 * 1024 * 1024).decode('utf-8'))
-
-            code = data.get('code', 0)
-            if code != 1:
-                return _err(data.get('msg', 'API 返回错误'))
-
-            cert_data = data.get('data')
-            # 统一为列表（分页格式：data.data 为数组）
-            if isinstance(cert_data, dict):
-                if 'data' in cert_data:
-                    certs = cert_data['data'] if isinstance(cert_data['data'], list) else [cert_data['data']]
-                else:
-                    certs = [cert_data]
-            elif isinstance(cert_data, list):
-                certs = cert_data
-            else:
-                certs = []
+            certs = api.query_batch(order_value)
 
             # 自动匹配站点（排除已绑定的站点）
             sites = self._site_mgr.get_sites()
@@ -720,6 +758,9 @@ class sslbt_main:
                 'order': order_value,
                 'certs': certs,
             })
+        except APIError as e:
+            self._logger.error("fetch_deploy_url API 错误: %s", str(e))
+            return _err('API 错误: %s' % str(e))
         except Exception as e:
             self._logger.error("fetch_deploy_url 失败: %s", str(e))
             return _err('请求失败: %s' % str(e))
@@ -799,8 +840,46 @@ class sslbt_main:
         except Exception as e:
             return _err('获取站点匹配失败: %s' % str(e))
 
+    def batch_set_renew_policy(self, args=None):
+        """批量设置续签策略（一次原子后端操作，逐证书派生）。
+
+        对每个证书按其域名派生 (renew_mode, validation_method)：SAN 含 IP 强制 local/file，
+        DNS 证书采用请求值并做兼容性校验（不兼容跳过）。DNS 证书不受混合批次中 IP 证书影响。
+        原为 policy_blocked（旧非法 IP 配置）的证书本次设为合法策略后清除阻断终态。
+        """
+        try:
+            mode = _get_param(args, 'renew_mode', '')
+            if mode not in ('pull', 'local'):
+                return _err('无效的续签模式')
+            validation = _get_param(args, 'validation_method', '')
+            if mode == 'local' and validation not in ('file', 'delegation'):
+                return _err('本机提交模式需指定验证方式')
+            certs = self._config.get_certs()
+            count = 0
+            skipped = []
+            for c in certs:
+                domains = c.get('domains', [])
+                d_mode, d_vm, err = derive_or_validate_renew_policy(
+                    domains, mode, validation if mode == 'local' else '')
+                if err:
+                    skipped.append(c.get('cert_name') or str(c.get('order_id', '')))
+                    continue
+                updates = {'renew_mode': d_mode}
+                if d_mode == 'local':  # pull 模式 validation 由服务端决定，不改写
+                    updates['validation_method'] = d_vm
+                self._config.update_cert(c['order_id'], updates)
+                if c.get('metadata', {}).get('last_issue_state') == ISSUE_STATE_POLICY_BLOCKED:
+                    self._config.update_metadata(c['order_id'], {'last_issue_state': ''})
+                count += 1
+            msg = '已为 %d 个证书设置续签策略' % count
+            if skipped:
+                msg += '，%d 个因域名限制跳过：%s' % (len(skipped), ', '.join(skipped))
+            return _ok(msg=msg)
+        except Exception as e:
+            return _err('批量设置失败: %s' % str(e))
+
     def batch_set_renew_mode(self, args=None):
-        """批量设置所有证书的续签模式"""
+        """批量设置所有证书的续签模式（逐证书派生，SAN 含 IP 强制 local/file）"""
         try:
             mode = _get_param(args, 'renew_mode', '')
             if mode not in ('pull', 'local'):
@@ -808,7 +887,11 @@ class sslbt_main:
             certs = self._config.get_certs()
             count = 0
             for c in certs:
-                self._config.update_cert(c['order_id'], {'renew_mode': mode})
+                d_mode, d_vm, _ = derive_or_validate_renew_policy(c.get('domains', []), mode, '')
+                updates = {'renew_mode': d_mode}
+                if d_mode == 'local' and d_vm:
+                    updates['validation_method'] = d_vm
+                self._config.update_cert(c['order_id'], updates)
                 count += 1
             return _ok(msg='已将 %d 个证书设为 %s' % (count, '自动签发' if mode == 'pull' else '本机提交'))
         except Exception as e:
@@ -865,6 +948,18 @@ class sslbt_main:
         except Exception as e:
             self._logger.error("续签检查失败: %s", str(e))
             return _err('续签检查失败: %s' % str(e))
+
+    def get_renew_status(self, args=None):
+        """获取最近一次续签运行状态（供面板展示最近续签信息）"""
+        try:
+            path = os.path.join(self._data_dir, 'renew_status.json')
+            if not os.path.exists(path):
+                return _ok(None)
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            return _ok(data)
+        except Exception as e:
+            return _err('获取续签状态失败: %s' % str(e))
 
     # ==================== 计划任务 ====================
 
@@ -960,6 +1055,14 @@ class sslbt_main:
 if __name__ == '__main__':
     import json as _json
     import traceback as _tb
+
+    if len(sys.argv) == 2 and sys.argv[1] == '--version':
+        try:
+            with open(os.path.join(PLUGIN_DIR, 'info.json'), 'r', encoding='utf-8') as _f:
+                print(_json.load(_f).get('versions', '0.0.0'))
+        except (OSError, ValueError):
+            print('0.0.0')
+        sys.exit(0)
 
     # 让 CLI 行为对齐面板进程：补上宝塔的 class 目录，使 crontab/panelSite 等可 import
     _BT_CLASS_DIR = '/www/server/panel/class'

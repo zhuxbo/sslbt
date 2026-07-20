@@ -3,6 +3,7 @@
 import os
 import json
 import time
+import fcntl
 import pytest
 from unittest.mock import MagicMock, patch
 
@@ -253,7 +254,6 @@ class TestDeployCert:
         assert result['status'] is False
         assert 'API' in result['msg']
 
-
     @patch('sslbt_main.APIClient')
     def test_deploy_processing_with_file(self, mock_api_cls, plugin):
         """processing + file 状态放置验证文件"""
@@ -322,6 +322,87 @@ class TestDeployCert:
         result = plugin.deploy_cert({'order_id': '304'})
         assert result['status'] is False
         assert '失败' in result['msg']
+
+    @patch('sslbt_main.APIClient')
+    def test_deploy_missing_ca_rejected(self, mock_api_cls, plugin):
+        """active 但缺少中间证书 → 拒绝部署，避免残链覆盖完整链（BT-01）"""
+        plugin._config.add_cert(
+            order_id=306,
+            cert_name='test',
+            domains=['a.com'],
+            site_names=['a.com'],
+            api_url='https://api.example.com',
+            api_token=TOKEN,
+        )
+        mock_api = MagicMock()
+        mock_api.query_order.return_value = {
+            'status': 'active',
+            'certificate': '-----BEGIN CERTIFICATE-----\nX\n-----END CERTIFICATE-----',
+            'ca_certificate': '',
+        }
+        mock_api_cls.return_value = mock_api
+        result = plugin.deploy_cert({'order_id': '306'})
+        assert result['status'] is False
+        assert '中间证书' in result['msg']
+
+    @patch('sslbt_main.APIClient')
+    def test_deploy_all_sites_failed_returns_failure(self, mock_api_cls, plugin):
+        """所有绑定站点部署失败时顶层状态必须为失败"""
+        plugin._config.add_cert(
+            order_id=305, cert_name='test', domains=['a.com'], site_names=['a.com'],
+            api_url='https://api.example.com', api_token=TOKEN,
+        )
+        mock_api = MagicMock()
+        mock_api.query_order.return_value = {
+            'status': 'active', 'certificate': '---CERT---',
+            'ca_certificate': '---CA---', 'private_key': '---KEY---',
+        }
+        mock_api_cls.return_value = mock_api
+        deployer_mock = MagicMock()
+        deployer_mock.deploy_multi.return_value = [
+            {'site_name': 'a.com', 'status': False, 'message': '部署超时'},
+        ]
+        with patch('sslbt_main.Deployer', return_value=deployer_mock), \
+             patch.object(plugin, '_resolve_private_key', return_value='---KEY---'):
+            result = plugin.deploy_cert({'order_id': '305'})
+
+        assert result['status'] is False
+        assert '0 成功，1 失败' in result['msg']
+        assert result['data'][0]['message'] == '部署超时'
+
+    def test_deploy_cert_busy_when_renew_locked(self, plugin):
+        """cron 续签占用 renew.lock 时手动部署返回 busy（BT-08）"""
+        plugin._config.add_cert(
+            order_id=307,
+            cert_name='test',
+            domains=['a.com'],
+            site_names=['a.com'],
+            api_url='https://api.example.com',
+            api_token=TOKEN,
+        )
+        lock_path = os.path.join(plugin._data_dir, 'renew.lock')
+        lock_fd = open(lock_path, 'w')
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            result = plugin.deploy_cert({'order_id': '307'})
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            lock_fd.close()
+        assert result['status'] is False
+        assert '续签' in result['msg']
+
+    def test_deploy_all_busy_when_renew_locked(self, plugin):
+        """cron 续签占用锁时批量部署返回 busy（BT-08）"""
+        lock_path = os.path.join(plugin._data_dir, 'renew.lock')
+        lock_fd = open(lock_path, 'w')
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            result = plugin.deploy_all({})
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            lock_fd.close()
+        assert result['status'] is False
+        assert '续签' in result['msg']
 
 
 class TestCheckCert:
@@ -409,8 +490,8 @@ class TestUpdateCertConfig:
         })
         assert result['status'] is False
 
-    def test_update_validation_method_ip_rejects_delegation(self, plugin):
-        """IP 域名拒绝 delegation 验证"""
+    def test_update_validation_method_ip_derives_file(self, plugin):
+        """IP 域名自动派生为 local/file（覆盖非法入参 delegation，spec §5.2）"""
         plugin._config.add_cert(order_id=506, cert_name='test', domains=['1.2.3.4'],
                                 api_url='https://api.example.com', api_token=TOKEN)
         result = plugin.update_cert_config({
@@ -418,7 +499,10 @@ class TestUpdateCertConfig:
             'renew_mode': 'local',
             'validation_method': 'delegation',
         })
-        assert result['status'] is False
+        assert result['status'] is True
+        cert = plugin._config.get_cert(506)
+        assert cert['renew_mode'] == 'local'
+        assert cert['validation_method'] == 'file'
 
 
 class TestGetSiteMatches:
@@ -452,6 +536,20 @@ class TestGetSiteMatches:
         assert data[1]['bound'] is False
         assert data[1]['match_type'] is None
 
+    def test_partial_match_returns_unmatched(self, plugin):
+        """部分匹配站点返回未覆盖域名清单（前端据此提示 TLS 覆盖缺口，BT-05）"""
+        plugin._config.add_cert(order_id=703, cert_name='test',
+                                domains=['a.example.com'],
+                                api_url='https://api.example.com', api_token=TOKEN)
+        plugin._site_mgr.get_sites.return_value = [
+            {'name': 'site-p.example.com', 'domains': ['a.example.com', 'uncovered.example.com']},
+        ]
+        result = plugin.get_site_matches({'order_id': '703'})
+        assert result['status'] is True
+        row = result['data'][0]
+        assert row['match_type'] == 'partial'
+        assert row['unmatched'] == ['uncovered.example.com']
+
     def test_no_sites(self, plugin):
         plugin._config.add_cert(order_id=701, cert_name='test', domains=['a.example.com'],
                                 api_url='https://api.example.com', api_token=TOKEN)
@@ -479,6 +577,28 @@ class TestGetSiteMatches:
         assert result['data'][0]['bound'] is True
 
 
+class TestGetRenewStatus:
+    """最近续签状态读取（B5）"""
+
+    def test_no_status_file(self, plugin):
+        """无状态文件时返回 data=None"""
+        result = plugin.get_renew_status()
+        assert result['status'] is True
+        assert result['data'] is None
+
+    def test_reads_status_file(self, plugin):
+        """读取续签状态文件内容"""
+        path = os.path.join(plugin._data_dir, 'renew_status.json')
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump({'last_run': '2026-07-17T10:00:00Z', 'total': 3,
+                       'success': 2, 'pending': 0, 'failure': 1}, f)
+        result = plugin.get_renew_status()
+        assert result['status'] is True
+        assert result['data']['total'] == 3
+        assert result['data']['success'] == 2
+        assert result['data']['failure'] == 1
+
+
 class TestFetchDeployUrl:
     def test_missing_url(self, plugin):
         result = plugin.fetch_deploy_url({})
@@ -500,84 +620,119 @@ class TestFetchDeployUrl:
         assert result['status'] is False
         assert 'order' in result['msg']
 
-    @patch('urllib.request.urlopen')
-    def test_success_returns_session_id(self, mock_urlopen, plugin):
+    @patch('sslbt_main.APIClient')
+    def test_success_returns_session_id(self, mock_api_cls, plugin):
         """正常流程返回 session_id 而非明文 token"""
-        mock_resp = MagicMock()
-        mock_resp.read.return_value = json.dumps({
-            'code': 1,
-            'data': {'order_id': 100, 'domains': 'a.com', 'status': 'active'},
-        }).encode()
-        mock_urlopen.return_value = mock_resp
+        mock_api = MagicMock()
+        mock_api.query_batch.return_value = [{'order_id': 100, 'domains': 'a.com', 'status': 'active'}]
+        mock_api_cls.return_value = mock_api
         plugin._site_mgr.get_sites.return_value = []
 
-        result = plugin.fetch_deploy_url({'url': 'https://api.example.com/deploy?token=secret123456789012345678901234&order=100'})
+        result = plugin.fetch_deploy_url({'url': 'https://api.example.com/api/deploy?token=' + TOKEN + '&order=100'})
         assert result['status'] is True
         data = result['data']
         assert 'session_id' in data
-        assert 'token' not in data.get('api', {}) or data['api']['token'] == ''  # 明文 token 不应出现
+        assert 'token' not in data.get('api', {})  # 明文 token 不应出现
         assert data['api']['token_masked'].endswith('***')  # 仅返回脱敏值
 
-    @patch('urllib.request.urlopen')
-    def test_add_cert_with_session_id(self, mock_urlopen, plugin):
+    @patch('sslbt_main.APIClient')
+    def test_partial_match_includes_unmatched(self, mock_api_cls, plugin):
+        """fetch_deploy_url 为部分匹配站点返回未覆盖域名（前端一键部署列表据此提示，BT-05）"""
+        mock_api = MagicMock()
+        mock_api.query_batch.return_value = [{'order_id': 200, 'domains': 'a.example.com', 'status': 'active'}]
+        mock_api_cls.return_value = mock_api
+        plugin._site_mgr.get_sites.return_value = [
+            {'name': 'site-x.example.com', 'domains': ['a.example.com', 'b.uncovered.com']},
+        ]
+        result = plugin.fetch_deploy_url({'url': 'https://api.example.com/api/deploy?token=' + TOKEN + '&order=200'})
+        assert result['status'] is True
+        matches = result['data']['certs'][0]['_matches']
+        assert len(matches) == 1
+        assert matches[0]['match_type'] == 'partial'
+        assert matches[0]['unmatched'] == ['b.uncovered.com']
+
+    def test_http_scheme_rejected(self, plugin):
+        """http 部署链接被拒绝（统一客户端 HTTPS 强制，BT-09）"""
+        result = plugin.fetch_deploy_url({
+            'url': 'http://api.example.com/api/deploy?token=' + TOKEN + '&order=1'})
+        assert result['status'] is False
+        assert 'HTTPS' in result['msg'] or '不安全' in result['msg']
+
+    @patch('sslbt_main.APIClient')
+    def test_reverse_proxy_subpath_preserved(self, mock_api_cls, plugin):
+        """反代子路径部署链接保留路径前缀（api_url 不得被改写回 host-root）"""
+        mock_api = MagicMock()
+        mock_api.query_batch.return_value = [{'order_id': 300, 'domains': 'a.com', 'status': 'active'}]
+        mock_api_cls.return_value = mock_api
+        plugin._site_mgr.get_sites.return_value = []
+
+        result = plugin.fetch_deploy_url({
+            'url': 'https://host.example.com/manager/api/deploy?token=' + TOKEN + '&order=300'})
+        assert result['status'] is True
+        # APIClient 用含子路径的 base_url 构造，session/config 后续沿用同一地址
+        assert mock_api_cls.call_args[0][0] == 'https://host.example.com/manager/api/deploy'
+        assert result['data']['api']['url'] == 'https://host.example.com/manager/api/deploy'
+
+    @patch('sslbt_main.APIClient')
+    def test_host_root_link_behavior_unchanged(self, mock_api_cls, plugin):
+        """标准链接（path=/api/deploy）功能不变，api_url 含标准路径"""
+        mock_api = MagicMock()
+        mock_api.query_batch.return_value = [{'order_id': 301, 'domains': 'a.com', 'status': 'active'}]
+        mock_api_cls.return_value = mock_api
+        plugin._site_mgr.get_sites.return_value = []
+
+        result = plugin.fetch_deploy_url({
+            'url': 'https://api.example.com/api/deploy?token=' + TOKEN + '&order=301'})
+        assert result['status'] is True
+        assert mock_api_cls.call_args[0][0] == 'https://api.example.com/api/deploy'
+
+    @patch('sslbt_main.APIClient')
+    def test_add_cert_with_session_id(self, mock_api_cls, plugin):
         """通过 session_id 添加证书"""
-        # 先 fetch 获取 session_id
-        mock_resp = MagicMock()
-        mock_resp.read.return_value = json.dumps({
-            'code': 1,
-            'data': {'order_id': 100, 'domains': 'a.com', 'status': 'active'},
-        }).encode()
-        mock_urlopen.return_value = mock_resp
+        mock_api = MagicMock()
+        mock_api.query_batch.return_value = [{'order_id': 100, 'domains': 'a.com', 'status': 'active'}]
+        mock_api.query_order.return_value = {'status': 'active', 'domains': 'a.com'}
+        mock_api_cls.return_value = mock_api
         plugin._site_mgr.get_sites.return_value = []
 
-        fetch_result = plugin.fetch_deploy_url({'url': 'https://api.example.com/deploy?token=' + TOKEN + '&order=100'})
+        fetch_result = plugin.fetch_deploy_url(
+            {'url': 'https://api.example.com/api/deploy?token=' + TOKEN + '&order=100'})
         session_id = fetch_result['data']['session_id']
 
-        # 用 session_id 添加证书
-        with patch('sslbt_main.APIClient') as mock_api_cls:
-            mock_api = MagicMock()
-            mock_api.query_order.return_value = {'status': 'active', 'domains': 'a.com'}
-            mock_api_cls.return_value = mock_api
+        # 用 session_id 添加证书（api_url 保留链接路径，_build_api_url 对含 /api/ 的路径直接追加后缀）
+        result = plugin.add_cert({
+            'order_id': '100',
+            'session_id': session_id,
+            'site_names': 'a.com',
+        })
+        assert result['status'] is True
+        cert = plugin._config.get_cert(100)
+        assert cert['api']['url'] == 'https://api.example.com/api/deploy'
+        assert cert['api']['token'] == TOKEN
 
-            result = plugin.add_cert({
-                'order_id': '100',
-                'session_id': session_id,
-                'site_names': 'a.com',
-            })
-            assert result['status'] is True
-            cert = plugin._config.get_cert(100)
-            assert cert['api']['url'] == 'https://api.example.com'
-            assert cert['api']['token'] == TOKEN
-
-    @patch('urllib.request.urlopen')
-    def test_session_id_reusable_for_batch(self, mock_urlopen, plugin):
+    @patch('sslbt_main.APIClient')
+    def test_session_id_reusable_for_batch(self, mock_api_cls, plugin):
         """同一 session_id 可用于批量添加多个证书"""
-        mock_resp = MagicMock()
-        mock_resp.read.return_value = json.dumps({
-            'code': 1,
-            'data': [
-                {'order_id': 101, 'domains': 'a.com'},
-                {'order_id': 102, 'domains': 'b.com'},
-            ],
-        }).encode()
-        mock_urlopen.return_value = mock_resp
+        mock_api = MagicMock()
+        mock_api.query_batch.return_value = [
+            {'order_id': 101, 'domains': 'a.com'},
+            {'order_id': 102, 'domains': 'b.com'},
+        ]
+        mock_api.query_order.side_effect = [
+            {'status': 'active', 'domains': 'a.com'},
+            {'status': 'active', 'domains': 'b.com'},
+        ]
+        mock_api_cls.return_value = mock_api
         plugin._site_mgr.get_sites.return_value = []
 
-        fetch_result = plugin.fetch_deploy_url({'url': 'https://api.example.com/deploy?token=' + TOKEN + '&order=101'})
+        fetch_result = plugin.fetch_deploy_url(
+            {'url': 'https://api.example.com/api/deploy?token=' + TOKEN + '&order=101'})
         session_id = fetch_result['data']['session_id']
 
-        with patch('sslbt_main.APIClient') as mock_api_cls:
-            mock_api = MagicMock()
-            mock_api.query_order.side_effect = [
-                {'status': 'active', 'domains': 'a.com'},
-                {'status': 'active', 'domains': 'b.com'},
-            ]
-            mock_api_cls.return_value = mock_api
-
-            r1 = plugin.add_cert({'order_id': '101', 'session_id': session_id, 'site_names': 'a.com'})
-            r2 = plugin.add_cert({'order_id': '102', 'session_id': session_id, 'site_names': 'b.com'})
-            assert r1['status'] is True
-            assert r2['status'] is True
+        r1 = plugin.add_cert({'order_id': '101', 'session_id': session_id, 'site_names': 'a.com'})
+        r2 = plugin.add_cert({'order_id': '102', 'session_id': session_id, 'site_names': 'b.com'})
+        assert r1['status'] is True
+        assert r2['status'] is True
 
     def test_expired_session(self, plugin):
         """过期 session_id 被拒绝"""
@@ -675,14 +830,15 @@ class TestFetchDeployUrl:
         assert 'sid-A' in loaded
         assert loaded['sid-A']['api_token'] == TOKEN
 
-    @patch('urllib.request.urlopen')
-    def test_api_error(self, mock_urlopen, plugin):
-        """API 返回错误"""
-        mock_resp = MagicMock()
-        mock_resp.read.return_value = json.dumps({'code': 0, 'msg': '认证失败'}).encode()
-        mock_urlopen.return_value = mock_resp
+    @patch('sslbt_main.APIClient')
+    def test_api_error(self, mock_api_cls, plugin):
+        """API 返回错误时透传"""
+        from lib.api_client import APIError
+        mock_api = MagicMock()
+        mock_api.query_batch.side_effect = APIError('认证失败')
+        mock_api_cls.return_value = mock_api
 
-        result = plugin.fetch_deploy_url({'url': 'https://api.example.com/deploy?token=abc&order=1'})
+        result = plugin.fetch_deploy_url({'url': 'https://api.example.com/api/deploy?token=' + TOKEN + '&order=1'})
         assert result['status'] is False
         assert '认证失败' in result['msg']
 
@@ -1062,6 +1218,7 @@ class TestDeployAll:
 
         with patch.object(plugin, 'deploy_cert', side_effect=fake_deploy):
             result = plugin.deploy_all()
+        assert result['status'] is False
         assert '1 成功' in result['msg']
         assert '1 失败' in result['msg']
         assert '1 需要私钥' in result['msg']
@@ -1074,9 +1231,21 @@ class TestDeployAll:
         with patch.object(plugin, 'deploy_cert',
                           return_value={'status': False, 'msg': '需要私钥', 'need_key': True}):
             result = plugin.deploy_all()
+        assert result['status'] is False
         assert '2 需要私钥' in result['msg']
         assert 'cert-x' in result['msg']
         assert 'cert-y' in result['msg']
+        assert '成功' not in result['msg']
+
+    def test_all_failed(self, plugin):
+        """全部证书部署失败时批量顶层状态必须为失败"""
+        self._add_cert(plugin, 940, 'cert-a')
+        self._add_cert(plugin, 941, 'cert-b')
+        with patch.object(plugin, 'deploy_cert',
+                          return_value={'status': False, 'msg': '部署失败'}):
+            result = plugin.deploy_all()
+        assert result['status'] is False
+        assert '2 失败' in result['msg']
         assert '成功' not in result['msg']
 
     def test_no_deployable_certs(self, plugin):
@@ -1140,3 +1309,107 @@ class TestBatchSetValidationMethod:
         """无效验证方式被拒绝"""
         result = plugin.batch_set_validation_method({'validation_method': 'invalid'})
         assert result['status'] is False
+
+
+class TestAddCertPolicyDerive:
+    """add_cert 策略派生（SAN 含 IP 强制 local/file）与 auto_reissue（local 关/pull 开）"""
+
+    @patch('sslbt_main.CronManager')
+    @patch('sslbt_main.APIClient')
+    def test_ip_cert_derives_local_file_auto_reissue_off(self, mock_api_cls, mock_cron_cls, plugin):
+        """SAN 含 IP：即使请求 pull 也派生为 local/file，auto_reissue 关闭"""
+        mock_api = MagicMock()
+        mock_api.query_order.return_value = {'status': 'active', 'domains': '1.2.3.4'}
+        mock_api_cls.return_value = mock_api
+        mock_cron = MagicMock()
+        mock_cron.get_status.return_value = {'exists': True}
+        mock_cron_cls.return_value = mock_cron
+        result = plugin.add_cert({
+            'order_id': '1000', 'api_url': 'https://api.example.com', 'api_token': TOKEN,
+            'renew_mode': 'pull',
+        })
+        assert result['status'] is True
+        cert = plugin._config.get_cert(1000)
+        assert cert['renew_mode'] == 'local'
+        assert cert['validation_method'] == 'file'
+        mock_api.toggle_auto_reissue.assert_called_once_with(1000, False)
+
+    @patch('sslbt_main.CronManager')
+    @patch('sslbt_main.APIClient')
+    def test_dns_pull_auto_reissue_on(self, mock_api_cls, mock_cron_cls, plugin):
+        """DNS + pull：保持 pull，auto_reissue 开启"""
+        mock_api = MagicMock()
+        mock_api.query_order.return_value = {'status': 'active', 'domains': 'a.example.com'}
+        mock_api_cls.return_value = mock_api
+        mock_cron = MagicMock()
+        mock_cron.get_status.return_value = {'exists': True}
+        mock_cron_cls.return_value = mock_cron
+        result = plugin.add_cert({
+            'order_id': '1001', 'api_url': 'https://api.example.com', 'api_token': TOKEN,
+            'renew_mode': 'pull',
+        })
+        assert result['status'] is True
+        assert plugin._config.get_cert(1001)['renew_mode'] == 'pull'
+        mock_api.toggle_auto_reissue.assert_called_once_with(1001, True)
+
+
+class TestBatchSetRenewPolicy:
+    """批量续签策略：一次原子后端操作、逐证书派生，DNS 不受混合批次影响"""
+
+    def _add(self, plugin, order_id, name, domains):
+        plugin._config.add_cert(order_id=order_id, cert_name=name, domains=domains,
+                                api_url='https://api.example.com', api_token=TOKEN)
+
+    def test_mixed_batch_per_cert_derivation(self, plugin):
+        """混合批次：DNS→local/file，IP→强制 local/file，wildcard+file 跳过（逐证书派生）"""
+        self._add(plugin, 800, 'dns', ['a.example.com'])
+        self._add(plugin, 801, 'ip', ['1.2.3.4'])
+        self._add(plugin, 802, 'wild', ['*.example.com'])
+        result = plugin.batch_set_renew_policy({'renew_mode': 'local', 'validation_method': 'file'})
+        assert result['status'] is True
+        dns = plugin._config.get_cert(800)
+        assert dns['renew_mode'] == 'local' and dns['validation_method'] == 'file'
+        ip = plugin._config.get_cert(801)
+        assert ip['renew_mode'] == 'local' and ip['validation_method'] == 'file'
+        wild = plugin._config.get_cert(802)
+        assert wild.get('validation_method', '') != 'file'  # 通配符+file 不兼容，跳过
+        assert '跳过' in result['msg']
+
+    def test_pull_batch_ip_still_local(self, plugin):
+        """批次设为 pull：DNS→pull，IP 证书仍独立派生 local/file，不受混合批次影响"""
+        self._add(plugin, 810, 'dns', ['a.example.com'])
+        self._add(plugin, 811, 'ip', ['1.2.3.4'])
+        result = plugin.batch_set_renew_policy({'renew_mode': 'pull'})
+        assert result['status'] is True
+        assert plugin._config.get_cert(810)['renew_mode'] == 'pull'
+        ip = plugin._config.get_cert(811)
+        assert ip['renew_mode'] == 'local'
+        assert ip['validation_method'] == 'file'
+
+    def test_clears_policy_blocked(self, plugin):
+        """重新设置合法策略清除 policy_blocked 终态"""
+        self._add(plugin, 820, 'ip', ['1.2.3.4'])
+        plugin._config.update_metadata(820, {'last_issue_state': 'policy_blocked_needs_setup'})
+        plugin.batch_set_renew_policy({'renew_mode': 'local', 'validation_method': 'file'})
+        assert plugin._config.get_cert(820)['metadata']['last_issue_state'] == ''
+
+    def test_invalid_mode(self, plugin):
+        assert plugin.batch_set_renew_policy({'renew_mode': 'invalid'})['status'] is False
+
+    def test_local_requires_validation(self, plugin):
+        assert plugin.batch_set_renew_policy({'renew_mode': 'local'})['status'] is False
+
+
+class TestUpdateClearsPolicyBlocked:
+    def test_edit_ip_to_local_file_clears_block(self, plugin):
+        """编辑 policy_blocked 的 IP 证书为 local/file → 派生并清除阻断终态"""
+        plugin._config.add_cert(order_id=530, cert_name='ip', domains=['1.2.3.4'],
+                                api_url='https://api.example.com', api_token=TOKEN)
+        plugin._config.update_metadata(530, {'last_issue_state': 'policy_blocked_needs_setup'})
+        result = plugin.update_cert_config({
+            'order_id': '530', 'renew_mode': 'local', 'validation_method': 'file'})
+        assert result['status'] is True
+        cert = plugin._config.get_cert(530)
+        assert cert['renew_mode'] == 'local'
+        assert cert['validation_method'] == 'file'
+        assert cert['metadata']['last_issue_state'] == ''

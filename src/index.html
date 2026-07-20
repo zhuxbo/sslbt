@@ -764,13 +764,19 @@
           h += '<div style="font-size:12px;color:#606266;margin-bottom:4px">匹配站点：</div>';
           for (var s = 0; s < availableMatches.length; s++) {
             var mt = availableMatches[s];
-            var tagCls = mt.match_type === 'full' ? 'ssl-tag-success' : 'ssl-tag-warning';
-            var tagTxt = mt.match_type === 'full' ? '全部匹配' : '部分匹配';
+            var isFull = mt.match_type === 'full';
+            var tagCls = isFull ? 'ssl-tag-success' : 'ssl-tag-warning';
+            var tagTxt = isFull ? '全部匹配' : '部分匹配';
             h += '<label style="display:flex;align-items:center;gap:6px;padding:3px 0;font-size:12px;cursor:pointer">';
-            h += '<input type="checkbox" checked data-cert-idx="' + c + '" data-site="' + P._e(mt.site_name) + '" class="add-site-cb" />';
+            // 部分匹配默认不勾选，避免一键部署后未覆盖域名 TLS 失效
+            h += '<input type="checkbox"' + (isFull ? ' checked' : '') + ' data-cert-idx="' + c + '" data-site="' + P._e(mt.site_name) + '" class="add-site-cb" />';
             h += P._e(mt.site_name);
             h += ' <span class="ssl-tag ' + tagCls + '">' + tagTxt + '</span>';
             h += '</label>';
+            // 部分匹配：列出未被证书覆盖的域名，提示这些域名将失去 TLS 覆盖
+            if (!isFull && mt.unmatched && mt.unmatched.length) {
+              h += '<div style="margin:0 0 4px 22px;font-size:11px;color:#e6a23c">未覆盖域名: ' + P._e(mt.unmatched.join(', ')) + '</div>';
+            }
           }
         } else {
           h += '<div style="font-size:12px;color:#c0c4cc">无匹配站点</div>';
@@ -1033,6 +1039,10 @@
           sitesHtml += '<input type="checkbox" class="edit-site-cb" value="' + P._e(s.site_name) + '"' + (s.bound ? ' checked' : '') + ' />';
           sitesHtml += '<span>' + P._e(s.site_name) + '</span>' + tag;
           sitesHtml += '</label>';
+          // 部分匹配：提示该站点未被证书覆盖的域名
+          if (s.match_type === 'partial' && s.unmatched && s.unmatched.length) {
+            sitesHtml += '<div style="margin:0 0 4px 22px;font-size:11px;color:#e6a23c">未覆盖域名: ' + P._e(s.unmatched.join(', ')) + '</div>';
+          }
         }
         sitesHtml += '</div>';
 
@@ -1046,11 +1056,12 @@
             '<div style="padding:20px 30px">' +
             '<div ' + row + '><label ' + lbl + '>绑定站点</label>' + sitesHtml + '</div>' +
             '<div ' + row + '><label ' + lbl + '>续签模式</label><select id="edit-renew-mode" ' + ipt + ' onchange="sslbt._toggleVmRow()">' +
-            '<option value="pull"' + (effectiveMode !== 'local' ? ' selected' : '') + '>自动签发</option>' +
-            '<option value="local"' + (effectiveMode === 'local' ? ' selected' : '') + '>本机提交</option></select></div>' +
-            '<div id="edit-vm-row" style="margin-bottom:14px;display:' + (effectiveMode === 'local' ? 'block' : 'none') + '"><label ' + lbl + '>验证方式</label><select id="edit-validation-method" ' + ipt + '>' +
+            // SAN 含 IP 的证书强制 local/file（禁用 pull/delegation，安全约束仍在后端派生）
+            '<option value="pull"' + (hasIP ? ' disabled' : '') + (effectiveMode !== 'local' && !hasIP ? ' selected' : '') + '>自动签发</option>' +
+            '<option value="local"' + (effectiveMode === 'local' || hasIP ? ' selected' : '') + '>本机提交</option></select></div>' +
+            '<div id="edit-vm-row" style="margin-bottom:14px;display:' + ((effectiveMode === 'local' || hasIP) ? 'block' : 'none') + '"><label ' + lbl + '>验证方式</label><select id="edit-validation-method" ' + ipt + '>' +
             '<option value="delegation"' + (hasIP ? ' disabled' : '') + (validationMethod !== 'file' && !hasIP ? ' selected' : '') + '>委托验证</option>' +
-            '<option value="file"' + (hasWildcard ? ' disabled' : '') + (validationMethod === 'file' && !hasWildcard ? ' selected' : '') + '>文件验证</option>' +
+            '<option value="file"' + (hasWildcard ? ' disabled' : '') + ((validationMethod === 'file' || hasIP) && !hasWildcard ? ' selected' : '') + '>文件验证</option>' +
             '</select></div>' +
             '<div ' + row + '><label ' + lbl + '>API URL</label><input id="edit-api-url" value="' + P._e(apiUrl) + '" placeholder="https://..." ' + ipt + ' /></div>' +
             '<div ' + row + '><label ' + lbl + '>API Token' + (apiTokenMasked ? ' <span style="color:#c0c4cc;font-weight:400">当前: ' + P._e(apiTokenMasked) + '</span>' : '') + '</label><input id="edit-api-token" value="" placeholder="留空则不修改" ' + ipt + ' /></div>' +
@@ -1131,6 +1142,7 @@
         h += '<button class="ssl-btn ssl-btn-sm" onclick="sslbt.removeCron()">删除计划任务</button>';
         h += ' <span id="cron-status" style="color:#909399;font-size:12px;margin-left:8px"></span>';
         h += '</td></tr>';
+        h += '<tr><td>最近续签</td><td><span id="renew-status" style="color:#909399;font-size:12px">加载中...</span></td></tr>';
         h += '</table></div>';
 
         // Section 3: 批量操作
@@ -1159,6 +1171,7 @@
 
         $('#settings-form').html(h);
         sslbt._loadCronStatus();
+        sslbt._loadRenewStatus();
       });
     },
 
@@ -1169,6 +1182,18 @@
         var el = document.getElementById('cron-status');
         if (!el) return;
         el.textContent = d.exists ? '当前: ' + d.cycle : '未设置';
+      });
+    },
+
+    _loadRenewStatus: function () {
+      P._call('get_renew_status', null, function (r) {
+        var el = document.getElementById('renew-status');
+        if (!el) return;
+        if (!r.status || !r.data) { el.textContent = '暂无续签记录'; return; }
+        var d = r.data;
+        var t = (d.last_run || '').replace('T', ' ').replace('Z', ' UTC');
+        el.textContent = t + '：共 ' + (d.total || 0) + '，成功 ' + (d.success || 0) +
+          '，等待 ' + (d.pending || 0) + '，失败 ' + (d.failure || 0);
       });
     },
 
@@ -1197,21 +1222,19 @@
     batchSetRenewMode: function () {
       var mode = $('#batch-renew-mode').val();
       var label = mode === 'local' ? '本机提交' : '自动签发';
-      var confirmMsg = '确定将所有证书的续签模式设为「' + label + '」？';
+      var confirmMsg = '确定将所有证书的续签策略设为「' + label + '」？';
       if (mode === 'local') {
         var vmLabel = $('#batch-validation-method').val() === 'file' ? '文件验证' : '委托验证';
-        confirmMsg += '\n验证方式：' + vmLabel + '（不兼容的证书将跳过）';
+        confirmMsg += '\n验证方式：' + vmLabel + '（含 IP 的证书强制文件验证，不兼容的证书将跳过）';
       }
       layer.confirm(confirmMsg, { offset: 'auto', closeBtn: 2 }, function (idx) {
         layer.close(idx);
-        P._call('batch_set_renew_mode', { renew_mode: mode }, function (r) {
+        // 一次原子后端操作，逐证书派生（含 IP 的证书强制 local/file）
+        var params = { renew_mode: mode };
+        if (mode === 'local') params.validation_method = $('#batch-validation-method').val();
+        P._call('batch_set_renew_policy', params, function (r) {
           layer.msg(r.msg, { icon: r.status ? 1 : 2 });
-          if (r.status) P._certCache = {};
-          if (r.status && mode === 'local') {
-            P._call('batch_set_validation_method', { validation_method: $('#batch-validation-method').val() }, function (r2) {
-              if (r2.msg) layer.msg(r2.msg, { icon: r2.status ? 1 : 2 });
-            });
-          }
+          if (r.status) { P._certCache = {}; P.loadCerts(); }
         });
       });
     },

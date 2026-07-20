@@ -31,7 +31,8 @@ class TestBuildAPIURL:
         assert _build_api_url('https://api.example.com/api/deploy') == 'https://api.example.com/api/deploy'
 
     def test_with_suffix(self):
-        assert _build_api_url('https://api.example.com/api/deploy', '/callback') == 'https://api.example.com/api/deploy/callback'
+        assert _build_api_url('https://api.example.com/api/deploy', '/callback') == \
+            'https://api.example.com/api/deploy/callback'
 
     def test_trailing_slash(self):
         assert _build_api_url('https://api.example.com/') == 'https://api.example.com/api/deploy'
@@ -148,6 +149,112 @@ class TestAPIClient:
             deployed_at='2026-01-01T00:00:00Z',
         )
         assert result['code'] == 1
+
+    @staticmethod
+    def _sent_payload(client):
+        """提取 mock opener 收到的请求体 JSON"""
+        req = client._opener.open.call_args.args[0]
+        return json.loads(req.data.decode('utf-8'))
+
+    def test_callback_failure_with_message(self, client):
+        resp_data = json.dumps({'code': 1, 'msg': 'success'}).encode()
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = resp_data
+        client._opener.open.return_value = mock_resp
+
+        client.callback(
+            order_id=12345,
+            status='failure',
+            deployed_at='2026-01-01T00:00:00Z',
+            message='s1: nginx 重载失败',
+        )
+        payload = self._sent_payload(client)
+        assert payload['status'] == 'failure'
+        assert payload['message'] == 's1: nginx 重载失败'
+
+    def test_callback_without_message_omits_field(self, client):
+        resp_data = json.dumps({'code': 1, 'msg': 'success'}).encode()
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = resp_data
+        client._opener.open.return_value = mock_resp
+
+        client.callback(
+            order_id=12345,
+            status='success',
+            deployed_at='2026-01-01T00:00:00Z',
+        )
+        payload = self._sent_payload(client)
+        assert 'message' not in payload
+
+    def test_callback_message_truncated_to_client_limit(self, client):
+        # 客户端将 message 截断至 ≤256（服务端上限 500，客户端更严格），超长不致整条被拒
+        resp_data = json.dumps({'code': 1, 'msg': 'success'}).encode()
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = resp_data
+        client._opener.open.return_value = mock_resp
+
+        client.callback(
+            order_id=12345,
+            status='failure',
+            deployed_at='2026-01-01T00:00:00Z',
+            message='错' * 600,
+        )
+        payload = self._sent_payload(client)
+        assert len(payload['message']) == 256
+
+    def test_callback_failure_message_sanitized(self, client):
+        # 失败原因含 Bearer Token 时须脱敏，绝不泄漏原始凭证到回调请求体
+        resp_data = json.dumps({'code': 1, 'msg': 'success'}).encode()
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = resp_data
+        client._opener.open.return_value = mock_resp
+
+        secret = 'Bearer abcDEF123456_secret-token.value'
+        client.callback(
+            order_id=12345,
+            status='failure',
+            deployed_at='2026-01-01T00:00:00Z',
+            message='部署失败 %s 请重试' % secret,
+        )
+        payload = self._sent_payload(client)
+        assert 'abcDEF123456_secret-token.value' not in payload['message']
+        assert 'Bearer ***REDACTED***' in payload['message']
+
+    def test_callback_message_sanitize_before_truncate(self, client):
+        # 密钥材料位于 256 截断点之内、END 标记在点外：
+        # 若实现改成"先截断后脱敏"，截断产物含 BEGIN+材料但无 END，私钥正则不命中即泄漏，本用例转红
+        resp_data = json.dumps({'code': 1, 'msg': 'success'}).encode()
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = resp_data
+        client._opener.open.return_value = mock_resp
+
+        raw = 'x' * 150 + '-----BEGIN PRIVATE KEY-----\nLEAKMATERIAL' + 'A' * 80 + '\n-----END PRIVATE KEY-----'
+        client.callback(
+            order_id=12345,
+            status='failure',
+            deployed_at='2026-01-01T00:00:00Z',
+            message=raw,
+        )
+        payload = self._sent_payload(client)
+        assert 'LEAKMATERIAL' not in payload['message']
+        assert '***REDACTED PRIVATE KEY***' in payload['message']
+        assert len(payload['message']) <= 256
+
+    def test_callback_success_with_message_omits_field(self, client):
+        # message 仅 failure 携带：即便误传，success 也绝不带出 message
+        resp_data = json.dumps({'code': 1, 'msg': 'success'}).encode()
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = resp_data
+        client._opener.open.return_value = mock_resp
+
+        client.callback(
+            order_id=12345,
+            status='success',
+            deployed_at='2026-01-01T00:00:00Z',
+            message='不应出现的内容',
+        )
+        payload = self._sent_payload(client)
+        assert 'message' not in payload
 
     def test_test_connection_success(self, client):
         resp_data = json.dumps({'code': 1, 'msg': 'ok', 'data': {}}).encode()
