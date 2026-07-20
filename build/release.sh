@@ -43,6 +43,7 @@ usage() {
   build/release.sh --verify BUNDLE_DIR
   build/release.sh --resume BUNDLE_DIR
   build/release.sh --dev VERSION [--bundle DIR]
+  build/release.sh VERSION [--bundle DIR]    # 兼容旧入口，仅限预发布版
   build/release.sh --dry-run VERSION
   build/release.sh --test-connections
 
@@ -64,7 +65,10 @@ while [ "$#" -gt 0 ]; do
             MODE="test-connections"; shift ;;
         --bundle) BUNDLE_DIR="${2:-}"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
-        *) die "未知参数: $1" ;;
+        -*) die "未知参数: $1" ;;
+        *)
+            [ -z "$MODE" ] || die "只能选择一个模式"
+            MODE="dev"; VERSION="$1"; shift ;;
     esac
 done
 [ -n "$MODE" ] || { usage; exit 1; }
@@ -322,7 +326,11 @@ stage_nodes() {
             info "$SERVER_NAME 暂存并校验完成"
         fi
     done
-    info "所有节点暂存完成；main 此时才可创建不可变 tag 和 draft GitHub Release"
+    if [ "$CHANNEL" = main ]; then
+        info "所有节点暂存完成；main 通道可继续创建不可变 tag 和 draft GitHub Release"
+    else
+        info "所有节点暂存完成；dev 通道无需 tag 和 GitHub Release，将继续发布"
+    fi
 }
 
 require_main_tag() {
@@ -618,6 +626,6 @@ case "$MODE" in
         require_main_tag; stage_nodes true; publish_nodes ;;
     dev)
         [ -n "$VERSION" ] || die "缺少版本号"
-        normalize_version "$VERSION"; [[ "$VERSION" == *-* ]] || die "--dev 只接受预发布 SemVer"
+        normalize_version "$VERSION"; [[ "$VERSION" == *-* ]] || die "dev 发布只接受预发布 SemVer"
         prepare_bundle "$VERSION"; stage_nodes false; publish_nodes ;;
 esac

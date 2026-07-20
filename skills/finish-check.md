@@ -21,7 +21,7 @@
 11. 宝塔契约：SetSSL 参数/返回白名单、参数化 SQLite、站点查询失败与零站点区分、两轮解绑确认、前后端方法与 `{status,msg,data}` 同步。
 12. 续签契约：服务端 `renew_before_days`、UTC、重试上限、Local CSR 异步状态、pending 私钥生命周期、订单变更、failure 回调和部署失败顶层状态符合 `deploy-spec.md`。
 13. 发布与治理（若相关）：正式资产仅 `sslbt.zip`；SHA256 与文件名一致；main 不可覆盖/重建，tag 后只能原 bundle 恢复；所有节点先 stage 后 publish；Skill/工具/README 不复制冲突流程。
-14. diff 与文档：无调试残留、误删、被忽略文件或无关改动；`src/info.json` 不手改。只有本次触碰 `deploy-spec.md` 时才检查 `ssl-manager`、`sslctl`、`sslctlw`、`sslbt` 四仓字节一致，本任务未修改则标记不适用。
+14. diff 与文档：无调试残留、误删、被忽略文件或无关改动；`src/info.json` 不手改。只有本次触碰 `deploy-spec.md` 时才检查 `sslctl`、`sslctlw`、`sslbt` 三仓字节一致，本任务未修改则标记不适用。
 
 ## 平台验证与风险报告
 

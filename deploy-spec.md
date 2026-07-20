@@ -770,11 +770,11 @@ dev 发布完成至少验证所有发布节点的版本目录可读、产物数�
 - `dev → main` PR 已合并；本仓发布 skill 声明的适用 required checks 和 release gates 在 PR、合并后 `main`、回同步后 `dev` 三个阶段均成功，且均核对到对应的精确 commit
 - 本地与远端 `main`、本地与远端 `dev`、`v{version}`、`latest`、GitHub Release target 全部指向同一 commit
 - 工作区干净
-- 所有发布节点及统一公网入口的 `main.latest` 均等于本次版本（不带 `v` 前缀）
+- 所有发布节点通过各自公网域名读取的 `main.latest` 均等于本次版本（不带 `v` 前缀）
 - 所有发布节点和 GitHub Release 的规范正式资产集合完整且字节一致，SHA256 与 `releases.json.checksums` 一致；平台声明的 GitHub-only 附加资产也完整
 - GitHub Release 已公开，非 draft、非 prerelease，并标记为最新正式版
 - 产物内注入的版本号正确，平台要求的签名验证通过
-- 至少通过公网入口实际下载一个代表产物并完成 SHA256 校验
+- 至少通过每个发布节点的公网域名实际下载一个代表产物并完成 SHA256 校验
 
 ---
 
@@ -970,6 +970,6 @@ skills/*.md             由根 Skill 路由的领域知识和可执行工作流�
 - `skills/SKILL.md` 中列出的叶子文件全部存在
 - 项目文档不再引用旧的 `skills/<name>/SKILL.md` 路径
 - 固定模板的工具自定义指令与预期模板哈希一致，并引用存在的对应叶子资源
-- 统一多仓流程检查四仓（`ssl-manager`、`sslctl`、`sslctlw`、`sslbt`）`deploy-spec.md` 字节一致；单仓 CI 不拉取其他仓库的移动分支进行比较
+- 统一多仓流程检查三仓（`sslctl`、`sslctlw`、`sslbt`）`deploy-spec.md` 字节一致；单仓 CI 不拉取其他仓库的移动分支进行比较
 
-第 12 节描述四仓完成智能体配置同步后的目标状态。规范可先行同步；在单仓完成结构迁移前，不启用引用尚不存在文件的结构门禁。某仓完成迁移后，本节即成为该仓必须持续满足的现行约束。
+第 12 节描述三仓完成智能体配置同步后的目标状态。规范可先行同步；在单仓完成结构迁移前，不启用引用尚不存在文件的结构门禁。某仓完成迁移后，本节即成为该仓必须持续满足的现行约束。

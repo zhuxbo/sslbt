@@ -116,7 +116,10 @@ def test_dev_release_stages_then_publishes_identical_assets(tmp_path):
     env, nodes = mock_release_env(tmp_path)
     env['FORCE_CLEAN_GIT'] = '1'
     bundle = tmp_path / 'bundle'
-    run_release(['--dev', '9.8.7-rc.1', '--bundle', str(bundle)], env)
+    result = run_release(['--dev', '9.8.7-rc.1', '--bundle', str(bundle)], env)
+
+    assert '所有节点暂存完成；dev 通道无需 tag 和 GitHub Release，将继续发布' in result.stdout
+    assert 'main 通道可继续创建不可变 tag' not in result.stdout
 
     hashes = []
     for node in nodes:
@@ -129,6 +132,26 @@ def test_dev_release_stages_then_publishes_identical_assets(tmp_path):
         assert not (node / '.publish-lock').exists()
     assert hashes[0] == hashes[1]
     assert not (bundle / '.publish-process.lock').exists()
+
+
+def test_legacy_positional_dev_release_is_compatible(tmp_path):
+    env, nodes = mock_release_env(tmp_path)
+    bundle = tmp_path / 'legacy-bundle'
+
+    result = run_release(['v9.8.8-beta.1', '--bundle', str(bundle)], env)
+
+    assert '所有节点暂存完成；dev 通道无需 tag 和 GitHub Release，将继续发布' in result.stdout
+    for node in nodes:
+        assert (node / 'dev' / 'v9.8.8-beta.1' / 'sslbt.zip').is_file()
+        index = json.loads((node / 'releases.json').read_text())
+        assert index['dev']['latest'] == '9.8.8-beta.1'
+
+
+def test_legacy_positional_stable_release_is_rejected():
+    result = run_release(['9.8.8'], os.environ.copy(), check=False)
+
+    assert result.returncode != 0
+    assert 'dev 发布只接受预发布 SemVer' in result.stderr
 
 
 def test_publish_failure_rolls_back_all_nodes(tmp_path):
@@ -149,7 +172,9 @@ def test_publish_failure_rolls_back_all_nodes(tmp_path):
 
     bundle = tmp_path / 'bundle'
     run_release(['--prepare', '1.0.1', '--bundle', str(bundle)], env)
-    run_release(['--stage', str(bundle)], env)
+    stage_result = run_release(['--stage', str(bundle)], env)
+    assert '所有节点暂存完成；main 通道可继续创建不可变 tag 和 draft GitHub Release' in stage_result.stdout
+    assert 'dev 通道无需 tag 和 GitHub Release' not in stage_result.stdout
     failing_env = dict(env, FAIL_HOST='node2', FAIL_MATCH='releases.json.tmp')
     result = run_release(['--publish', str(bundle)], failing_env, check=False)
     assert result.returncode != 0
