@@ -4,13 +4,12 @@ import os
 import json
 import hashlib
 import shutil
-import ssl
 import tempfile
 import zipfile
 from urllib.parse import urlparse
 from urllib.request import Request, build_opener
 
-from .api_client import _SafeHTTPHandler, _SafeHTTPSHandler
+from .api_client import _SafeHTTPHandler, _SafeHTTPSHandler, _create_ssl_context
 from .net_guard import check_ssrf
 
 MAX_RELEASES_SIZE = 256 * 1024
@@ -98,7 +97,7 @@ class Updater:
         self._plugin_dir = plugin_dir
         self._config = config_manager
         self._logger = logger
-        ssl_ctx = ssl.create_default_context()
+        ssl_ctx = _create_ssl_context()
         self._opener = build_opener(
             _SafeHTTPHandler(),
             _SafeHTTPSHandler(context=ssl_ctx),

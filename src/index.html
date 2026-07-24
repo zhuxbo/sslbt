@@ -308,12 +308,15 @@
   }
   .ssl-settings-section table {
     border: none;
+    table-layout: fixed;
+    width: 100%;
   }
   .ssl-settings-section table td {
     padding: 6px 8px;
     border: none;
     vertical-align: middle;
     font-size: 13px;
+    text-align: left;
   }
   .ssl-settings-section table td:first-child {
     text-align: right;
@@ -387,13 +390,17 @@
   var P = {
     _certCache: {},   // order_id → detail data
     _certList: null,  // cached cert list for stats
+    _settingsRendered: false,
+    _settingsLoading: false,
+    _settingsLoaded: false,
+    _postUpdateKey: 'sslbt-post-update-version',
 
-    _call: function (method, data, cb) {
+    _call: function (method, data, cb, errCb) {
       var d = {};
       if (data) {
         for (var k in data) d[k] = data[k];
       }
-      $.post(
+      var req = $.post(
         '/plugin?action=a&s=' + method + '&name=sslbt',
         d,
         function (r) {
@@ -404,6 +411,8 @@
         },
         'json'
       );
+      if (errCb) req.fail(function (xhr) { errCb(xhr); });
+      return req;
     },
 
     _e: function (s) {
@@ -435,6 +444,39 @@
         if (m[t]) self[m[t]]();
       });
       this.loadCerts();
+      this._checkPostUpdate();
+    },
+
+    _rememberPostUpdate: function (version) {
+      try { window.sessionStorage.setItem(P._postUpdateKey, version || ''); } catch (e) {}
+    },
+
+    _checkPostUpdate: function () {
+      var expected = '';
+      try { expected = window.sessionStorage.getItem(P._postUpdateKey) || ''; } catch (e) {}
+      if (!expected) return;
+      var clearMarker = function () {
+        try { window.sessionStorage.removeItem(P._postUpdateKey); } catch (e) {}
+      };
+      var promptRestart = function () {
+        clearMarker();
+        layer.alert('刷新后未能正常加载目标版本，请重启宝塔面板后重新打开插件。', {
+          closeBtn: 2,
+          title: '需要重启面板',
+          icon: 2,
+          offset: 'auto',
+          btn: ['我知道了']
+        });
+      };
+      P._call('get_config', null, function (r) {
+        var actual = r && r.status && r.data ? String(r.data.plugin_version || '') : '';
+        var normalize = function (v) { return String(v || '').replace(/^v/, ''); };
+        if (!actual || normalize(actual) !== normalize(expected)) {
+          promptRestart();
+          return;
+        }
+        clearMarker();
+      }, promptRestart);
     },
 
     // ===== 统计计算 =====
@@ -1127,52 +1169,66 @@
 
     // ===== 设置 =====
     loadSettings: function () {
+      if (!P._settingsRendered) {
+        P._renderSettings();
+      }
+      // 状态按进入设置页刷新，只更新文字，不重建 DOM，也不轮询。
+      sslbt._loadCronStatus();
+      sslbt._loadRenewStatus();
+      if (P._settingsLoaded || P._settingsLoading) return;
+      P._settingsLoading = true;
       P._call('get_config', null, function (r) {
+        P._settingsLoading = false;
         if (!r.status) {
-          $('#settings-form').html('<div class="ssl-loading">' + P._e(r.msg) + '</div>');
+          $('#update-result').html('<span style="color:#f56c6c">加载设置失败: ' + P._e(r.msg) + '</span>');
           return;
         }
         var c = r.data;
-        var h = '';
-
-        // Section 1: 计划任务
-        h += '<div class="ssl-settings-section"><table>';
-        h += '<tr><td>计划任务</td><td>';
-        h += '<button class="ssl-btn ssl-btn-sm" onclick="sslbt.setupCron()">设置计划任务</button> ';
-        h += '<button class="ssl-btn ssl-btn-sm" onclick="sslbt.removeCron()">删除计划任务</button>';
-        h += ' <span id="cron-status" style="color:#909399;font-size:12px;margin-left:8px"></span>';
-        h += '</td></tr>';
-        h += '<tr><td>最近续签</td><td><span id="renew-status" style="color:#909399;font-size:12px">加载中...</span></td></tr>';
-        h += '</table></div>';
-
-        // Section 3: 批量操作
-        h += '<div class="ssl-settings-section"><table>';
-        h += '<tr><td>续签模式</td><td>';
-        h += '<select id="batch-renew-mode" style="width:94px" onchange="sslbt._toggleBatchVm()">';
-        h += '<option value="pull">自动签发</option><option value="local">本机提交</option></select> ';
-        h += '<span id="batch-vm-wrap" style="display:none">';
-        h += '<select id="batch-validation-method" style="width:94px"><option value="delegation">委托验证</option><option value="file">文件验证</option></select> ';
-        h += '</span>';
-        h += '<button class="ssl-btn ssl-btn-sm" onclick="sslbt.batchSetRenewMode()">应用到全部证书</button>';
-        h += '</td></tr>';
-        h += '</table></div>';
-
-        // Section 4: 插件升级
-        h += '<div class="ssl-settings-section"><table>';
-        h += '<tr><td>插件更新</td><td>';
-        h += '<select id="update-channel" style="width:94px" onchange="sslbt.saveUpdateChannel()">';
-        h += '<option value="main"' + ((c.upgrade_channel || 'main') === 'main' ? ' selected' : '') + '>稳定版</option>';
-        h += '<option value="dev"' + (c.upgrade_channel === 'dev' ? ' selected' : '') + '>测试版</option></select> ';
-        h += '<button class="ssl-btn ssl-btn-sm" onclick="sslbt.checkUpdate()">检查更新</button>';
-        h += ' <span style="color:#909399;font-size:12px;margin-left:8px">当前: ' + P._e(c.plugin_version || '0.0.0') + '</span>';
-        h += '<span id="update-result" style="margin-left:10px"></span>';
-        h += '</td></tr>';
-        h += '</table></div>';
-
-        $('#settings-form').html(h);
-        sslbt._loadCronStatus();
-        sslbt._loadRenewStatus();
+        $('#update-channel').val(c.upgrade_channel || 'main').prop('disabled', false);
+        $('#plugin-version').text(c.plugin_version || '0.0.0');
+        $('#update-result').empty();
+        P._settingsLoaded = true;
       });
+    },
+
+    _renderSettings: function () {
+      var h = '';
+
+      // Section 1: 计划任务
+      h += '<div class="ssl-settings-section"><table>';
+      h += '<tr><td>计划任务</td><td>';
+      h += '<button class="ssl-btn ssl-btn-sm" onclick="sslbt.setupCron()">设置计划任务</button> ';
+      h += '<button class="ssl-btn ssl-btn-sm" onclick="sslbt.removeCron()">删除计划任务</button>';
+      h += ' <span id="cron-status" style="color:#909399;font-size:12px;margin-left:8px"></span>';
+      h += '</td></tr>';
+      h += '<tr><td>最近续签</td><td><span id="renew-status" style="color:#909399;font-size:12px">加载中...</span></td></tr>';
+      h += '</table></div>';
+
+      // Section 3: 批量操作
+      h += '<div class="ssl-settings-section"><table>';
+      h += '<tr><td>续签模式</td><td>';
+      h += '<select id="batch-renew-mode" style="width:94px" onchange="sslbt._toggleBatchVm()">';
+      h += '<option value="pull">自动签发</option><option value="local">本机提交</option></select> ';
+      h += '<span id="batch-vm-wrap" style="display:none">';
+      h += '<select id="batch-validation-method" style="width:94px"><option value="delegation">委托验证</option><option value="file">文件验证</option></select> ';
+      h += '</span>';
+      h += '<button class="ssl-btn ssl-btn-sm" onclick="sslbt.batchSetRenewMode()">应用到全部证书</button>';
+      h += '</td></tr>';
+      h += '</table></div>';
+
+      // Section 4: 插件升级
+      h += '<div class="ssl-settings-section"><table>';
+      h += '<tr><td>插件更新</td><td>';
+      h += '<select id="update-channel" style="width:94px" onchange="sslbt.saveUpdateChannel()" disabled>';
+      h += '<option value="main">稳定版</option><option value="dev">测试版</option></select> ';
+      h += '<button class="ssl-btn ssl-btn-sm" onclick="sslbt.checkUpdate()">检查更新</button>';
+      h += ' <span style="color:#909399;font-size:12px;margin-left:8px">当前: <span id="plugin-version">加载中...</span></span>';
+      h += '<span id="update-result" style="margin-left:10px"></span>';
+      h += '</td></tr>';
+      h += '</table></div>';
+
+      $('#settings-form').html(h);
+      P._settingsRendered = true;
     },
 
     _loadCronStatus: function () {
@@ -1308,8 +1364,9 @@
         checksum: P._ui.checksum || ''
       }, function (r) {
         if (r.status) {
+          P._rememberPostUpdate(P._ui.latest_version);
           sp.innerHTML = '<span style="color:#67c23a">更新成功！</span>';
-          layer.alert('插件更新成功。刷新页面即可加载新版本，若遇到异常请重启面板（bt restart）。', {
+          layer.alert('插件更新成功。刷新页面即可加载新版本；若刷新后仍有异常，请重启宝塔面板。', {
             closeBtn: 2,
             title: '更新完成',
             icon: 1,

@@ -4,7 +4,11 @@ import os
 import json
 import time
 import fcntl
+import subprocess
+import sys
+import textwrap
 import pytest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from lib.config import ConfigManager
@@ -27,6 +31,41 @@ def plugin(tmp_data_dir):
 
 
 TOKEN = 'a' * 32 + '.test-token-abcdefghij1234'
+
+
+def test_reload_with_panel_module_name_refreshes_cached_lib_config():
+    """宝塔用非 sslbt_main 模块名 reload 时，也必须清掉升级前的 lib 缓存。"""
+    root = Path(__file__).resolve().parents[1]
+    script = textwrap.dedent("""
+        import importlib.util
+        import os
+        import sys
+        import types
+
+        root = sys.argv[1]
+        sys.path.insert(0, os.path.join(root, 'src'))
+        sys.path.insert(0, os.path.join(root, 'tests'))
+        sys.modules['panelSite'] = __import__('mock_bt.panelSite', fromlist=['panelSite'])
+        sys.modules['public'] = __import__('mock_bt.public', fromlist=['public'])
+
+        from lib.config import ConfigManager
+        stale_config = types.ModuleType('lib.config')
+        stale_config.__file__ = os.path.join(root, 'src', 'lib', 'config.py')
+        stale_config.ConfigManager = ConfigManager
+        sys.modules['lib.config'] = stale_config
+
+        entry = os.path.join(root, 'src', 'sslbt_main.py')
+        spec = importlib.util.spec_from_file_location('panel_plugin_sslbt', entry)
+        module = importlib.util.module_from_spec(spec)
+        module.sslbt_main = object
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+
+        assert hasattr(module, 'sslbt_main')
+        assert hasattr(sys.modules['lib.config'], 'derive_or_validate_renew_policy')
+    """)
+
+    subprocess.run([sys.executable, '-c', script, str(root)], check=True)
 
 
 class TestGetConfig:

@@ -2,11 +2,28 @@
 
 import json
 import pytest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 from urllib.error import HTTPError
 from io import BytesIO
 
 from lib.api_client import APIClient, APIError, validate_token, _build_api_url
+
+
+class TestSSLContext:
+    def test_loads_ubuntu_system_ca_bundle(self):
+        """宝塔 Python 默认 CA 路径异常时，仍补充加载 Ubuntu 系统 CA。"""
+        import lib.api_client as api_client
+        assert hasattr(api_client, '_create_ssl_context')
+        context = MagicMock()
+
+        def isfile(path):
+            return path == '/etc/ssl/certs/ca-certificates.crt'
+
+        with patch('lib.api_client.os.path.isfile', side_effect=isfile), \
+                patch('lib.api_client.ssl.create_default_context', return_value=context):
+            assert api_client._create_ssl_context() is context
+        context.load_verify_locations.assert_called_once_with(
+            cafile='/etc/ssl/certs/ca-certificates.crt')
 
 
 class TestValidateToken:

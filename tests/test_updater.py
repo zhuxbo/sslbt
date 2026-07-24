@@ -291,6 +291,12 @@ class TestChannelWhitelist:
 class TestSSRFProtection:
     """spec 10.1: SSRF/DNS Rebinding 防护"""
 
+    def test_uses_shared_system_ca_context_factory(self):
+        """升级检测与部署 API 必须共用系统 CA 补充逻辑。"""
+        import lib.api_client as api_client
+        import lib.updater as updater
+        assert getattr(updater, '_create_ssl_context', None) is api_client._create_ssl_context
+
     def test_opener_has_safe_handlers(self, updater_env):
         from lib.updater import Updater
         from lib.api_client import _SafeHTTPHandler, _SafeHTTPSHandler

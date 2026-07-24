@@ -1,5 +1,6 @@
 """证书平台 API 客户端"""
 
+import os
 import json
 import time
 import ssl
@@ -20,6 +21,29 @@ MAX_CALLBACK_RESPONSE_SIZE = 64 * 1024  # 64KB
 CALLBACK_MESSAGE_MAX = 256  # 客户端回调 message 截断上限（服务端校验上限 500，客户端更严格截断至 256）
 BATCH_MAX_RESPONSE_SIZE = 5 * 1024 * 1024  # 5MB
 TOKEN_PATTERN = re.compile(r'^[A-Za-z0-9\-_\.]+$')
+
+# 宝塔内置 Python/OpenSSL 的默认 CA 路径可能与宿主系统不一致；补充加载常见 Linux
+# 系统 CA bundle，仍由 SSLContext 严格执行证书链和主机名校验。
+_SYSTEM_CA_BUNDLES = (
+    '/etc/ssl/certs/ca-certificates.crt',       # Debian / Ubuntu
+    '/etc/pki/tls/certs/ca-bundle.crt',         # RHEL / CentOS
+    '/etc/ssl/ca-bundle.pem',                   # openSUSE
+    '/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem',
+)
+
+
+def _create_ssl_context():
+    """创建严格校验的 SSL Context，并补充宿主系统 CA 信任库。"""
+    context = ssl.create_default_context()
+    for cafile in _SYSTEM_CA_BUNDLES:
+        if not os.path.isfile(cafile):
+            continue
+        try:
+            context.load_verify_locations(cafile=cafile)
+        except (OSError, ssl.SSLError):
+            continue
+        break
+    return context
 
 
 class APIError(Exception):
@@ -108,7 +132,7 @@ class APIClient:
         self._logger = logger
         self._timeout = timeout
         # 使用系统 CA 验证，不支持自签名证书（API 服务端本身是证书签发方，应有有效证书）
-        self._ssl_ctx = ssl.create_default_context()
+        self._ssl_ctx = _create_ssl_context()
         # DNS Rebinding 防护的安全 opener
         self._opener = build_opener(
             _SafeHTTPHandler(),

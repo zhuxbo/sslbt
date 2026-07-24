@@ -17,9 +17,10 @@ sys.path.insert(0, PLUGIN_DIR)
 
 # 热更新：宝塔面板每次请求调用 reload(sslbt_main)，但不会递归 reload 子模块，
 # 导致升级后 lib/ 下的模块仍是旧版本。检测到 reload 时清除缓存，重新 import 即可。
-# 判断方式：首次 import 时 sslbt_main 类尚未定义，reload 时已存在。
+# 判断方式：reload 会保留当前模块 globals，首次 import 时 sslbt_main 类尚未定义。
+# 不依赖模块注册名，兼容宝塔以自定义模块名加载插件。
 # 注意：reload 会重置类变量；session 已改为磁盘持久化（data/sessions.json），不受影响。
-if hasattr(sys.modules.get('sslbt_main'), 'sslbt_main'):
+if 'sslbt_main' in globals():
     for _mod in [k for k in sys.modules if k == 'lib' or k.startswith('lib.')]:
         del sys.modules[_mod]
 
