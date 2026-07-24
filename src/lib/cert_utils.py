@@ -3,6 +3,8 @@
 import os
 import re
 import hashlib
+import locale
+import shutil
 import tempfile
 from datetime import datetime, timezone
 
@@ -21,6 +23,7 @@ PEM_CSR_RE = re.compile(
 
 MAX_CERT_SIZE = 65536  # 64KB
 MAX_KEY_SIZE = 16384  # 16KB
+MAX_PARSE_DIAGNOSTIC_SIZE = 256
 
 
 def validate_cert_pem(pem_text):
@@ -59,7 +62,24 @@ def validate_site_name_component(site_name):
     return None
 
 
-def parse_cert_info(pem_text):
+def _log_parse_failure(logger, reason, detail=''):
+    """记录不含证书正文的解析诊断；日志失败不得影响证书处理。"""
+    if not logger:
+        return
+    clean_detail = ' '.join(str(detail).split())
+    if len(clean_detail) > MAX_PARSE_DIAGNOSTIC_SIZE:
+        clean_detail = clean_detail[:MAX_PARSE_DIAGNOSTIC_SIZE] + '...'
+    openssl_path = shutil.which('openssl') or '(PATH 中未找到)'
+    try:
+        logger.error(
+            "证书解析诊断: reason=%s, openssl=%s, detail=%s",
+            reason, openssl_path, clean_detail or '(无)',
+        )
+    except Exception:
+        pass
+
+
+def parse_cert_info(pem_text, logger=None):
     """解析证书信息，返回 dict: common_name, domains, not_before, not_after, serial, issuer"""
     tmp = None
     try:
@@ -69,10 +89,12 @@ def parse_cert_info(pem_text):
 
         result = subprocess.run(
             ['openssl', 'x509', '-in', tmp.name, '-noout',
-             '-subject', '-dates', '-serial', '-issuer', '-ext', 'subjectAltName'],
+             '-subject', '-dates', '-serial', '-issuer', '-text'],
             capture_output=True, text=True, timeout=10
         )
         if result.returncode != 0:
+            _log_parse_failure(
+                logger, 'openssl_exit_%s' % result.returncode, result.stderr)
             return None
 
         output = result.stdout
@@ -88,7 +110,20 @@ def parse_cert_info(pem_text):
         if nb_match:
             info['not_before'] = _parse_openssl_date(nb_match.group(1).strip())
         if na_match:
-            info['not_after'] = _parse_openssl_date(na_match.group(1).strip())
+            not_after_text = na_match.group(1).strip()
+            info['not_after'] = _parse_openssl_date(not_after_text)
+            if info['not_after'] is None:
+                try:
+                    lc_time = locale.setlocale(locale.LC_TIME)
+                except Exception:
+                    lc_time = '(读取失败)'
+                _log_parse_failure(
+                    logger, 'invalid_not_after',
+                    'value=%s, LC_TIME=%s' % (not_after_text, lc_time))
+                return None
+        else:
+            _log_parse_failure(logger, 'missing_not_after', result.stderr)
+            return None
 
         # Serial
         serial_match = re.search(r'serial=([A-Fa-f0-9]+)', output)
@@ -118,7 +153,9 @@ def parse_cert_info(pem_text):
             delta = info['not_after'] - now
             info['days_remaining'] = delta.days
         return info
-    except Exception:
+    except Exception as e:
+        _log_parse_failure(
+            logger, 'exception_%s' % type(e).__name__, str(e))
         return None
     finally:
         if tmp and os.path.exists(tmp.name):

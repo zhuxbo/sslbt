@@ -539,6 +539,8 @@ class TestMetadataFailure:
         with pytest.raises(DeployError, match='部署未完成'):
             deployer.deploy_multi(['s1'], 'cert', 'key', order_id=12345)
 
+        mock_cert_utils.parse_cert_info.assert_called_once_with(
+            'cert', logger=deployer._logger)
         kwargs = api.callback.call_args.kwargs
         assert kwargs['status'] == 'failure'
         assert '到期时间' in kwargs.get('message', '')

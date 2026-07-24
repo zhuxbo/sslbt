@@ -121,7 +121,8 @@ class Deployer:
         # 解析或写入失败视为部署未完成：本地 cert_expires_at 缺失会导致 cron 永不接手
         meta_error = None
         if order_id and success_count > 0:
-            cert_info = cert_utils.parse_cert_info(fullchain_pem)
+            cert_info = cert_utils.parse_cert_info(
+                fullchain_pem, logger=self._logger)
             if not cert_info or not cert_info.get('not_after'):
                 meta_error = '证书解析失败，无法记录到期时间'
             else:

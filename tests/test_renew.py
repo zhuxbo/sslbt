@@ -1109,6 +1109,8 @@ class TestLocalUnknownExpiryRefill:
         cert = self._add_local_cert_empty_meta(engine, order_id=7006)
         result = engine._renew_local(cert, engine._mock_api)
         assert result is False
+        mock_parse.assert_called_once_with(
+            '---CERT---', logger=engine._logger)
         engine._mock_api.submit_csr.assert_not_called()
 
     @patch('lib.renew.cert_utils.generate_csr')

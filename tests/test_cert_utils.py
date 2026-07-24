@@ -1,9 +1,12 @@
 """证书工具测试"""
 
+import subprocess
+from unittest.mock import MagicMock
+
 import pytest
 
 from lib.cert_utils import (
-    validate_cert_pem, validate_key_pem, build_fullchain,
+    validate_cert_pem, validate_key_pem, build_fullchain, parse_cert_info,
     validate_site_name_component,
     PEM_CERT_RE, PEM_KEY_RE,
 )
@@ -80,6 +83,117 @@ class TestRegex:
 
 
 class TestSanParsing:
+    def test_parse_failure_logs_bounded_openssl_stderr(self, monkeypatch):
+        """OpenSSL 失败时记录退出码、实际路径和截断后的 stderr，不记录证书正文"""
+        logger = MagicMock()
+        pem = "-----BEGIN CERTIFICATE-----\nSECRET-CERT-BODY\n-----END CERTIFICATE-----"
+        stderr = 'unknown option -ext ' + 'x' * 400
+        monkeypatch.setattr(
+            subprocess, 'run',
+            lambda command, **kwargs: subprocess.CompletedProcess(
+                command, 1, stdout='', stderr=stderr))
+        monkeypatch.setattr('lib.cert_utils.shutil.which',
+                            lambda command: '/usr/bin/openssl')
+
+        assert parse_cert_info(pem, logger=logger) is None
+
+        logger.error.assert_called_once()
+        log_args = logger.error.call_args.args
+        message = log_args[0] % log_args[1:]
+        assert 'reason=openssl_exit_1' in message
+        assert 'openssl=/usr/bin/openssl' in message
+        assert 'unknown option -ext' in message
+        assert 'SECRET-CERT-BODY' not in message
+        assert len(message.split('detail=', 1)[1]) == 259
+
+    def test_invalid_not_after_logs_locale(self, monkeypatch):
+        """日期无法解析时记录原始日期与 LC_TIME，便于识别 locale 问题"""
+        logger = MagicMock()
+        output = """subject= /CN=example.com
+notBefore=Jan  1 00:00:00 2026 GMT
+notAfter=invalid-date
+serial=ABC123
+issuer= /CN=Test CA
+"""
+        monkeypatch.setattr(
+            subprocess, 'run',
+            lambda command, **kwargs: subprocess.CompletedProcess(
+                command, 0, stdout=output, stderr=''))
+        monkeypatch.setattr('lib.cert_utils.locale.setlocale',
+                            lambda category: 'zh_CN.UTF-8')
+
+        assert parse_cert_info('certificate', logger=logger) is None
+
+        log_args = logger.error.call_args.args
+        message = log_args[0] % log_args[1:]
+        assert 'reason=invalid_not_after' in message
+        assert 'value=invalid-date' in message
+        assert 'LC_TIME=zh_CN.UTF-8' in message
+
+    def test_parse_cert_info_with_runtime_openssl(self, tmp_path):
+        """用 PATH 中的真实 openssl 生成并解析含 DNS/IP SAN 的证书"""
+        config_file = tmp_path / 'openssl.cnf'
+        cert_file = tmp_path / 'cert.pem'
+        key_file = tmp_path / 'key.pem'
+        config_file.write_text("""[req]
+distinguished_name = dn
+x509_extensions = v3
+prompt = no
+
+[dn]
+CN = runtime.example
+
+[v3]
+subjectAltName = DNS:runtime.example,DNS:www.runtime.example,IP:192.0.2.1
+""")
+        subprocess.run(
+            ['openssl', 'req', '-new', '-x509', '-nodes', '-newkey', 'rsa:2048',
+             '-keyout', str(key_file), '-out', str(cert_file), '-days', '1',
+             '-config', str(config_file)],
+            capture_output=True, text=True, check=True, timeout=30,
+        )
+
+        info = parse_cert_info(cert_file.read_text())
+
+        assert info is not None
+        assert info['common_name'] == 'runtime.example'
+        assert info.get('not_after') is not None
+        assert info.get('serial')
+        assert info['domains'] == [
+            'runtime.example', 'www.runtime.example', '192.0.2.1']
+
+    def test_parse_cert_info_supports_openssl_1_0_2(self, monkeypatch):
+        """OpenSSL 1.0.2 无 x509 -ext，仍应通过 -text 解析证书信息"""
+        output = """subject= /CN=example.com
+notBefore=Jan  1 00:00:00 2026 GMT
+notAfter=Apr  1 00:00:00 2027 GMT
+serial=ABC123
+issuer= /CN=Test CA
+        X509v3 Subject Alternative Name:
+            DNS:example.com, DNS:www.example.com, IP Address:192.0.2.1
+"""
+        commands = []
+
+        def fake_run(command, **kwargs):
+            commands.append(command)
+            if '-ext' in command:
+                return subprocess.CompletedProcess(
+                    command, 1, stdout='', stderr='unknown option -ext')
+            return subprocess.CompletedProcess(command, 0, stdout=output, stderr='')
+
+        monkeypatch.setattr(subprocess, 'run', fake_run)
+
+        info = parse_cert_info(
+            "-----BEGIN CERTIFICATE-----\nTEST\n-----END CERTIFICATE-----")
+
+        assert info is not None
+        assert info['common_name'] == 'example.com'
+        assert info['not_after'].year == 2027
+        assert info['serial'] == 'ABC123'
+        assert info['domains'] == ['example.com', 'www.example.com', '192.0.2.1']
+        assert '-text' in commands[0]
+        assert '-ext' not in commands[0]
+
     def test_multiline_san_extraction(self):
         """SAN 跨多行输出时也能正确提取"""
         import re

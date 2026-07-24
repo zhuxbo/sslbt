@@ -603,7 +603,8 @@ class RenewEngine:
                     order_id, cert_data.get('status', ''))
             return False
 
-        cert_info = cert_utils.parse_cert_info(certificate)
+        cert_info = cert_utils.parse_cert_info(
+            certificate, logger=self._logger)
         if not cert_info or not cert_info.get('not_after'):
             if self._logger:
                 self._logger.warning("回填到期时间失败（证书解析错误），本轮跳过: order_id=%s", order_id)
