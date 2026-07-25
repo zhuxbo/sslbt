@@ -45,8 +45,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 # 检测 Python3 路径（宝塔自带 Python 不在系统 PATH 中，需查找已知位置）
+# 面板解释器优先：系统 python3 缺 psutil 等面板依赖，用它执行插件逻辑会在 import public 处失败
 PYTHON3=""
-for _py in python3 /www/server/panel/pyenv/bin/python3; do
+for _py in /www/server/panel/pyenv/bin/python3 python3; do
     if command -v "$_py" &>/dev/null && "$_py" -c "import json" &>/dev/null; then
         PYTHON3="$_py"
         break
@@ -235,9 +236,10 @@ rm -f "$TMP_FILE"
 # 清除 __pycache__ 避免旧字节码缓存
 find "$PLUGIN_DIR" -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true
 
-# 执行插件自带的 install.sh（宝塔插件注册流程）
+# 执行插件自带的 install.sh（宝塔插件注册流程，含计划任务注册/刷新）
+# 不吞 stderr：此前 2>/dev/null 让计划任务注册失败完全不可见
 if [ -f "$PLUGIN_DIR/install.sh" ]; then
-    cd "$PLUGIN_DIR" && bash install.sh install 2>/dev/null || true
+    cd "$PLUGIN_DIR" && bash install.sh install || echo_error "插件注册流程返回非零，请检查计划任务是否已设置"
 fi
 
 # 复制图标到面板静态目录（兼容不同版本宝塔的路径）

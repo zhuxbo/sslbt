@@ -263,6 +263,25 @@ class Updater:
 
             self._safe_extract(tmp_path, self._plugin_dir)
             self._logger.info("更新完成: %s", version)
+            self._refresh_cron()
         finally:
             if os.path.exists(tmp_path):
                 os.unlink(tmp_path)
+
+    def _refresh_cron(self):
+        """升级后刷新计划任务脚本正文（deploy-spec §7.3 步骤 8）
+
+        cron 脚本正文存在宝塔 crontab 库里、不在 PLUGIN_DIR 内，升级解压碰不到它——
+        不在这里刷新，_build_script 的任何修正都永远到不了存量安装。保留现有执行时间，
+        失败仅记日志：升级本身已经成功，不该因刷新失败而回滚。
+        """
+        try:
+            from .cron import CronManager
+            data_dir = os.path.join(self._plugin_dir, 'data')
+            res = CronManager(data_dir, self._logger).refresh()
+            if res.get('status'):
+                self._logger.info("计划任务已随升级刷新: %s", res.get('message', ''))
+            else:
+                self._logger.warning("升级后刷新计划任务失败: %s", res.get('message', ''))
+        except Exception as e:
+            self._logger.warning("升级后刷新计划任务异常: %s", str(e))

@@ -377,10 +377,14 @@ class sslbt_main:
             except Exception as e:
                 self._logger.warning("toggle_auto_reissue 失败: order_id=%s, error=%s", order_id, str(e))
 
-            # 自动创建计划任务（如果尚未设置）
+            # 自动创建计划任务（仅在确认不存在时）。查询失败绝不能触发创建：
+            # 那会经 remove+重建把用户正常的任务在一次瞬时 DB 锁定中弄丢
             try:
                 cron_mgr = CronManager(DATA_DIR, self._logger)
-                if not cron_mgr.get_status().get('exists'):
+                st = cron_mgr.get_status()
+                if st.get('error'):
+                    self._logger.warning("计划任务状态查询失败，跳过自动创建: %s", st['error'])
+                elif not st.get('exists'):
                     cron_mgr.setup()
             except Exception as e:
                 self._logger.warning("自动创建计划任务失败: %s", str(e))

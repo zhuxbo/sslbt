@@ -653,8 +653,24 @@
           return;
         }
         if (!enabledCount) return;
-        P._call('get_renew_status', null, function (r) {
-          P._showHealth(P._renewHealthMsg((r.status && r.data) ? r.data : null));
+        // 计划任务缺失/暂停是 cron 停摆最直接的原因，优先于 last_run 陈旧判定报出，
+        // 因为它能给出可操作的指引（备份恢复、跨机迁移后都是这个形态）
+        P._call('get_cron_status', null, function (cs) {
+          var d = (cs.status && cs.data) ? cs.data : null;
+          if (d && !d.error) {
+            if (!d.exists) {
+              P._showHealth('已有启用中的证书，但计划任务不存在，自动续签不会运行。'
+                + '请到「设置」点击「设置计划任务」。');
+              return;
+            }
+            if (d.paused) {
+              P._showHealth('计划任务已暂停，自动续签不会运行。请到宝塔「计划任务」页恢复。');
+              return;
+            }
+          }
+          P._call('get_renew_status', null, function (r) {
+            P._showHealth(P._renewHealthMsg((r.status && r.data) ? r.data : null));
+          });
         });
       });
     },
@@ -1367,13 +1383,27 @@
       P._settingsRendered = true;
     },
 
+    // 三态渲染：后端已区分「运行中」「已暂停」「查询失败」，此前只渲染 cycle，
+    // 用户在宝塔计划任务页暂停后这里照样显示「当前: 每天 14:23」
     _loadCronStatus: function () {
       P._call('get_cron_status', null, function (r) {
-        if (!r.status || !r.data) return;
-        var d = r.data;
         var el = document.getElementById('cron-status');
         if (!el) return;
-        el.textContent = d.exists ? '当前: ' + d.cycle : '未设置';
+        if (!r.status || !r.data) { el.textContent = ''; return; }
+        var d = r.data;
+        if (d.error) {
+          el.textContent = '状态查询失败: ' + d.error;
+          el.style.color = '#e6a23c';
+        } else if (!d.exists) {
+          el.textContent = '未设置（自动续签不会运行）';
+          el.style.color = '#f56c6c';
+        } else if (d.paused) {
+          el.textContent = '已暂停（自动续签不会运行）· ' + d.cycle;
+          el.style.color = '#f56c6c';
+        } else {
+          el.textContent = '运行中 · ' + d.cycle;
+          el.style.color = '#909399';
+        }
       });
     },
 
