@@ -280,6 +280,10 @@ def _migrate_cert_semantics(cert, global_renew_mode):
     return changed
 
 
+class ConfigDegradedError(Exception):
+    """主配置文件损坏，插件进入只读降级态，拒绝一切写入"""
+
+
 class ConfigManager:
     """配置读写管理，文件锁保护"""
 
@@ -287,29 +291,65 @@ class ConfigManager:
         self._data_dir = data_dir
         self._logger = logger
         self._config_path = os.path.join(data_dir, 'config.json')
+        # 主配置损坏后置位：允许任何局部写入都会把损坏文件"洗"成合法的空配置，
+        # 用户的证书配置就彻底没了。必须在 _ensure_config 之前初始化
+        self._degraded = False
         os.makedirs(data_dir, exist_ok=True)
         self._ensure_config()
+
+    def is_degraded(self):
+        """主配置是否处于只读降级态（供续签引擎在整轮开始前拒跑）"""
+        return self._degraded
+
+    def _assert_writable(self):
+        """降级态拒绝一切写入。报错优于静默覆盖：损坏文件还能人工修，被空配置盖掉就没了"""
+        if self._degraded:
+            name = os.path.basename(self._config_path)
+            raise ConfigDegradedError(
+                '配置文件 %s 解析失败，已停止一切写入以防覆盖；'
+                '原文件备份在 %s.bak，请人工修复后重试' % (name, name))
+
+    def _backup_corrupt(self, path):
+        """备份损坏文件。已有备份时不覆盖——第二次损坏不能毁掉第一份可恢复副本"""
+        bak = path + '.bak'
+        if os.path.exists(bak):
+            if self._logger:
+                self._logger.warning("损坏备份已存在，保留原备份不覆盖: %s", os.path.basename(bak))
+            return
+        try:
+            shutil.copy2(path, bak)
+        except OSError:
+            pass
 
     def _ensure_config(self):
         """启动时校验配置：合并旧文件、执行迁移、持久化"""
         raw = self._read_json(self._config_path, DEFAULT_CONFIG)
+
+        # 主配置损坏：保持现场，不迁移、不合并、不写入、不删除任何文件
+        if self._degraded:
+            if self._logger:
+                self._logger.error("配置文件损坏，插件进入只读降级态，已停止一切写入")
+            return
+
         changed = False
 
-        # 合并旧文件（先记录，写入成功后再删除）
+        # 合并旧文件：仅当内容确实并入 AND 本次写入成功才删除，其余一律改名 .orphan 保留。
+        # 删除不可逆，而"读失败"与"目标已有数据故未合并"都不代表旧文件没有价值——
+        # 此前 merged_files.append 在合并判断之外，这两种情况都会连同数据一起被删掉
         merged_files = []
+        orphan_files = []
         for old_name, field in _OLD_FILE_MERGES.items():
             old_path = os.path.join(self._data_dir, old_name)
             if not os.path.isfile(old_path):
                 continue
-            try:
-                old_data = self._read_json(old_path, {})
-                items = old_data.get(field, [])
-                if items and not raw.get(field):
-                    raw[field] = items
-                    changed = True
+            old_data = self._read_json(old_path, {})
+            items = old_data.get(field, []) if isinstance(old_data, dict) else []
+            if items and not raw.get(field):
+                raw[field] = items
+                changed = True
                 merged_files.append(old_path)
-            except OSError:
-                pass
+            else:
+                orphan_files.append(old_path)
 
         # 全局字段迁移
         changed = _apply_field_rules(raw, _GLOBAL_FIELD_RULES) or changed
@@ -323,16 +363,38 @@ class ConfigManager:
             changed = _fill_defaults(cert, DEFAULT_CERT_ENTRY) or changed
             changed = _migrate_cert_semantics(cert, global_renew_mode) or changed
 
+        # 捕获 Exception 而非 OSError：json.dump 对不可序列化对象抛 TypeError/ValueError，
+        # 穿透出去会让 ConfigManager 构造失败，插件整体不可用
+        write_ok = True
         if changed:
             try:
                 self._write_json(self._config_path, raw)
-            except OSError:
-                pass
+            except Exception as e:
+                write_ok = False
+                if self._logger:
+                    self._logger.error("配置写入失败，保留旧文件不删除: %s", str(e))
 
-        # 写入成功后再删除旧文件
+        if not write_ok:
+            # 写入失败时已合并的内容并未落盘，删除旧文件会让数据两头皆空
+            orphan_files.extend(merged_files)
+            merged_files = []
+
         for path in merged_files:
             try:
                 os.remove(path)
+            except OSError:
+                pass
+
+        for path in orphan_files:
+            orphan = path + '.orphan'
+            if os.path.exists(orphan):
+                continue  # 已有同名孤儿文件，保留原件不动，避免覆盖上一次的备份
+            try:
+                os.rename(path, orphan)
+                if self._logger:
+                    self._logger.warning(
+                        "旧配置文件未被合并，已改名保留: %s -> %s",
+                        os.path.basename(path), os.path.basename(orphan))
             except OSError:
                 pass
 
@@ -352,15 +414,17 @@ class ConfigManager:
         except json.JSONDecodeError:
             if self._logger:
                 self._logger.error("配置文件 JSON 解析失败: %s", path)
-            try:
-                shutil.copy2(path, path + '.bak')
-            except OSError:
-                pass
+            self._backup_corrupt(path)
+            # 仅主配置损坏才进入降级：遗留文件（certs.json 等）损坏由 _ensure_config 按
+            # .orphan 无损跳过，若也置降级会让插件永久只读，用户连删掉那张证书都做不到
+            if os.path.abspath(path) == os.path.abspath(self._config_path):
+                self._degraded = True
             return copy.deepcopy(default)
         except OSError:
             return copy.deepcopy(default)
 
     def _write_json(self, path, data):
+        self._assert_writable()
         if os.path.islink(path):
             raise OSError("refusing to write to symlink: %s" % os.path.basename(path))
         tmp_path = path + '.tmp'
@@ -376,7 +440,13 @@ class ConfigManager:
         os.replace(tmp_path, path)
 
     def _update_json(self, path, updater_fn, default):
-        """原子读-改-写: 在排他锁保护下执行 updater_fn(data) -> data"""
+        """原子读-改-写: 在排他锁保护下执行 updater_fn(data) -> data
+
+        降级门禁必须在这里也有一份：本函数有独立的"解析失败 → 备份 → 回落默认值 → 照常
+        写回"路径，是主配置被空配置覆盖的真正发生点（_ensure_config 的写入被 changed 门住，
+        损坏时不会触发）。只拦 _ensure_config 挡不住 cron 的任意一次 update_metadata。
+        """
+        self._assert_writable()
         if os.path.islink(path):
             raise OSError("refusing to write to symlink: %s" % os.path.basename(path))
         lock_path = path + '.lock'
@@ -390,10 +460,14 @@ class ConfigManager:
                     except json.JSONDecodeError:
                         if self._logger:
                             self._logger.error("配置文件 JSON 解析失败: %s", path)
-                        try:
-                            shutil.copy2(path, path + '.bak')
-                        except OSError:
-                            pass
+                        self._backup_corrupt(path)
+                        if os.path.abspath(path) == os.path.abspath(self._config_path):
+                            # 本次已持锁，置位后由下一次调用的 _assert_writable 拦截；
+                            # 本次直接抛出，绝不用默认值覆盖损坏的主配置
+                            self._degraded = True
+                            raise ConfigDegradedError(
+                                '配置文件 %s 解析失败，已停止写入以防覆盖'
+                                % os.path.basename(path))
                         data = copy.deepcopy(default)
                     except OSError:
                         data = copy.deepcopy(default)

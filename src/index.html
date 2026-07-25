@@ -637,15 +637,25 @@
       return '';
     },
 
+    _showHealth: function (msg) {
+      var el = document.getElementById('renew-health');
+      if (el) el.innerHTML = msg ? '<div class="ssl-health-bar">' + P._e(msg) + '</div>' : '';
+    },
+
     // 仅在有已启用证书时判定：全新安装、以及刚加完第一张证书（cron 最长 24h 后才首跑）
-    // 都还没有 renew_status.json，不该报红
+    // 都还没有 renew_status.json，不该报红。
+    // 配置降级例外——此时证书列表恒为空，正是最需要告警的时刻
     _loadRenewHealth: function (enabledCount) {
-      if (!enabledCount) return;
-      P._call('get_renew_status', null, function (r) {
-        var el = document.getElementById('renew-health');
-        if (!el) return;
-        var msg = P._renewHealthMsg((r.status && r.data) ? r.data : null);
-        el.innerHTML = msg ? '<div class="ssl-health-bar">' + P._e(msg) + '</div>' : '';
+      P._call('get_config', null, function (cr) {
+        if (cr.status && cr.data && cr.data.config_degraded) {
+          P._showHealth('配置文件损坏，插件已停止一切写入与自动续签以防覆盖。'
+            + '原文件备份为 config.json.bak，请人工修复后重启面板。');
+          return;
+        }
+        if (!enabledCount) return;
+        P._call('get_renew_status', null, function (r) {
+          P._showHealth(P._renewHealthMsg((r.status && r.data) ? r.data : null));
+        });
       });
     },
 
@@ -665,6 +675,8 @@
         if (!certs.length) {
           h += '<div class="ssl-empty">暂无证书，请点击"添加证书"</div>';
           $('#cert-list').html(h);
+          // 空列表也要检查：配置损坏时列表恒为空，"暂无证书"正是最危险的假象
+          P._loadRenewHealth(0);
           return;
         }
 

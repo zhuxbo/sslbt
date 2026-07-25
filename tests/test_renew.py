@@ -2131,3 +2131,30 @@ class TestEnvBlockCallbackEdgeTriggered:
         assert 'Web 配置检查执行异常' in meta['last_deploy_block_reason']
         assert meta.get('deploy_attempt_count', 0) == 0
         engine._deployer.deploy_multi.assert_not_called()
+
+
+class TestConfigDegradedAbortsRenew:
+    """配置降级时续签整轮中止（F2/A2）
+
+    此时 get_certs 恒为空，照常跑完会写出全 0 的新鲜 renew_status，
+    与"确实无需续签"在面板上不可区分——正是要消除的健康假象。
+    """
+
+    def test_degraded_config_aborts_with_reason(self, tmp_data_dir):
+        with open(os.path.join(tmp_data_dir, 'config.json'), 'w') as f:
+            f.write('{ broken')
+
+        config = ConfigManager(tmp_data_dir)
+        assert config.is_degraded() is True
+
+        mock_api = MagicMock()
+        engine = RenewEngine(config, MagicMock(return_value=mock_api), MagicMock(), MagicMock())
+        with patch('lib.renew.probe_panel_runtime', return_value=None):
+            results = engine.check_and_renew_all()
+
+        assert results == []
+        assert '配置文件损坏' in engine.last_abort_reason
+        mock_api.callback.assert_not_called()
+
+        with open(os.path.join(tmp_data_dir, 'renew_status.json')) as f:
+            assert json.load(f)['aborted_reason']

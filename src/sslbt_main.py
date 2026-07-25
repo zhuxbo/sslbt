@@ -274,6 +274,9 @@ class sslbt_main:
             except (OSError, json.JSONDecodeError):
                 safe_cfg['plugin_version'] = '0.0.0'
 
+            # 降级态必须透出：此时证书列表为空且续签已停，面板不能显示成"暂无证书"
+            safe_cfg['config_degraded'] = self._config.is_degraded()
+
             return _ok(safe_cfg)
         except Exception as e:
             return _err('获取配置失败: %s' % str(e))

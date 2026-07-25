@@ -552,3 +552,181 @@ class TestSemanticMigration:
             domains=['1.2.3.4'], renew_mode='pull')
         cm = ConfigManager(tmp_data_dir)
         assert cm.get_cert(5000)['metadata']['last_issue_state'] == 'CAPPED'
+
+
+class TestLegacyMergeDataLoss:
+    """旧文件合并的删除判据（F1/A1）
+
+    核心风险：merged_files.append 曾在合并判断之外，"读失败"和"目标已有数据故未合并"
+    两种情况都会连同数据一起被删；而写入失败被 except OSError 吞掉后同样照删，
+    结果是两个文件都没有证书配置，且全程零异常。
+    """
+
+    @staticmethod
+    def _write(path, data):
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(data, f)
+
+    def _legacy_certs(self, data_dir, order_id=111):
+        path = os.path.join(data_dir, 'certs.json')
+        self._write(path, {'certificates': [{
+            'order_id': order_id, 'cert_name': 'order-%d' % order_id,
+            'domains': ['legacy.com'], 'site_name': [], 'metadata': {},
+        }]})
+        return path
+
+    def test_merged_then_removed(self, tmp_data_dir):
+        """正常合并：内容并入且写入成功，旧文件删除"""
+        legacy = self._legacy_certs(tmp_data_dir)
+        cfg = ConfigManager(tmp_data_dir)
+        assert [c['order_id'] for c in cfg.get_certs()] == [111]
+        assert not os.path.exists(legacy)
+
+    def test_not_merged_is_kept_as_orphan(self, tmp_data_dir):
+        """目标已有 certificates 故未合并：旧文件绝不能被删，改名保留"""
+        self._write(os.path.join(tmp_data_dir, 'config.json'), {
+            'release_url': '', 'upgrade_channel': 'main',
+            'schedule': {'renew_mode': 'pull', 'renew_before_days': 14},
+            'certificates': [{
+                'order_id': 999, 'cert_name': 'order-999',
+                'domains': ['a.com'], 'site_name': [], 'metadata': {},
+            }],
+        })
+        legacy = self._legacy_certs(tmp_data_dir, order_id=111)
+
+        cfg = ConfigManager(tmp_data_dir)
+        assert [c['order_id'] for c in cfg.get_certs()] == [999]
+        assert not os.path.exists(legacy), 'certs.json 不应残留'
+        assert os.path.exists(legacy + '.orphan'), '未合并的旧文件必须保留为 .orphan'
+        with open(legacy + '.orphan') as f:
+            assert json.load(f)['certificates'][0]['order_id'] == 111
+
+    def test_corrupt_legacy_is_kept_as_orphan(self, tmp_data_dir):
+        """旧文件本身损坏：读不出内容不代表没有价值，同样保留"""
+        legacy = os.path.join(tmp_data_dir, 'certs.json')
+        with open(legacy, 'w') as f:
+            f.write('{ broken json')
+
+        ConfigManager(tmp_data_dir)
+        assert not os.path.exists(legacy)
+        assert os.path.exists(legacy + '.orphan')
+
+    def test_corrupt_legacy_does_not_degrade_plugin(self, tmp_data_dir):
+        """遗留文件损坏不得让插件进入只读降级——否则用户连删证书都做不到"""
+        with open(os.path.join(tmp_data_dir, 'certs.json'), 'w') as f:
+            f.write('{ broken json')
+
+        cfg = ConfigManager(tmp_data_dir)
+        assert cfg.is_degraded() is False
+        cfg.add_cert(order_id=1, cert_name='order-1', domains=['a.com'], site_names=[])
+        assert len(cfg.get_certs()) == 1
+
+    def test_write_failure_keeps_legacy_file(self, tmp_data_dir, monkeypatch):
+        """写入失败：已合并的内容并未落盘，删除旧文件会让数据两头皆空"""
+        legacy = self._legacy_certs(tmp_data_dir)
+
+        def boom(self, path, data):
+            raise OSError('disk full')
+
+        monkeypatch.setattr(ConfigManager, '_write_json', boom)
+        ConfigManager(tmp_data_dir)
+
+        assert os.path.exists(legacy) or os.path.exists(legacy + '.orphan'), \
+            '写入失败时旧文件必须以某种形式保留'
+        surviving = legacy if os.path.exists(legacy) else legacy + '.orphan'
+        with open(surviving) as f:
+            assert json.load(f)['certificates'][0]['order_id'] == 111
+
+    def test_write_failure_on_non_oserror_does_not_break_plugin(self, tmp_data_dir, monkeypatch):
+        """json.dump 对不可序列化对象抛 TypeError，穿透出去会让插件整体不可用"""
+        self._legacy_certs(tmp_data_dir)
+
+        def boom(self, path, data):
+            raise TypeError('not JSON serializable')
+
+        monkeypatch.setattr(ConfigManager, '_write_json', boom)
+        ConfigManager(tmp_data_dir)  # 不得抛出
+
+    def test_orphan_collision_keeps_original(self, tmp_data_dir):
+        """已有同名 .orphan 时保留原件，不覆盖上一次的备份"""
+        legacy = os.path.join(tmp_data_dir, 'certs.json')
+        with open(legacy, 'w') as f:
+            f.write('{ broken')
+        with open(legacy + '.orphan', 'w') as f:
+            f.write('{"certificates": [{"order_id": 1}]}')
+
+        ConfigManager(tmp_data_dir)
+        assert os.path.exists(legacy), '同名 orphan 已存在时应保留原件'
+        with open(legacy + '.orphan') as f:
+            assert json.load(f)['certificates'][0]['order_id'] == 1, '旧 orphan 不得被覆盖'
+
+
+class TestConfigDegradedMode:
+    """主配置损坏后的只读降级（F2/A2）
+
+    核心风险：损坏后第一次写操作会经 _update_json 的"解析失败 → 备份 → 回落默认值 →
+    照常写回"路径，把用户的全部证书配置替换成空配置，而面板显示"暂无证书"、
+    renew_status 写出新鲜 last_run + 全 0，与一台干净安装完全同形。
+    """
+
+    @staticmethod
+    def _corrupt(data_dir, content='{ THIS IS NOT JSON'):
+        path = os.path.join(data_dir, 'config.json')
+        with open(path, 'w') as f:
+            f.write(content)
+        return path
+
+    def test_corrupt_config_enters_degraded(self, tmp_data_dir):
+        path = self._corrupt(tmp_data_dir)
+        cfg = ConfigManager(tmp_data_dir)
+        assert cfg.is_degraded() is True
+        with open(path) as f:
+            assert f.read() == '{ THIS IS NOT JSON', '构造阶段不得改动损坏文件'
+
+    def test_write_is_refused_and_file_untouched(self, tmp_data_dir):
+        """核心断言：任何写入都被拒绝，损坏文件原样保留"""
+        from lib.config import ConfigDegradedError
+
+        path = self._corrupt(tmp_data_dir)
+        cfg = ConfigManager(tmp_data_dir)
+
+        with pytest.raises(ConfigDegradedError):
+            cfg.add_cert(order_id=1, cert_name='order-1', domains=['a.com'], site_names=[])
+        with pytest.raises(ConfigDegradedError):
+            cfg.update_metadata(1, {'cert_expires_at': 'x'})
+        with pytest.raises(ConfigDegradedError):
+            cfg.save_config({'schedule': {'renew_mode': 'pull'}})
+
+        with open(path) as f:
+            assert f.read() == '{ THIS IS NOT JSON'
+
+    def test_backup_not_overwritten_by_second_corruption(self, tmp_data_dir):
+        """第二次损坏不得毁掉第一份可恢复副本"""
+        path = self._corrupt(tmp_data_dir, '{ first corruption')
+        ConfigManager(tmp_data_dir)
+        with open(path + '.bak') as f:
+            assert f.read() == '{ first corruption'
+
+        with open(path, 'w') as f:
+            f.write('{ second corruption')
+        ConfigManager(tmp_data_dir)
+        with open(path + '.bak') as f:
+            assert f.read() == '{ first corruption', '.bak 不得被第二次损坏覆盖'
+
+    def test_healthy_config_is_not_degraded(self, tmp_data_dir):
+        cfg = ConfigManager(tmp_data_dir)
+        assert cfg.is_degraded() is False
+        cfg.add_cert(order_id=1, cert_name='order-1', domains=['a.com'], site_names=[])
+        assert len(cfg.get_certs()) == 1
+
+    def test_recovers_after_manual_fix(self, tmp_data_dir):
+        """降级随进程重建：用户修好文件后下一次请求即自动恢复"""
+        path = self._corrupt(tmp_data_dir)
+        assert ConfigManager(tmp_data_dir).is_degraded() is True
+
+        with open(path, 'w') as f:
+            json.dump(copy.deepcopy(DEFAULT_CONFIG), f)
+        cfg = ConfigManager(tmp_data_dir)
+        assert cfg.is_degraded() is False
+        cfg.add_cert(order_id=1, cert_name='order-1', domains=['a.com'], site_names=[])
+        assert len(cfg.get_certs()) == 1

@@ -171,6 +171,15 @@ class RenewEngine:
             self._write_renew_status([], aborted_reason=self.last_abort_reason)
             return []
 
+        # 配置降级（主配置损坏）：此时 get_certs 恒为空，照常跑完会写出全 0 的新鲜状态，
+        # 与"确实无需续签"在面板上不可区分——正是要消除的那种健康假象
+        if getattr(self._config, 'is_degraded', lambda: False)():
+            self.last_abort_reason = '配置文件损坏，已停止自动续签以防覆盖，请人工修复'
+            if self._logger:
+                self._logger.error("配置降级态，本轮续签整体中止")
+            self._write_renew_status([], aborted_reason=self.last_abort_reason)
+            return []
+
         certs = self._config.get_certs()
 
         # 阶段 1: 收集需续签的证书和对应 API 客户端
