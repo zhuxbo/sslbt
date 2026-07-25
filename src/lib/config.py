@@ -42,6 +42,9 @@ DEPLOY_SUCCESS_RESET_KEYS = {
     'last_csr_hash': '',
     'last_deploy_block_reason': '',
     'last_deploy_block_at': '',
+    'last_order_status': '',
+    'unchanged_cert_rounds': 0,
+    'verify_file_place_failed': False,
 }
 
 # 用户手动「恢复自动续签」时要清除的键（reset_issue_state）。
@@ -55,6 +58,9 @@ MANUAL_RESET_KEYS = {
     'deploy_started': False,
     'last_deploy_block_reason': '',
     'last_deploy_block_at': '',
+    'last_order_status': '',
+    'unchanged_cert_rounds': 0,
+    'verify_file_place_failed': False,
 }
 
 

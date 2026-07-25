@@ -15,7 +15,9 @@ sslbt_main.py  ← 插件入口（控制器），宝塔面板调用
   ├─ cert_utils.py      ← 证书验证 + CSR 生成（支持 DNS/IP SAN）
   ├─ site_manager.py    ← 宝塔站点管理 + 域名匹配（兼容新旧数据库分片）
   ├─ updater.py         ← 在线升级（releases.json 解析 + 安全下载 + 校验）
-  ├─ cron.py            ← 宝塔计划任务（_BtParams + 直接查库 + 每天随机时间 + cron.log 轮转；AddCrontab 结果按「显式 False 判失败 + 入库反查」双重校验）
+  ├─ cron.py            ← 宝塔计划任务（setup 首建随机时间 / refresh 保留原时间只重写脚本；
+  │                         resolve_python() 经 subprocess 验证解释器能 import public，绝不回落
+  │                         系统 python3；先建后删；get_status 三态；AddCrontab 结果双重校验）
   └─ logger.py          ← 日志（对格式化后完整消息脱敏，覆盖 dict/list 参数，MAX_LOG_FILES=90 自动清理）
 index.html              ← 前端 UI（纯 JS，3 Tab: 证书管理/设置/日志）
 ```
@@ -111,8 +113,12 @@ SetSSL 部署：写入前 pre-flight 校验既有配置（`check_web_config()`�
 - `FileVerifier.cleanup_files(placed_paths)`：证书签发后清理验证文件
 - 路径安全校验：必须以 `.well-known/` 开头，不含 `..`
 - 触发场景：Local 模式续签（`_submit_new_csr`/`_handle_processing`）和手动部署（`deploy_cert`）
-- metadata 存储：`pending_file_verify`（文件信息）、`pending_verify_paths`（已放置路径列表）
-- 清理时机：证书签发成功、CSR 超时、状态异常
+- metadata 存储：`pending_file_verify`（文件信息）、`pending_verify_paths`（已放置路径列表）、
+  `verify_file_place_failed`（未覆盖全部站点，面板告警）
+- 清理时机：证书签发成功、状态异常（**无 CSR 超时机制**，三仓均无）
+- 重放判据是「上次是否真的放上去了」而非「file_info 变没变」：`_verify_files_intact` 要求
+  列表非空 + 覆盖全部绑定站点 + 文件仍在盘上，三者缺一即重放。首轮放置失败时
+  `pending_file_verify` 照样落盘，只比对它会让文件一次都写不进去而订单永远卡在 processing
 
 ## 续签引擎关键逻辑
 
@@ -133,12 +139,12 @@ SetSSL 部署：写入前 pre-flight 校验既有配置（`check_web_config()`�
 - 查询状态归一：服务端提交响应只会是 `pending`/`processing`；查询在 `processing → active` 之间可能出现短暂中间态 `approving`，三者统一归一 `processing` 继续等待；`active` 之后的状态为订单终态。终态持久化到 `last_issue_state` 后每轮仍查询一次（可自愈），但状态未变化时不重复记 error、不重复落盘
 - 策略派生 `derive_or_validate_renew_policy`（`config`，唯一权威）：SAN 含 IP 强制 `renew_mode=local` + `validation_method=file`；DNS 校验兼容性。add_cert/update_cert_config/batch_set_renew_policy/续签提交统一调用
 - 私钥回退（deploy-spec §5.3）：deploy_cert 中按 API → 参数路径 → 站点已有私钥(GetSSL) → 弹窗粘贴 四级回退，所有来源均需 verify_cert_key_match 校验
-- 文件验证：CSR 提交返回 file 字段时自动放置，签发/超时/异常时自动清理
-- `_check_deploy_results()`：全部失败抛异常，部分失败记警告
+- 文件验证：CSR 提交返回 file 字段时自动放置，签发成功/状态异常时清理（无超时机制）
+- `_check_deploy_results()`：全部失败抛异常；**部分失败同样抛异常**——回调本就报 failure，此前返回 True 造成本地与服务端双口径
 - callback message：仅 failure 携带各站点失败原因摘要（含回滚状态、可能的「已达重试上限」标注）；上限 `CALLBACK_MESSAGE_MAX=256`，**先脱敏后截断**（`sanitize()` 过滤 Bearer/私钥/token 后再截断）；success 不带 message
 - 分散续签：`check_and_renew_all(spread=True)` 在证书间加动态延迟，根据需续签数量自动缩短间隔（总延迟上限 600s），仅 cron 调用启用
 - 汇总日志：续签完成后记录成功/等待/失败数量
-- cron 注册：`_build_script()` 用注册时进程的解释器（`sys.executable`，面板 pyenv）而非裸 python3，避免环境不一致导致续签不可运行；旧条目经 `setup()` 的 remove+重建替换
+- cron 注册：`_build_script()` 烧入 `resolve_python()` 自检通过的解释器；`install.sh` 与 `updater.do_update()` 均调 `refresh()`（脚本正文存在宝塔 crontab 库、不在 PLUGIN_DIR 内，不在这两处刷新则修正永远到不了存量安装）；`add_cert` 仅在**确认不存在**时创建，查询失败不动现有任务
 - 续签状态：每次运行结束写 `data/renew_status.json`（last_run/total/success/pending/failure，原子写 0600），面板经 `get_renew_status` 展示「最近续签」
 - 站点删除自愈（两轮确认）：`deploy_multi` 部署前查一次 `SiteManager.get_sites()` 复用清单检测站点存在；`get_sites` 查询失败（DB 缺失/锁定/表结构漂移）抛 `SiteQueryError` 与「确认零站点」严格区分，失败或清单为空时放弃本轮删除判定（保守视为全部存在，不计数、不解绑）；仅当清单查询成功且非空时才对不在清单中的站点计数——首轮仅记「疑似删除」（`site_missing`，按 failure 上报但不解绑），连续第二轮（计数达 `SITE_MISSING_CONFIRM_THRESHOLD=2`，且两轮间隔 ≥ `SITE_MISSING_MIN_INTERVAL_HOURS=12` 小时）确认后才解除绑定并持久化，缩小迁移/重装中途不完整快照误清绑定的破坏半径；缺失计数存于证书 `metadata.site_missing_counts`，站点恢复/解绑后自动清零；`site_missing`/`site_removed` 均按 failure 上报（与部署回调 failure 语义一致），其余站点继续部署，解绑后不再重复失败
 - 常量：RENEW_DEFAULT_DAYS=14, MAX_ISSUE_RETRY_COUNT=10, MAX_DEPLOY_ATTEMPT_COUNT=10, SAFETY_MARGIN_HOURS=24, RENEW_SLEEP_MIN=5, RENEW_SLEEP_MAX=120, SPREAD_TOTAL_MAX=600（计数与状态常量集中在 `config`，`renew` 复用）
@@ -146,6 +152,34 @@ SetSSL 部署：写入前 pre-flight 校验既有配置（`check_web_config()`�
 - deploy_multi 全部站点失败时不更新 metadata（保留重试状态）
 - 单次续签上限 MAX_RENEW_BATCH=100，超出按配置文件顺序截断，剩余下次 cron 处理；紧急证书由用户手动触发
 - 续费订单 ID 更新：API 返回的 `order_id` 与本地不同时，`_check_order_update` 原子更新 config（order_id + cert_name）+ 重命名 pending key 目录 + 更新内存 cert_entry，后续操作使用新 ID；冲突（新 ID 已存在）时 warn 并沿用旧 ID
+
+- 运行环境闸门：`_do_renew_all` 开头 `probe_panel_runtime()` 探测 `public`/`panelSite` 可导入性，
+  不可用即整轮中止（写 `renew_status.aborted_reason` + 面板红条），**一个回调都不发**——
+  进程级故障归因不到订单，spec §2.8 的上报对象是部署结果，此时一次部署都没发生。
+  成因通常是 cron 脚本回退系统 python3（缺 psutil 等面板依赖）
+- `check_web_config()` 调用必须包 try：抛异常与返回错误同样走阻断路径。裸调用会让异常穿透到
+  通用 except，回调发不出、原因不落盘、计数停在 0 而永不触顶
+- 阻断类回调一律**变化触发**（reason 变化才发一次）：服务端 reminder 是电平驱动，一行即可让
+  订单永久留在失败视图，逐日重发零信息增量却会淹没管理端列表且不被 PurgeCommand 清理
+- 部署结果三组落盘（`deploy_multi`）：`site_deploy_status` 无条件写；计数清零在「任一成功」
+  （与编排层 `counts_cleared=any` 镜像，不收紧到全成功——一个永久坏的站点会让整张证书十轮后
+  CAPPED，健康站点跟着停更）；`cert_expires_at`/`cert_serial`/`last_deploy_at` 仅全成功才写
+  （部分失败不前推 → 次日重试失败站点，而非等 76 天）
+- 部分站点失败改判为失败：`_deploy_callback_decision` 本就报 failure，`_check_deploy_results`
+  此前返回 True 造成本地与服务端双口径
+- 证书更替检测（`_track_cert_unchanged`）：仅编排层判定、两端 serial 非空才比、连续
+  `CERT_UNCHANGED_ROUNDS=2` 轮才升级 failure。手动重复部署与部分失败重试都会命中同一序列号
+- 抢锁窗口按调用方参数化：cron `CRON_LOCK_WAIT=120`，面板按钮 `PANEL_LOCK_WAIT=6`（同步 HTTP）；
+  抢锁失败写 `renew_lock_skip.json` 而非读改写 `renew_status.json`（那是无锁路径，会覆盖持锁方结果）
+- 批次选择 `_select_batch`：processing 组限额 `MAX_RENEW_BATCH//2`，组内按 `last_attempt_at`
+  轮转 + 紧急度，保证 ⌈N/100⌉ 轮内全部触达。单纯按紧急度排序无效——processing 证书正因临期才提交
+- EXPIRED 自愈：判定必须在终态 `continue` **之前**，守卫为「剩余有效期可解析且 > 安全余量」，
+  只清状态不动计数。站点缺失计数另有时钟护栏（回拨或间隔 > 30 天视为跳变，不递增）
+- 配置降级（`ConfigManager.is_degraded`）：主配置解析失败即拒绝一切写入并让续签整轮中止。
+  真正的覆盖点是 `_update_json`（`_ensure_config` 的写入被 `changed` 门住），仅拦后者挡不住
+  cron 的任意一次 `update_metadata`
+- 新增 metadata 字段必须同步 `config.DEPLOY_SUCCESS_RESET_KEYS` 与 `MANUAL_RESET_KEYS`，
+  否则面板会留存已消失的旧原因，而测试不会变红
 
 ## 已知局限（无需处理，仅记录）
 

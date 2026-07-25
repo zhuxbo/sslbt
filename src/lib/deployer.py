@@ -28,6 +28,10 @@ SITE_MISSING_CONFIRM_THRESHOLD = 2
 # 确认删除需要跨时间段的两轮观测，而非短时间内的两次探测（如数分钟内两次手动运行）
 SITE_MISSING_MIN_INTERVAL_HOURS = 12
 
+# 两次缺失观测的合理间隔上限。超过即视为系统时间跳变而非真实经过的时间：
+# 跨间隔确认这道护栏依赖时钟单调，一次前跳就能让它形同虚设
+_CLOCK_SANITY_MAX = timedelta(days=30)
+
 
 class _BtParams(dict):
     """兼容宝塔 API 的参数对象，支持属性和字典两种访问方式"""
@@ -376,6 +380,15 @@ class Deployer:
                 prev = self._parse_iso_ts(last_at)
                 if prev is None:
                     # 时间戳缺失/损坏：修复为当前时间，本轮不递增（保守方向）
+                    last_at = now_str
+                elif prev > now or (now - prev) > _CLOCK_SANITY_MAX:
+                    # 时钟不可信（回拨，或前跳导致间隔大得离谱）：本轮不递增并重新锚定。
+                    # 「跨 12 小时两轮观测」这道护栏的前提是时钟单调——一次前跳会让
+                    # now-prev >= 12h 立即成立，一次真实观测加一次跳变后的观测就能确认解绑
+                    if self._logger:
+                        self._logger.warning(
+                            "系统时间异常跳变，站点缺失计数本轮不递增: order_id=%s, site=%s",
+                            order_id, sn)
                     last_at = now_str
                 elif now - prev >= min_interval:
                     count = min(count + 1, SITE_MISSING_CONFIRM_THRESHOLD)

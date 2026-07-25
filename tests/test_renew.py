@@ -2322,3 +2322,224 @@ class TestLockWaitAndSkip:
         results = engine.check_and_renew_all()
         assert results == []
         assert '锁文件' in engine.last_abort_reason
+
+
+class TestCertUnchangedDetection:
+    """证书更替检测（F9/C4）
+
+    核心风险：deploy_multi 从不比对 cert_serial，服务端反复返回同一张旧证书时
+    每轮都报 success，服务端最新一行永远是成功、面板一路「正常」→「已过期」。
+    """
+
+    @pytest.fixture
+    def engine(self, tmp_data_dir):
+        config = ConfigManager(tmp_data_dir)
+        mock_api = MagicMock()
+        eng = RenewEngine(config, MagicMock(return_value=mock_api), MagicMock(), MagicMock())
+        eng._mock_api = mock_api
+        return eng
+
+    @staticmethod
+    def _cert(engine, order_id, serial):
+        engine._config.add_cert(order_id=order_id, cert_name='order-%d' % order_id,
+                                domains=['a.com'], site_names=['s%d.com' % order_id])
+        engine._config.update_metadata(order_id, {'cert_serial': serial})
+        return engine._config.get_cert(order_id)
+
+    def test_same_serial_twice_reports_failure(self, engine):
+        cert = self._cert(engine, 9501, 'AABB')
+        assert engine._track_cert_unchanged(cert, 9501, 'AABB') == ''      # 第 1 轮仅计数
+        assert '未实际更新' in engine._track_cert_unchanged(cert, 9501, 'AABB')
+
+    def test_changed_serial_resets_counter(self, engine):
+        cert = self._cert(engine, 9502, 'AABB')
+        engine._track_cert_unchanged(cert, 9502, 'AABB')
+        assert cert['metadata']['unchanged_cert_rounds'] == 1
+        # 新证书：计数归零，绝不能累积到误报
+        engine._config.update_metadata(9502, {'cert_serial': 'CCDD'})
+        cert = engine._config.get_cert(9502)
+        assert engine._track_cert_unchanged(cert, 9502, 'AABB') == ''
+        assert cert['metadata']['unchanged_cert_rounds'] == 0
+
+    def test_empty_serial_never_triggers(self, engine):
+        """两端都要非空：解析失败返回 ''，老 OpenSSL 上 '' == '' 会让每次部署都误报"""
+        cert = self._cert(engine, 9503, '')
+        for _ in range(5):
+            assert engine._track_cert_unchanged(cert, 9503, '') == ''
+        assert cert['metadata'].get('unchanged_cert_rounds', 0) == 0
+
+    def test_partial_failure_round_does_not_accumulate(self, engine):
+        """部分失败轮次不写 cert_serial，prev 与 new 不同 → 不累积（F8×F9 无假阳性）"""
+        cert = self._cert(engine, 9504, 'AABB')
+        # 部分失败：deploy_multi 未写 cert_serial，metadata 仍是旧值，但 prev 取的是部署前值
+        assert engine._track_cert_unchanged(cert, 9504, '') == ''
+        assert cert['metadata'].get('unchanged_cert_rounds', 0) == 0
+
+
+class TestExpiredSelfHealing:
+    """EXPIRED 自动解除（F16/D4）
+
+    一次时钟前跳就把还有几十天有效期的证书永久打成「已过期停更」，且标签本身是错的。
+    解除逻辑必须在终态 continue 之前，否则永远执行不到。
+    """
+
+    @pytest.fixture
+    def engine(self, tmp_data_dir):
+        config = ConfigManager(tmp_data_dir)
+        return RenewEngine(config, MagicMock(return_value=MagicMock()), MagicMock(), MagicMock())
+
+    def test_expired_state_cleared_when_cert_actually_valid(self, engine):
+        exp = (datetime.now(timezone.utc) + timedelta(days=60)).strftime('%Y-%m-%dT%H:%M:%SZ')
+        engine._config.add_cert(order_id=9601, cert_name='order-9601',
+                                domains=['a.com'], site_names=['s.com'])
+        engine._config.update_metadata(9601, {
+            'cert_expires_at': exp, 'last_issue_state': 'EXPIRED'})
+
+        pending = []
+        engine._collect_one(engine._config.get_cert(9601), pending)
+        assert engine._config.get_cert(9601)['metadata']['last_issue_state'] == ''
+
+    def test_truly_expired_stays_terminal(self, engine):
+        exp = (datetime.now(timezone.utc) - timedelta(days=3)).strftime('%Y-%m-%dT%H:%M:%SZ')
+        engine._config.add_cert(order_id=9602, cert_name='order-9602',
+                                domains=['a.com'], site_names=['s2.com'])
+        engine._config.update_metadata(9602, {
+            'cert_expires_at': exp, 'last_issue_state': 'EXPIRED'})
+
+        engine._collect_one(engine._config.get_cert(9602), [])
+        assert engine._config.get_cert(9602)['metadata']['last_issue_state'] == 'EXPIRED'
+
+    def test_unparseable_expiry_stays_terminal(self, engine):
+        """元数据损坏时保持终态：否则真过期的证书会反复启动新动作，违反 spec §3.2"""
+        engine._config.add_cert(order_id=9603, cert_name='order-9603',
+                                domains=['a.com'], site_names=['s3.com'])
+        engine._config.update_metadata(9603, {
+            'cert_expires_at': 'not-a-date', 'last_issue_state': 'EXPIRED'})
+
+        engine._collect_one(engine._config.get_cert(9603), [])
+        assert engine._config.get_cert(9603)['metadata']['last_issue_state'] == 'EXPIRED'
+
+    def test_clearing_does_not_reset_counts(self, engine):
+        """只清状态不动计数：清了会绕过触顶保护"""
+        exp = (datetime.now(timezone.utc) + timedelta(days=60)).strftime('%Y-%m-%dT%H:%M:%SZ')
+        engine._config.add_cert(order_id=9604, cert_name='order-9604',
+                                domains=['a.com'], site_names=['s4.com'])
+        engine._config.update_metadata(9604, {
+            'cert_expires_at': exp, 'last_issue_state': 'EXPIRED',
+            'issue_retry_count': 7, 'deploy_attempt_count': 5})
+
+        engine._collect_one(engine._config.get_cert(9604), [])
+        meta = engine._config.get_cert(9604)['metadata']
+        assert meta['issue_retry_count'] == 7
+        assert meta['deploy_attempt_count'] == 5
+
+
+class TestVerifyFileRetry:
+    """验证文件放置判据（F13/D1）"""
+
+    @pytest.fixture
+    def engine(self, tmp_data_dir):
+        config = ConfigManager(tmp_data_dir)
+        verifier = MagicMock()
+        eng = RenewEngine(config, MagicMock(), MagicMock(), MagicMock(), verifier)
+        eng._verifier = verifier
+        return eng
+
+    def test_retries_when_previous_placement_failed(self, engine):
+        """首轮放置失败后必须重试：此前 pending_file_verify 照样落盘，
+        之后每轮都被短路，文件一次都没写进去而订单永远卡在 processing"""
+        engine._verifier.place_file.return_value = []
+        cert = {'order_id': 1, 'site_name': ['a.com'],
+                'metadata': {'pending_file_verify': {'path': '.well-known/x', 'content': 'c'},
+                             'pending_verify_paths': []}}
+        engine._config.add_cert(order_id=1, cert_name='order-1',
+                                domains=['a.com'], site_names=['a.com'])
+        engine._try_place_verify_file(cert, {'file': {'path': '.well-known/x', 'content': 'c'}})
+        engine._verifier.place_file.assert_called_once()
+
+    def test_skips_when_files_intact(self, engine, tmp_data_dir):
+        """真的放上去了才短路"""
+        real = os.path.join(tmp_data_dir, 'placed.txt')
+        with open(real, 'w') as f:
+            f.write('x')
+        info = {'path': '.well-known/x', 'content': 'c'}
+        cert = {'order_id': 2, 'site_name': ['a.com'],
+                'metadata': {'pending_file_verify': info, 'pending_verify_paths': [real]}}
+        engine._try_place_verify_file(cert, {'file': info})
+        engine._verifier.place_file.assert_not_called()
+
+    def test_retries_when_file_disappeared(self, engine, tmp_data_dir):
+        """文件被清理/站点重建后消失也要重放"""
+        info = {'path': '.well-known/x', 'content': 'c'}
+        cert = {'order_id': 3, 'site_name': ['a.com'],
+                'metadata': {'pending_file_verify': info,
+                             'pending_verify_paths': [os.path.join(tmp_data_dir, 'gone.txt')]}}
+        engine._config.add_cert(order_id=3, cert_name='order-3',
+                                domains=['a.com'], site_names=['a.com'])
+        engine._verifier.place_file.return_value = ['/tmp/x']
+        engine._try_place_verify_file(cert, {'file': info})
+        engine._verifier.place_file.assert_called_once()
+
+    def test_partial_coverage_retries(self, engine, tmp_data_dir):
+        """多站点只放上一个：CA 可能恰好去验失败的那个，必须重试"""
+        real = os.path.join(tmp_data_dir, 'one.txt')
+        with open(real, 'w') as f:
+            f.write('x')
+        info = {'path': '.well-known/x', 'content': 'c'}
+        cert = {'order_id': 4, 'site_name': ['a.com', 'b.com'],
+                'metadata': {'pending_file_verify': info, 'pending_verify_paths': [real]}}
+        engine._config.add_cert(order_id=4, cert_name='order-4',
+                                domains=['a.com'], site_names=['a.com'])
+        engine._verifier.place_file.return_value = [real]
+        engine._try_place_verify_file(cert, {'file': info})
+        engine._verifier.place_file.assert_called_once()
+
+
+class TestBatchFairness:
+    """批次选择公平性（F15/D3）
+
+    核心风险：卡在 processing 的证书每轮都进列表且不会自行退出，
+    按配置顺序截断会让第 101 张之后的证书确定性饿死。
+    """
+
+    @pytest.fixture
+    def engine(self, tmp_data_dir):
+        return RenewEngine(ConfigManager(tmp_data_dir), MagicMock(), MagicMock(), MagicMock())
+
+    @staticmethod
+    def _item(oid, state='', hours=240, last_attempt=''):
+        exp = (datetime.now(timezone.utc) + timedelta(hours=hours)).strftime('%Y-%m-%dT%H:%M:%SZ')
+        return ({'order_id': oid, 'metadata': {
+            'last_issue_state': state, 'cert_expires_at': exp,
+            'last_attempt_at': last_attempt}}, MagicMock(), 'pull')
+
+    def test_processing_cannot_starve_the_tail(self, engine):
+        """100 张卡 processing + 5 张待续签：尾部必须进得来"""
+        items = [self._item(i, state='processing', hours=100) for i in range(100)]
+        items += [self._item(1000 + i, hours=300) for i in range(5)]
+
+        picked = engine._select_batch(items)
+        picked_ids = {i[0]['order_id'] for i in picked}
+        assert len(picked) == 100
+        for i in range(5):
+            assert 1000 + i in picked_ids, '待续签证书必须进入本批次'
+
+    def test_processing_quota_is_capped(self, engine):
+        items = [self._item(i, state='processing') for i in range(200)]
+        items += [self._item(1000 + i) for i in range(60)]
+        picked = engine._select_batch(items)
+        n_processing = sum(1 for i in picked
+                           if i[0]['metadata']['last_issue_state'] == 'processing')
+        assert n_processing <= 50
+
+    def test_rotation_prefers_least_recently_attempted(self, engine):
+        """轮转保证 ceil(N/100) 轮内全部触达"""
+        old = [self._item(i, last_attempt='2020-01-01T00:00:00Z') for i in range(60)]
+        recent = [self._item(500 + i, last_attempt='2030-01-01T00:00:00Z') for i in range(60)]
+        picked = engine._select_batch(recent + old)
+        picked_ids = {i[0]['order_id'] for i in picked}
+        assert all(i in picked_ids for i in range(60)), '久未尝试的证书应优先'
+
+    def test_under_limit_returns_all(self, engine):
+        items = [self._item(i) for i in range(10)]
+        assert engine._select_batch(items) == items

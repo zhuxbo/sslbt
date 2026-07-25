@@ -372,11 +372,21 @@ class sslbt_main:
             self._logger.info("添加证书: order_id=%s, domains=%s", order_id, ','.join(domains))
 
             # 按派生模式设置 auto_reissue（local 关 / pull 开；不自动开付费 auto_renew）
+            # 结果必须落盘：pull 模式下它没设成功 = 服务端永不重签 = 客户端每天查到
+            # 非 active 状态、永远显示「等待签发」。api_client 内部已吞掉异常并返回 None，
+            # 这里再吞一次就彻底无迹可寻了
             effective_mode = renew_mode or self._config.get_config().get('schedule', {}).get('renew_mode', 'pull')
+            confirmed = False
             try:
-                api.toggle_auto_reissue(order_id, effective_mode == 'pull')
+                confirmed = api.toggle_auto_reissue(order_id, effective_mode == 'pull') is not None
             except Exception as e:
                 self._logger.warning("toggle_auto_reissue 失败: order_id=%s, error=%s", order_id, str(e))
+            if not confirmed:
+                self._logger.warning("auto_reissue 未确认设置成功: order_id=%s", order_id)
+            try:
+                self._config.update_metadata(order_id, {'auto_reissue_confirmed': confirmed})
+            except Exception as e:
+                self._logger.warning("记录 auto_reissue 状态失败: order_id=%s, error=%s", order_id, str(e))
 
             # 自动创建计划任务（仅在确认不存在时）。查询失败绝不能触发创建：
             # 那会经 remove+重建把用户正常的任务在一次瞬时 DB 锁定中弄丢

@@ -33,6 +33,13 @@ LOCK_RETRY_INTERVAL = 5
 CRON_LOCK_WAIT = 120    # cron 续签：覆盖典型交互式部署（几秒到几十秒）
 PANEL_LOCK_WAIT = 6     # 面板「续签」按钮：同步 HTTP，超过几秒就是页面卡死
 
+# 连续多少轮拿到同一张证书才判定「服务端未更替」。取 2 而非 1：
+# F8 之后部分失败的证书会次日重试，那次补部署必然是同一张证书，属正常重试
+CERT_UNCHANGED_ROUNDS = 2
+
+# renew_status.json 里跳过明细的条数上限：该文件每次打开设置页都被整份读出发给浏览器
+MAX_SKIPPED_DETAIL = 50
+
 # 服务端"已在处理"类状态统一归一为 processing（只查询、不重复提交、不增计数、不重生 CSR）：
 # 提交响应只会是 pending / processing；查询在 processing → active 之间可能出现短暂中间态 approving
 _PROCESSING_ALIASES = ('processing', 'pending', 'approving')
@@ -244,9 +251,10 @@ class RenewEngine:
         # 阶段 1: 收集需续签的证书和对应 API 客户端
         pending_list = []
         collect_failures = []
+        skipped = []
         for cert in certs:
             try:
-                self._collect_one(cert, pending_list)
+                self._collect_one(cert, pending_list, skipped)
             except Exception as e:
                 # 逐证书隔离：此前阶段 1 一行 try 都没有，而 APIClient.__init__ 会对
                 # SSRF 命中 / token 非法 / 协议非法主动 raise ValueError——一张证书的
@@ -258,10 +266,18 @@ class RenewEngine:
                 collect_failures.append({
                     'order_id': oid, 'status': 'failure', 'message': '预处理失败: %s' % e})
 
-        return self._process_pending(pending_list, spread, collect_failures)
+        return self._process_pending(pending_list, spread, collect_failures, skipped)
 
-    def _collect_one(self, cert, pending_list):
-        """阶段 1 的单证书前置过滤：命中任一跳过条件即返回，否则追加到待处理列表"""
+    def _collect_one(self, cert, pending_list, skipped=None):
+        """阶段 1 的单证书前置过滤：命中任一跳过条件即返回，否则追加到待处理列表
+
+        skipped 收集「需要向用户解释」的跳过原因。not_due 不记——证书列表本来就逐张
+        显示状态，把几百张不到期的证书写进状态文件只是噪音，而该文件每次打开设置页
+        都会被整份读出发给浏览器。
+        """
+        def _skip(reason):
+            if skipped is not None:
+                skipped.append({'order_id': cert.get('order_id', 0), 'reason': reason})
         if not cert.get('enabled', True):
             return
         order_id = cert.get('order_id')
@@ -270,8 +286,26 @@ class RenewEngine:
         meta = cert.get('metadata', {})
         state = meta.get('last_issue_state', '')
 
+        # EXPIRED 自愈：必须在终态 continue 之前判定，否则永远执行不到。
+        # 一次时钟前跳（NTP 抽风、快照恢复、容器漂移）就会把还有几十天有效期的证书
+        # 永久打成「已过期停更」，且标签本身是错的。
+        # 守卫：仅当剩余有效期能被解析出来且高于安全余量才解除——元数据损坏时保持终态，
+        # 否则真过期的证书会反复启动新动作，违反 spec §3.2
+        if state == ISSUE_STATE_EXPIRED:
+            hours_now = _remaining_hours(meta)
+            if hours_now is not None and hours_now > SAFETY_MARGIN_HOURS:
+                if self._logger:
+                    self._logger.warning(
+                        "证书实际未过期（剩余 %.1fh），解除过期终态: order_id=%s",
+                        hours_now, cert.get('order_id'))
+                # 只清状态，不动两个计数：那是另一回事，清了会绕过触顶保护
+                self._persist_meta(cert['order_id'], {'last_issue_state': ''})
+                meta['last_issue_state'] = ''
+                state = ''
+
         # 触顶 / 过期 / policy 阻断为终态：静默跳过，不启动新动作、不发回调、不计数
         if state in TERMINAL_ISSUE_STATES:
+            _skip('terminal:%s' % state)
             return
 
         renew_mode = self._config.get_renew_mode(cert)
@@ -282,9 +316,11 @@ class RenewEngine:
         if renew_mode == RENEW_MODE_LOCAL and state != ISSUE_STATE_PROCESSING \
                 and meta.get('issue_retry_count', 0) >= MAX_ISSUE_RETRY_COUNT:
             self._enter_capped(cert, CAP_STAGE_ISSUE)
+            _skip('capped:%s' % CAP_STAGE_ISSUE)
             return
         if meta.get('deploy_attempt_count', 0) >= MAX_DEPLOY_ATTEMPT_COUNT:
             self._enter_capped(cert, CAP_STAGE_DEPLOY)
+            _skip('capped:%s' % CAP_STAGE_DEPLOY)
             return
 
         # 到期准入：已过期 → 转 EXPIRED 静默；剩余 < 安全余量 → 本轮不启动新动作
@@ -292,12 +328,14 @@ class RenewEngine:
         if hours is not None:
             if hours <= 0:
                 self._enter_expired(cert)
+                _skip('expired')
                 return
             if hours < SAFETY_MARGIN_HOURS:
                 if self._logger:
                     self._logger.info(
                         "剩余有效期不足安全余量（%.1fh < %dh），本轮不启动新动作: order_id=%s",
                         hours, SAFETY_MARGIN_HOURS, order_id)
+                _skip('safety_margin')
                 return
 
         renew_days = self._config.get_renew_before_days(cert)
@@ -307,17 +345,59 @@ class RenewEngine:
         if not api:
             if self._logger:
                 self._logger.warning("证书 order_id=%s 缺少 API 配置，跳过续签", order_id)
+            _skip('no_api_config')
             return
         pending_list.append((cert, api, renew_mode))
 
-    def _process_pending(self, pending_list, spread, collect_failures):
-        """阶段 2/3：截断、计算延迟、逐个续签并汇总"""
-        if len(pending_list) > MAX_RENEW_BATCH:
-            if self._logger:
-                self._logger.warning(
-                    "需续签证书 %d 个，超过单次上限 %d，截断处理",
-                    len(pending_list), MAX_RENEW_BATCH)
-            pending_list = pending_list[:MAX_RENEW_BATCH]
+    def _select_batch(self, pending_list):
+        """从待处理列表中选出本轮批次（上限 MAX_RENEW_BATCH）
+
+        此前按配置文件顺序直接截断，尾部证书会确定性饿死：卡在 processing 的证书
+        每轮都进列表且不会自行退出，100 张卡住就永远轮不到第 101 张。
+
+        单纯按紧急度排序解决不了——processing 证书正是因为临期才提交的 CSR，
+        剩余有效期必然更短，排序只会让它们更稳地占住配额。所以：
+        - processing 组限额一半，剩余名额留给会发起新动作的证书
+        - 组内按剩余有效期升序（紧急优先）
+        - 仍超额时按 last_attempt_at 升序轮转，保证 ceil(N/100) 轮内全部触达
+        """
+        if len(pending_list) <= MAX_RENEW_BATCH:
+            return pending_list
+
+        def remaining(item):
+            hours = _remaining_hours(item[0].get('metadata', {}))
+            return hours if hours is not None else float('inf')
+
+        def last_attempt(item):
+            return item[0].get('metadata', {}).get('last_attempt_at', '')
+
+        processing, fresh = [], []
+        for item in pending_list:
+            state = item[0].get('metadata', {}).get('last_issue_state', '')
+            (processing if state == ISSUE_STATE_PROCESSING else fresh).append(item)
+
+        # 轮转优先于紧急度：先按上次尝试时间排，同组内再按紧急度
+        for group in (processing, fresh):
+            group.sort(key=lambda i: (last_attempt(i), remaining(i)))
+
+        quota = MAX_RENEW_BATCH // 2
+        picked = processing[:quota]
+        picked += fresh[:MAX_RENEW_BATCH - len(picked)]
+        if len(picked) < MAX_RENEW_BATCH:
+            rest = [i for i in processing[quota:] if i not in picked]
+            picked += rest[:MAX_RENEW_BATCH - len(picked)]
+
+        if self._logger:
+            self._logger.warning(
+                "需续签证书 %d 个，超过单次上限 %d，本轮处理 %d 个（processing %d），"
+                "其余下轮按上次尝试时间轮转",
+                len(pending_list), MAX_RENEW_BATCH, len(picked),
+                sum(1 for i in picked if i in processing))
+        return picked
+
+    def _process_pending(self, pending_list, spread, collect_failures, skipped=None):
+        """阶段 2/3：选批、计算延迟、逐个续签并汇总"""
+        pending_list = self._select_batch(pending_list)
         sleep_min, sleep_max = self._calc_spread_delay(len(pending_list))
 
         # 阶段 3: 逐个续签。预处理失败的证书先计入，确保它们出现在汇总与面板里
@@ -334,6 +414,10 @@ class RenewEngine:
 
             if self._logger:
                 self._logger.info("证书需要续签: order_id=%s, mode=%s", order_id, renew_mode)
+
+            # 记录本轮已触达，供下一轮轮转排序使用（超额时保证 ceil(N/100) 轮内全部处理到）
+            self._persist_meta(order_id, {
+                'last_attempt_at': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')})
 
             try:
                 if renew_mode == RENEW_MODE_LOCAL:
@@ -366,10 +450,10 @@ class RenewEngine:
             else:
                 self._logger.info("续签检查完成: 无需续签")
 
-        self._write_renew_status(results)
+        self._write_renew_status(results, skipped=skipped)
         return results
 
-    def _write_renew_status(self, results, aborted_reason=''):
+    def _write_renew_status(self, results, aborted_reason='', skipped=None):
         """写入最近一次续签运行的轻量状态（供面板展示），失败不影响续签
 
         复用数据目录，原子写 + 0600 权限，与 config/session 落盘约定一致。
@@ -386,6 +470,12 @@ class RenewEngine:
             'failure': sum(1 for r in results if r.get('status') == 'failure'),
             'aborted_reason': aborted_reason,
         }
+        # 跳过明细：只记需要向用户解释的原因（not_due 不入册）。数组硬上限——
+        # get_certs 本身没有上限，而本文件每次打开设置页都会被整份读出发给浏览器
+        skipped = skipped or []
+        status['skipped_count'] = len(skipped)
+        status['skipped'] = skipped[:MAX_SKIPPED_DETAIL]
+        status['skipped_overflow'] = max(0, len(skipped) - MAX_SKIPPED_DETAIL)
         path = os.path.join(self._data_dir, 'renew_status.json')
         data = json.dumps(status, ensure_ascii=False).encode('utf-8')
         # 随机名临时文件（mkstemp 以 O_EXCL|O_CREAT 创建，不跟随符号链接）+ 原子替换，
@@ -644,6 +734,9 @@ class RenewEngine:
         block_reason = self._check_deploy_environment(cert_entry, api, order_id)
         if block_reason:
             raise RuntimeError(block_reason)
+        # 部署前的序列号：deploy_multi 仅在全部站点成功时才覆写它，
+        # 因此部分失败轮次不会污染更替判定
+        prev_serial = cert_entry.get('metadata', {}).get('cert_serial', '')
         count = self._begin_deploy_attempt(order_id, cert_entry)
         at_cap = count >= MAX_DEPLOY_ATTEMPT_COUNT
         now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
@@ -659,8 +752,50 @@ class RenewEngine:
         counts_cleared = any(r.get('status') for r in results)
         status, message = _deploy_callback_decision(results)
         self._conclude_deploy_attempt(order_id, cert_entry, counts_cleared)
+
+        # 证书更替检测：服务端反复返回同一张旧证书时，此前每轮都报 success，
+        # 服务端最新一行永远是成功、面板一路「正常」→「即将过期」→「已过期」
+        if status == 'success':
+            stale = self._track_cert_unchanged(cert_entry, order_id, prev_serial)
+            if stale:
+                status, message = 'failure', stale
+
         self._send_deploy_callback(api, order_id, status, now, message, at_cap)
         return results
+
+    def _track_cert_unchanged(self, cert_entry, order_id, prev_serial):
+        """全部站点成功时比对序列号，判断服务端是否真的换了证书
+
+        只在编排层（自动续签）判定，手动部署不参与——用户点两次「部署」、粘贴私钥后
+        重新部署、加绑站点后部署，都会用同一张证书，那是正常操作不是服务端故障。
+
+        判据要求两端序列号都非空：cert_utils 解析失败时返回 ''，老 OpenSSL 上
+        '' == '' 会让每次部署都误报。到期时间未前移只作为序列号缺失时的降级判据，
+        不与序列号并列——CA 重签常保留原订单剩余有效期，新序列号 + 相同 notAfter
+        是完全正常的结果，而 local 模式走的恰恰是重签路径。
+
+        连续 2 轮才升级为 failure：单轮相同可能是上一轮部分失败后的正常重试
+        （F8 之后失败站点会次日重试，那次补部署必然是同一张证书）。
+        """
+        meta = cert_entry.setdefault('metadata', {})
+        new_serial = meta.get('cert_serial', '')
+        # 上一轮有站点失败时归零：那一轮压根没写 cert_serial，本轮相同属预期重试
+        if not (prev_serial and new_serial and prev_serial == new_serial):
+            if meta.get('unchanged_cert_rounds'):
+                self._persist_meta(order_id, {'unchanged_cert_rounds': 0})
+                meta['unchanged_cert_rounds'] = 0
+            return ''
+
+        rounds = meta.get('unchanged_cert_rounds', 0) + 1
+        self._persist_meta(order_id, {'unchanged_cert_rounds': rounds})
+        meta['unchanged_cert_rounds'] = rounds
+        if self._logger:
+            self._logger.warning("服务端返回的证书未更替（第 %d 轮）: order_id=%s, serial=%s",
+                                 rounds, order_id, new_serial)
+        if rounds < CERT_UNCHANGED_ROUNDS:
+            return ''
+        return '服务端连续 %d 轮返回同一张证书（序列号 %s 未变），证书未实际更新' % (
+            rounds, new_serial)
 
     def _send_deploy_callback(self, api, order_id, status, deployed_at, message, at_cap):
         """编排层统一发送部署结果回调（非关键路径，失败仅记日志）。
@@ -674,6 +809,20 @@ class RenewEngine:
         except Exception as e:
             if self._logger:
                 self._logger.warning("部署回调失败（非关键）: %s", str(e))
+
+    def _track_order_status(self, cert_entry, order_id, status):
+        """记录服务端返回的订单状态（展示专用，不参与任何门禁判定）
+
+        pull 模式此前对非 active 一律 info 日志 + 返回 False，本轮被计为「等待签发」，
+        面板显示「自动续签中」——一张已被取消的订单会这样每天轮询到过期为止。
+        用 _persist_meta 而非 update_metadata：该值每轮都能从 API 重新推导，
+        订单不存在时不该把良性 pending 变成失败。
+        """
+        meta = cert_entry.setdefault('metadata', {})
+        if meta.get('last_order_status', '') == status:
+            return
+        self._persist_meta(order_id, {'last_order_status': status})
+        meta['last_order_status'] = status
 
     def _renew_pull(self, cert_entry, api):
         """Pull 模式续签：查询订单 → 证书就绪则部署"""
@@ -691,9 +840,15 @@ class RenewEngine:
         private_key = cert_data.get('private_key', '')
 
         if status != 'active' or not certificate:
+            # 记录服务端订单状态供面板展示。不写 last_issue_state——那是 spec 定义的
+            # 带门禁语义的字段，把 cancelled 之类写进去会让证书被前置过滤永久跳过，
+            # 违反「后续轮次仍可查询自愈」；renewed/reissued 更是链延续标记而非故障
+            self._track_order_status(cert_entry, order_id, status)
             if self._logger:
                 self._logger.info("证书未就绪: status=%s", status)
             return False
+
+        self._track_order_status(cert_entry, order_id, '')
 
         if not ca_certificate:
             if self._logger:
@@ -1036,6 +1191,14 @@ class RenewEngine:
                 placed = self._file_verifier.place_file(file_info, site_names)
                 meta_update['pending_file_verify'] = file_info
                 meta_update['pending_verify_paths'] = placed
+                # CSR 已提交无法撤回，但"验证文件没放上去"必须可见——否则订单会一直
+                # 卡在 processing 等一个永远不会通过的 CA 验证
+                incomplete = len(placed) != len(site_names)
+                meta_update['verify_file_place_failed'] = incomplete
+                if incomplete and self._logger:
+                    self._logger.error(
+                        "验证文件未能覆盖全部站点，CA 验证将失败: order_id=%s, 已放置 %d/%d",
+                        order_id, len(placed), len(site_names))
 
         self._config.update_metadata(order_id, meta_update)
         if self._logger:
@@ -1050,6 +1213,21 @@ class RenewEngine:
         if paths:
             self._file_verifier.cleanup_files(paths)
 
+    @staticmethod
+    def _verify_files_intact(meta, site_names):
+        """已放置的验证文件是否仍然完整覆盖全部绑定站点
+
+        三个条件缺一不可：
+        - 列表非空——all([]) 恒为 True，而空列表正是"一次都没放上去"的症状
+        - 覆盖全部站点——多站点里一个成功一个失败时列表非空但不完整，
+          CA 可能恰好去验失败的那个
+        - 文件仍在盘上——部署清理、站点重建、人工删除都会让它消失
+        """
+        paths = meta.get('pending_verify_paths', [])
+        if not paths or len(paths) != len(site_names):
+            return False
+        return all(os.path.isfile(p) for p in paths)
+
     def _try_place_verify_file(self, cert_entry, cert_data):
         """检查 API 返回是否有新的验证文件需要放置"""
         if not self._file_verifier:
@@ -1059,8 +1237,13 @@ class RenewEngine:
             return
         meta = cert_entry.get('metadata', {})
         old_file = meta.get('pending_file_verify', '')
-        # 验证文件未变化则跳过
-        if old_file and old_file == file_info:
+        site_names = cert_entry.get('site_name', [])
+        if isinstance(site_names, str):
+            site_names = [site_names] if site_names else []
+        # 去重判据是"上次是否真的放上去了"，不是"file_info 变没变"：
+        # 首轮放置失败（站点清单查询异常等）时 pending_file_verify 照样落盘，
+        # 之后每轮都被短路，文件一次都没写进去而订单永远卡在 processing
+        if old_file and old_file == file_info and self._verify_files_intact(meta, site_names):
             return
         # 清理旧文件，放置新文件
         self._cleanup_verify_files(meta)

@@ -538,6 +538,21 @@
       if (issued || deployed) {
         parts.push('<span style="color:#909399">签发尝试 ' + issued + ' / 部署尝试 ' + deployed + '</span>');
       }
+      // 服务端订单状态是不可信输入，必须转义
+      if (m.last_order_status) {
+        parts.push('<span style="color:#e6a23c">订单状态: '
+          + P._e(P.ORDER_STATUS_LABEL[m.last_order_status] || m.last_order_status) + '</span>');
+      }
+      if (m.verify_file_place_failed) {
+        parts.push('<span style="color:#f56c6c">验证文件未能放置到全部站点，CA 验证将失败</span>');
+      }
+      if (m.unchanged_cert_rounds) {
+        parts.push('<span style="color:#e6a23c">服务端连续 ' + (m.unchanged_cert_rounds | 0)
+          + ' 轮返回同一张证书</span>');
+      }
+      if (m.auto_reissue_confirmed === false) {
+        parts.push('<span style="color:#e6a23c">自动重签开关未确认设置成功，服务端可能不会自动签发</span>');
+      }
       if (m.last_deploy_block_reason) {
         // 中性措辞：该字段现在也承载「未绑定站点」等非环境类阻断
         parts.push('<span style="color:#e6a23c">部署阻断（' + P._fmtTime(m.last_deploy_block_at || '') + '）: '
@@ -597,6 +612,13 @@
     },
 
     // ===== 状态标签 =====
+    // 服务端不会再签发的订单状态。renewed/reissued 是证书链延续标记（服务端查询会
+    // 自动跟链到接替订单）、cancelling 是过渡态，都不算停机
+    ORDER_HALT_STATUSES: ['cancelled', 'revoked', 'failed', 'expired'],
+    ORDER_STATUS_LABEL: {
+      cancelled: '已取消', revoked: '已吊销', failed: '签发失败', expired: '已过期'
+    },
+
     _missingApi: function (cert) {
       var api = cert.api || {};
       return !api.url || !api.token_masked;
@@ -616,6 +638,13 @@
       // 判据两者都要：_get_api_for_cert 要求 url 和 token 都非空，
       // 而 get_cert_list 只在 token 非空时才回传 token_masked
       if (P._missingApi(cert)) return '<span class="ssl-tag ssl-tag-danger">缺少 API 配置</span>';
+      // 订单进入真正的停机集：服务端不会再签发，且 cancelled 的独立订单在服务端侧
+      // 是零通知（auto-renew 与到期提醒都要求证书 active），面板是唯一提示入口。
+      // renewed/reissued 是证书链延续标记、cancelling 是过渡态，都不在此列
+      var os_ = (m.last_order_status || '');
+      if (P.ORDER_HALT_STATUSES.indexOf(os_) >= 0) {
+        return '<span class="ssl-tag ssl-tag-danger">订单' + P._e(P.ORDER_STATUS_LABEL[os_] || os_) + '</span>';
+      }
       // 已签发过的证书失去全部绑定（站点被删后解绑等）：证书有效却无处部署，
       // 必须在到期判断之前拦下——否则 exp 非空会一路落到「正常」，
       // 而灰色「未绑定」标签只在 exp 为空时可达，恰好漏掉这个更严重的形态
