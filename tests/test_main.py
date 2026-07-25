@@ -1629,7 +1629,7 @@ class TestRenewSummaryMessage:
 
         monkeypatch.setattr(
             renew_mod.RenewEngine, 'check_and_renew_all',
-            lambda self, spread=False: [{'order_id': 1, 'status': 'failure', 'message': 'boom'}])
+            lambda self, spread=False, lock_wait=0: [{'order_id': 1, 'status': 'failure', 'message': 'boom'}])
         result = plugin.run_renew()
         assert result['status'] is True  # 检查本身跑完了，明细在 data 里
         assert '0 成功' in result['msg'] and '1 失败' in result['msg']
