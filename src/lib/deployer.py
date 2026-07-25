@@ -2,6 +2,7 @@
 
 import os
 import re
+import sys
 from datetime import datetime, timezone, timedelta
 
 from . import cert_utils
@@ -11,6 +12,12 @@ _BT_CERT_DIRS = (
     '/www/server/panel/vhost/cert/%s',
     '/www/server/panel/vhost/ssl/%s',
 )
+
+# 宝塔面板自带解释器；cron 脚本注册时会把它烧进脚本，回退系统 python3 时续签会整体失效
+PANEL_PYTHON = '/www/server/panel/pyenv/bin/python3'
+
+# 部署链路必需的宝塔运行时模块
+_PANEL_MODULES = ('public', 'panelSite')
 
 # 绑定站点在面板清单中连续缺失达此阈值才确认删除并解绑；
 # 未达阈值仅记为"疑似删除"（本轮按失败上报但不解绑），缩小误清绑定的破坏半径
@@ -55,6 +62,36 @@ _RELOAD_ERROR_PATTERNS = (
     re.compile(r'\bis not running\b', re.I),
     re.compile(r'AH\d{5}:.*(?:fatal|could not|failed)', re.I),  # apache
 )
+
+
+def _runtime_hint():
+    """指向根因的提示：解释器与面板解释器不一致是运行时不可用的最常见成因"""
+    current = sys.executable or ''
+    if current and os.path.exists(PANEL_PYTHON) \
+            and os.path.realpath(current) != os.path.realpath(PANEL_PYTHON):
+        return ('当前解释器 %s 不是面板解释器 %s，计划任务可能已回退到系统 python3，'
+                '请重新设置计划任务' % (current, PANEL_PYTHON))
+    return '当前解释器 %s' % (current or '未知')
+
+
+def probe_panel_runtime():
+    """探测宝塔运行时模块能否导入，返回错误信息字符串或 None（可用）
+
+    cron 脚本在注册时的面板解释器失效时会回退 PATH 中的 python3（cron.py 的 PY_BIN）。
+    lib/ 全是标准库，插件因此能照常启动、API 能照常查询，直到需要 public/panelSite 才失败——
+    而那时异常发生在部署闸门内部，failure 回调发不出去、部署计数不递增，服务端与面板两侧
+    都看不见。故整轮开始前一次性探测：不可用即整轮中止，且不产生任何 per-order 回调
+    （这不是某个订单的部署失败，spec §2.8 的上报对象是部署结果，此时一次部署都没发生）。
+    """
+    missing = []
+    for name in _PANEL_MODULES:
+        try:
+            __import__(name)
+        except Exception as e:
+            missing.append('%s(%s)' % (name, e))
+    if not missing:
+        return None
+    return '宝塔运行时模块不可用: %s；%s' % ('、'.join(missing), _runtime_hint())
 
 
 def check_web_config():

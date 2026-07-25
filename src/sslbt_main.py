@@ -1016,14 +1016,22 @@ class sslbt_main:
         failure = sum(1 for r in results if r.get('status') == 'failure')
         return '续签检查完成：%d 成功，%d 等待，%d 失败' % (success, pending, failure)
 
+    def _run_renew(self, spread):
+        """执行续签检查。整轮中止（运行环境不可用）与"跑完但无需续签"都返回空列表，
+        必须按 last_abort_reason 分开报，否则用户看到"无需续签"而实际什么都没跑。
+        """
+        deployer = self._get_deployer()
+        file_verifier = FileVerifier(self._site_mgr, self._logger)
+        engine = RenewEngine(self._config, self._get_api_for_cert, deployer, self._logger, file_verifier)
+        results = engine.check_and_renew_all(spread=spread)
+        if engine.last_abort_reason:
+            return _err('续签未执行: %s' % engine.last_abort_reason)
+        return _ok(results, msg=self._renew_summary(results))
+
     def run_renew(self, args=None):
         """手动执行续签检查"""
         try:
-            deployer = self._get_deployer()
-            file_verifier = FileVerifier(self._site_mgr, self._logger)
-            engine = RenewEngine(self._config, self._get_api_for_cert, deployer, self._logger, file_verifier)
-            results = engine.check_and_renew_all()
-            return _ok(results, msg=self._renew_summary(results))
+            return self._run_renew(spread=False)
         except Exception as e:
             self._logger.error("续签检查失败: %s", str(e))
             return _err('续签检查失败: %s' % str(e))
@@ -1031,11 +1039,7 @@ class sslbt_main:
     def run_renew_cron(self, args=None):
         """计划任务调用的续签检查（分散执行）"""
         try:
-            deployer = self._get_deployer()
-            file_verifier = FileVerifier(self._site_mgr, self._logger)
-            engine = RenewEngine(self._config, self._get_api_for_cert, deployer, self._logger, file_verifier)
-            results = engine.check_and_renew_all(spread=True)
-            return _ok(results, msg=self._renew_summary(results))
+            return self._run_renew(spread=True)
         except Exception as e:
             self._logger.error("续签检查失败: %s", str(e))
             return _err('续签检查失败: %s' % str(e))

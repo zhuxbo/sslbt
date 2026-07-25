@@ -75,6 +75,18 @@
     font-size: 13px;
   }
 
+  /* 续签健康告警条：cron 停摆是全局故障，需在证书页顶部而非仅设置页可见 */
+  .ssl-health-bar {
+    background: #fef0f0;
+    border: 1px solid #fbc4c4;
+    color: #f56c6c;
+    border-radius: 4px;
+    padding: 9px 12px;
+    margin-top: 16px;
+    font-size: 13px;
+    line-height: 1.5;
+  }
+
   /* 统计栏 */
   .ssl-stats-bar {
     display: flex;
@@ -602,6 +614,41 @@
       return '<span class="ssl-tag ssl-tag-info">已禁用</span>';
     },
 
+    // ===== 续签健康 =====
+    // cron 停摆的原因是开放集合（任务被删/被暂停/crond 没跑/脚本失效/插件构造失败），
+    // 逐个检测覆盖不全；last_run 有多旧是唯一的地面真值。
+    STALE_HOURS: 48,
+
+    _renewHealthMsg: function (d) {
+      if (!d || !d.last_run) {
+        return '自动续签尚未运行过。若添加证书已超过一天，请到「设置」检查计划任务。';
+      }
+      // 整轮中止时 last_run 同样是新鲜的，必须先看 aborted_reason，
+      // 否则一台永久跑不动的机器会被判为健康
+      if (d.aborted_reason) {
+        return '最近一次自动续签未执行：' + d.aborted_reason;
+      }
+      var t = Date.parse(d.last_run);
+      if (isNaN(t)) return '';
+      var hours = (Date.now() - t) / 3600000;
+      if (hours > P.STALE_HOURS) {
+        return '自动续签已 ' + Math.floor(hours / 24) + ' 天未运行，计划任务可能已停止，请到「设置」检查。';
+      }
+      return '';
+    },
+
+    // 仅在有已启用证书时判定：全新安装、以及刚加完第一张证书（cron 最长 24h 后才首跑）
+    // 都还没有 renew_status.json，不该报红
+    _loadRenewHealth: function (enabledCount) {
+      if (!enabledCount) return;
+      P._call('get_renew_status', null, function (r) {
+        var el = document.getElementById('renew-health');
+        if (!el) return;
+        var msg = P._renewHealthMsg((r.status && r.data) ? r.data : null);
+        el.innerHTML = msg ? '<div class="ssl-health-bar">' + P._e(msg) + '</div>' : '';
+      });
+    },
+
     // ===== 证书管理 =====
     loadCerts: function () {
       P._call('get_cert_list', null, function (r) {
@@ -613,7 +660,7 @@
         P._certList = certs;
 
         var stats = P._calcStats(certs);
-        var h = P._renderStatsBar(stats);
+        var h = '<div id="renew-health"></div>' + P._renderStatsBar(stats);
 
         if (!certs.length) {
           h += '<div class="ssl-empty">暂无证书，请点击"添加证书"</div>';
@@ -646,6 +693,7 @@
         }
         h += '</div>';
         $('#cert-list').html(h);
+        P._loadRenewHealth(stats.enabled);
 
         // 绑定点击事件
         $('.ssl-cert-summary').on('click', function () {
@@ -1324,6 +1372,13 @@
         if (!r.status || !r.data) { el.textContent = '暂无续签记录'; return; }
         var d = r.data;
         var t = (d.last_run || '').replace('T', ' ').replace('Z', ' UTC');
+        // 整轮中止时计数全为 0，直接显示成"共 0"会与"确实无需续签"混淆
+        if (d.aborted_reason) {
+          el.textContent = t + '：未执行（' + d.aborted_reason + '）';
+          el.style.color = '#f56c6c';
+          return;
+        }
+        el.style.color = '';
         el.textContent = t + '：共 ' + (d.total || 0) + '，成功 ' + (d.success || 0) +
           '，等待 ' + (d.pending || 0) + '，失败 ' + (d.failure || 0);
       });

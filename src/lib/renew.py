@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 
 from . import cert_utils
 from .api_client import APIError
-from .deployer import DeployError, check_web_config
+from .deployer import DeployError, check_web_config, probe_panel_runtime
 from .config import (
     MAX_ISSUE_RETRY_COUNT, MAX_DEPLOY_ATTEMPT_COUNT,
     ISSUE_STATE_PROCESSING, ISSUE_STATE_CAPPED, ISSUE_STATE_EXPIRED,
@@ -130,6 +130,9 @@ class RenewEngine:
         self._logger = logger
         self._file_verifier = file_verifier
         self._data_dir = config_manager._data_dir
+        # 本轮整体中止原因（运行环境不可用等）。调用方据此区分"中止"与"跑完但无需续签"，
+        # 二者都返回空列表，但对用户的含义相反
+        self.last_abort_reason = ''
 
     def check_and_renew_all(self, spread=False):
         """检查并续签所有证书
@@ -137,6 +140,7 @@ class RenewEngine:
         Args:
             spread: 是否在续签间加随机延迟，避免集中请求 API（cron 调用时为 True）
         """
+        self.last_abort_reason = ''
         # 并发保护：非阻塞获取进程锁
         lock_path = os.path.join(self._data_dir, 'renew.lock')
         lock_fd = open(lock_path, 'w')
@@ -156,6 +160,17 @@ class RenewEngine:
 
     def _do_renew_all(self, spread=False):
         """实际续签逻辑（已持有进程锁）"""
+        # 运行环境闸门：宝塔运行时不可用时整轮中止。这是进程级、与证书无关的故障，
+        # 逐证书发 failure 回调既定位不到根因，也不属于 spec §2.8 的"部署结果"上报范围，
+        # 故一个回调都不发，改由 renew_status 的 aborted_reason + 面板告警通知用户
+        runtime_err = probe_panel_runtime()
+        if runtime_err:
+            self.last_abort_reason = _compact_reason(runtime_err)
+            if self._logger:
+                self._logger.error("宝塔运行时不可用，本轮续签整体中止: %s", runtime_err)
+            self._write_renew_status([], aborted_reason=self.last_abort_reason)
+            return []
+
         certs = self._config.get_certs()
 
         # 阶段 1: 收集需续签的证书和对应 API 客户端
@@ -266,10 +281,14 @@ class RenewEngine:
         self._write_renew_status(results)
         return results
 
-    def _write_renew_status(self, results):
+    def _write_renew_status(self, results, aborted_reason=''):
         """写入最近一次续签运行的轻量状态（供面板展示），失败不影响续签
 
         复用数据目录，原子写 + 0600 权限，与 config/session 落盘约定一致。
+
+        aborted_reason 非空表示本轮整体没跑（运行环境不可用等）：此时 last_run 虽是新鲜的，
+        但面板不得据此判定健康——否则一台永久跑不动的机器会同时显示"最近续签正常"和错误告警。
+        参数可选，既有直接调用方（含测试）不受影响。
         """
         status = {
             'last_run': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
@@ -277,6 +296,7 @@ class RenewEngine:
             'success': sum(1 for r in results if r.get('status') == 'success'),
             'pending': sum(1 for r in results if r.get('status') == 'pending'),
             'failure': sum(1 for r in results if r.get('status') == 'failure'),
+            'aborted_reason': aborted_reason,
         }
         path = os.path.join(self._data_dir, 'renew_status.json')
         data = json.dumps(status, ensure_ascii=False).encode('utf-8')
@@ -470,8 +490,16 @@ class RenewEngine:
 
         本轮结果同样计为失败而非等待：既然已按 failure 上报服务端，本地汇总与面板
         必须给出一致口径，否则用户看到"续签成功"却什么都没发生。
+
+        check_web_config() 自身抛异常（面板内部失败、nginx 二进制缺失、配置目录不可读等）
+        与它返回错误同样处置：整轮开头的 probe_panel_runtime 只保证模块可导入，不保证调用
+        不抛。裸调用会让异常穿透到上层通用 except，届时回调发不出、阻断原因不落盘、计数
+        停在 0 而永不触顶——正是本函数要消灭的那种不可见失败。
         """
-        env_err = check_web_config()
+        try:
+            env_err = check_web_config()
+        except Exception as e:
+            env_err = 'Web 配置检查执行异常: %s' % e
         if not env_err:
             self._clear_deploy_block(cert_entry, order_id)
             return None
@@ -479,14 +507,19 @@ class RenewEngine:
         message = 'Web 服务配置校验失败（非本次部署导致）: %s' % _compact_reason(env_err)
         if self._logger:
             self._logger.error("环境阻断，本轮跳过部署且不计数: order_id=%s, error=%s", order_id, env_err)
+        meta = cert_entry.setdefault('metadata', {})
+        prev_reason = meta.get('last_deploy_block_reason', '')
         self._persist_meta(order_id, {
             'last_deploy_block_reason': message,
             'last_deploy_block_at': now,
         })
-        meta = cert_entry.setdefault('metadata', {})
         meta['last_deploy_block_reason'] = message
         meta['last_deploy_block_at'] = now
-        self._send_failure_callback(api, order_id, message)
+        # 变化触发：服务端 DeployFailureReminderCommand 是电平驱动（判据为"订单最新一行仍为
+        # failure"），一行就足以让订单永久留在失败视图，逐日重发零信息增量却会淹没管理端列表
+        # 且被 PurgeCommand 的终态过滤永久保留。与本模块既有的"仅状态变化才记录/落盘"同一纪律
+        if message != prev_reason:
+            self._send_failure_callback(api, order_id, message)
         return message
 
     def _deploy_and_report(self, cert_entry, api, fullchain, key_pem, site_names, domains, order_id):

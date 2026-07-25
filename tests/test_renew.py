@@ -1939,3 +1939,195 @@ class TestPendingKeyDanglingSymlink:
 
         engine._cleanup_pending_key(cert)
         assert not os.path.lexists(path)
+
+
+class TestPanelRuntimeGate:
+    """运行环境闸门：宝塔运行时不可用时整轮中止且零回调（F6/C1）
+
+    核心风险：cron 脚本在面板解释器失效时回退系统 python3，lib/ 全是标准库所以插件
+    照常启动、API 照常查询，直到部署闸门里 import public 才失败——而那时回调发不出、
+    计数不递增，服务端与面板两侧都看不见。
+    """
+
+    @pytest.fixture
+    def engine(self, tmp_data_dir):
+        config = ConfigManager(tmp_data_dir)
+        mock_api = MagicMock()
+        deployer = MagicMock()
+        eng = RenewEngine(config, MagicMock(return_value=mock_api), deployer, MagicMock())
+        eng._mock_api = mock_api
+        return eng
+
+    @staticmethod
+    def _seed(engine, order_id=7300):
+        cert = _make_cert_entry(10, order_id=order_id)
+        engine._config.add_cert(
+            order_id=cert['order_id'], cert_name=cert['cert_name'],
+            domains=cert['domains'], site_names=cert['site_name'],
+        )
+        engine._config.update_metadata(cert['order_id'], cert['metadata'])
+        return cert
+
+    def test_runtime_unavailable_aborts_without_any_callback(self, engine, tmp_data_dir):
+        """运行时不可用：整轮中止、零回调、零 API 查询"""
+        self._seed(engine)
+        with patch('lib.renew.probe_panel_runtime', return_value='宝塔运行时模块不可用: public(x)'):
+            results = engine.check_and_renew_all()
+
+        assert results == []
+        engine._mock_api.callback.assert_not_called()
+        engine._mock_api.query_order.assert_not_called()
+        engine._deployer.deploy_multi.assert_not_called()
+
+    def test_abort_reason_distinguishes_from_nothing_to_do(self, engine, tmp_data_dir):
+        """中止与"跑完但无需续签"都返回空列表，必须能被调用方区分"""
+        self._seed(engine)
+        with patch('lib.renew.probe_panel_runtime', return_value='运行时不可用'):
+            engine.check_and_renew_all()
+        assert engine.last_abort_reason
+
+        # 环境正常且无需续签：同样空列表，但中止原因必须被清空
+        engine._config.update_metadata(7300, {'cert_expires_at': (
+            datetime.now(timezone.utc) + timedelta(days=60)).strftime('%Y-%m-%dT%H:%M:%SZ')})
+        with patch('lib.renew.probe_panel_runtime', return_value=None):
+            results = engine.check_and_renew_all()
+        assert results == []
+        assert engine.last_abort_reason == ''
+
+    def test_abort_writes_reason_into_renew_status(self, engine, tmp_data_dir):
+        """面板据此告警：last_run 是新鲜的，不能让面板误判为健康"""
+        self._seed(engine)
+        with patch('lib.renew.probe_panel_runtime', return_value='运行时不可用: public'):
+            engine.check_and_renew_all()
+
+        with open(os.path.join(tmp_data_dir, 'renew_status.json')) as f:
+            status = json.load(f)
+        assert status['aborted_reason']
+        assert status['last_run']
+        assert status['total'] == 0
+
+    def test_healthy_runtime_leaves_reason_empty(self, engine, tmp_data_dir):
+        """正常运行时 aborted_reason 必须为空，否则面板永久告警"""
+        with patch('lib.renew.probe_panel_runtime', return_value=None):
+            engine.check_and_renew_all()
+        with open(os.path.join(tmp_data_dir, 'renew_status.json')) as f:
+            assert json.load(f)['aborted_reason'] == ''
+
+    def test_probe_detects_missing_module(self):
+        """探测函数本身：模块缺失时返回带根因提示的错误串"""
+        from lib.deployer import probe_panel_runtime
+        import builtins
+
+        real_import = builtins.__import__
+
+        def fake_import(name, *a, **kw):
+            if name == 'public':
+                raise ImportError("No module named 'psutil'")
+            return real_import(name, *a, **kw)
+
+        with patch('builtins.__import__', side_effect=fake_import):
+            err = probe_panel_runtime()
+        assert err and 'public' in err and 'psutil' in err
+        assert '解释器' in err
+
+    def test_probe_returns_none_when_available(self):
+        from lib.deployer import probe_panel_runtime
+        assert probe_panel_runtime() is None
+
+
+class TestEnvBlockCallbackEdgeTriggered:
+    """环境阻断回调改为变化触发（F6）
+
+    服务端 DeployFailureReminderCommand 是电平驱动（判据为"订单最新一行仍为 failure"），
+    一行就足以让订单永久留在失败视图；逐日重发零信息增量，却会淹没管理端列表，
+    且因 pull 单 latestCert 恒 active 而被 PurgeCommand 的终态过滤永久保留。
+    """
+
+    @pytest.fixture
+    def engine(self, tmp_data_dir):
+        config = ConfigManager(tmp_data_dir)
+        mock_api = MagicMock()
+        deployer = MagicMock()
+        deployer.deploy_multi.return_value = [
+            {'site_name': 'example.com', 'status': True, 'message': '部署成功'}]
+        eng = RenewEngine(config, MagicMock(return_value=mock_api), deployer, MagicMock())
+        eng._mock_api = mock_api
+        return eng
+
+    def _seed(self, engine, order_id=7400):
+        cert = _make_cert_entry(10, order_id=order_id)
+        engine._config.add_cert(
+            order_id=cert['order_id'], cert_name=cert['cert_name'],
+            domains=cert['domains'], site_names=cert['site_name'],
+        )
+        engine._config.update_metadata(cert['order_id'], cert['metadata'])
+        engine._mock_api.query_order.return_value = {
+            'status': 'active', 'certificate': '---CERT---',
+            'ca_certificate': '---CA---', 'private_key': '---KEY---',
+        }
+        return engine._config.get_cert(cert['order_id'])
+
+    @staticmethod
+    def _set_config_error(monkeypatch, message):
+        import public
+        monkeypatch.setattr(public, 'checkWebConfig', lambda: message)
+
+    def test_repeated_identical_block_reports_once(self, engine, monkeypatch):
+        """同一原因连续多轮只上报一次"""
+        self._set_config_error(monkeypatch, 'nginx: [emerg] same error')
+        cert = self._seed(engine)
+        for _ in range(5):
+            with pytest.raises(RuntimeError):
+                engine._renew_pull(engine._config.get_cert(cert['order_id']), engine._mock_api)
+        assert engine._mock_api.callback.call_count == 1
+
+    def test_changed_reason_reports_again(self, engine, monkeypatch):
+        """原因变化即上报：服务端需要拿到新信息"""
+        self._set_config_error(monkeypatch, 'nginx: [emerg] first error')
+        cert = self._seed(engine)
+        with pytest.raises(RuntimeError):
+            engine._renew_pull(engine._config.get_cert(cert['order_id']), engine._mock_api)
+
+        self._set_config_error(monkeypatch, 'nginx: [emerg] second different error')
+        with pytest.raises(RuntimeError):
+            engine._renew_pull(engine._config.get_cert(cert['order_id']), engine._mock_api)
+        assert engine._mock_api.callback.call_count == 2
+
+    def test_recovery_then_reblock_reports_again(self, engine, monkeypatch):
+        """恢复后复发必须再报：_clear_deploy_block 清空原因，复发即构成变化"""
+        import public
+        self._set_config_error(monkeypatch, 'nginx: [emerg] boom')
+        cert = self._seed(engine)
+        with pytest.raises(RuntimeError):
+            engine._renew_pull(engine._config.get_cert(cert['order_id']), engine._mock_api)
+        assert engine._mock_api.callback.call_count == 1
+
+        monkeypatch.setattr(public, 'checkWebConfig', lambda: True)
+        engine._renew_pull(engine._config.get_cert(cert['order_id']), engine._mock_api)
+
+        self._set_config_error(monkeypatch, 'nginx: [emerg] boom')
+        with pytest.raises(RuntimeError):
+            engine._renew_pull(engine._config.get_cert(cert['order_id']), engine._mock_api)
+        # 第 2 次阻断上报 + 中间那次部署成功的回调由编排层发出
+        assert engine._mock_api.callback.call_count >= 2
+
+    def test_check_web_config_raising_still_blocks_visibly(self, engine, monkeypatch):
+        """check_web_config 抛异常与返回错误同样处置：上报 + 落盘 + 不计数。
+        裸调用会让异常穿透到通用 except，届时回调发不出、原因不落盘、计数停在 0 而永不触顶。
+        """
+        import public
+
+        def boom():
+            raise RuntimeError('checkWebConfig 内部炸了')
+
+        monkeypatch.setattr(public, 'checkWebConfig', boom)
+        cert = self._seed(engine, 7401)
+        with pytest.raises(RuntimeError):
+            engine._renew_pull(engine._config.get_cert(cert['order_id']), engine._mock_api)
+
+        engine._mock_api.callback.assert_called_once()
+        assert engine._mock_api.callback.call_args[1]['status'] == 'failure'
+        meta = engine._config.get_cert(cert['order_id'])['metadata']
+        assert 'Web 配置检查执行异常' in meta['last_deploy_block_reason']
+        assert meta.get('deploy_attempt_count', 0) == 0
+        engine._deployer.deploy_multi.assert_not_called()
