@@ -26,13 +26,14 @@ if 'sslbt_main' in globals():
 
 from lib.config import (  # noqa: E402
     ConfigManager, derive_or_validate_renew_policy, ISSUE_STATE_POLICY_BLOCKED,
+    MANUAL_RESET_KEYS,
 )
 from lib.logger import Logger  # noqa: E402
 from lib.api_client import APIClient, APIError  # noqa: E402
 from lib.cert_utils import build_fullchain, parse_cert_info, verify_cert_key_match, validate_key_pem  # noqa: E402
 from lib.site_manager import SiteManager  # noqa: E402
 from lib.deployer import Deployer, DeployError, check_web_config  # noqa: E402
-from lib.renew import RenewEngine  # noqa: E402
+from lib.renew import RenewEngine, CRON_LOCK_WAIT, PANEL_LOCK_WAIT  # noqa: E402
 from lib.file_verifier import FileVerifier  # noqa: E402
 from lib.cron import CronManager  # noqa: E402
 from lib.updater import Updater  # noqa: E402
@@ -510,15 +511,7 @@ class sslbt_main:
             if not cert_entry:
                 return _err('订单 %d 不存在' % order_id)
             old_state = cert_entry.get('metadata', {}).get('last_issue_state', '')
-            self._config.update_metadata(order_id, {
-                'last_issue_state': '',
-                'cap_stage': '',
-                'issue_retry_count': 0,
-                'deploy_attempt_count': 0,
-                'deploy_started': False,
-                'last_deploy_block_reason': '',
-                'last_deploy_block_at': '',
-            })
+            self._config.update_metadata(order_id, dict(MANUAL_RESET_KEYS))
             self._logger.info("手动恢复自动续签: order_id=%s, 原状态=%s", order_id, old_state or '(空)')
             return _ok(msg='已恢复自动续签，下次检查将重新处理')
         except Exception as e:
@@ -1030,7 +1023,9 @@ class sslbt_main:
         deployer = self._get_deployer()
         file_verifier = FileVerifier(self._site_mgr, self._logger)
         engine = RenewEngine(self._config, self._get_api_for_cert, deployer, self._logger, file_verifier)
-        results = engine.check_and_renew_all(spread=spread)
+        # cron 可以等锁（丢掉当天唯一窗口的代价远大于多等两分钟），面板按钮不能
+        lock_wait = CRON_LOCK_WAIT if spread else PANEL_LOCK_WAIT
+        results = engine.check_and_renew_all(spread=spread, lock_wait=lock_wait)
         if engine.last_abort_reason:
             return _err('续签未执行: %s' % engine.last_abort_reason)
         return _ok(results, msg=self._renew_summary(results))

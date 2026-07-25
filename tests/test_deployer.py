@@ -166,13 +166,49 @@ class TestDeployer:
         )
         assert results[0]['status'] is True
         assert results[1]['status'] is False
-        # metadata 应被更新（部分成功）
         cert = config.get_cert(12345)
-        assert cert['metadata']['last_issue_state'] == ''
-        assert cert['metadata']['issue_retry_count'] == 0
-        assert cert['metadata']['last_deploy_at'] != ''
-        # 到期时间应被回填（避免 cron 因空 expires_at 永不接手）
-        assert cert['metadata']['cert_expires_at'] != ''
+        meta = cert['metadata']
+
+        # 组 2（任一成功）：计数清零。不收紧到「全部成功」——一个永久坏的站点会让
+        # 计数只增不减，10 轮后把整张证书推入 CAPPED，健康站点跟着一起停更
+        assert meta['last_issue_state'] == ''
+        assert meta['issue_retry_count'] == 0
+        assert meta['deploy_attempt_count'] == 0
+
+        # 组 3（全部成功）：部分失败时不前推到期时间，否则失败站点要等到新证书临期
+        # （90 天证书约 76 天）才会被再试一次，那之前它一直挂着旧证书
+        assert meta.get('cert_expires_at', '') == ''
+        assert meta.get('last_deploy_at', '') == ''
+
+        # 组 1（无条件）：逐站点结果落盘，面板据此渲染而非用证书级 last_deploy_at
+        statuses = meta['site_deploy_status']
+        assert statuses['s1.a.com']['status'] is True
+        assert statuses['s2.a.com']['status'] is False
+
+    @patch('lib.deployer.cert_utils')
+    @patch('lib.deployer.Deployer._set_ssl')
+    def test_deploy_multi_all_success_advances_expiry(self, mock_set_ssl, mock_cert_utils,
+                                                      deployer, tmp_data_dir):
+        """全部成功才前推到期时间与序列号"""
+        mock_cert_utils.validate_cert_pem.return_value = (True, '')
+        mock_cert_utils.validate_key_pem.return_value = (True, '')
+        mock_cert_utils.verify_cert_key_match.return_value = True
+        mock_cert_utils.parse_cert_info.return_value = {
+            'common_name': 'a.com', 'serial': 'DEF456', 'not_after': _FUTURE_EXPIRY,
+        }
+        mock_set_ssl.side_effect = [{'status': True}, {'status': True}]
+
+        config = ConfigManager(tmp_data_dir)
+        config.add_cert(12346, 'test', ['a.com'], site_names=['s1.a.com', 's2.a.com'])
+        deployer._config = config
+        deployer.deploy_multi(
+            site_names=['s1.a.com', 's2.a.com'], fullchain_pem='cert-pem',
+            key_pem='key-pem', order_id=12346, domains=['a.com'],
+        )
+        meta = config.get_cert(12346)['metadata']
+        assert meta['cert_expires_at'] != ''
+        assert meta['cert_serial'] == 'DEF456'
+        assert meta['last_deploy_at'] != ''
 
 
 class TestSetSSLResultWhitelist:

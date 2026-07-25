@@ -539,7 +539,8 @@
         parts.push('<span style="color:#909399">签发尝试 ' + issued + ' / 部署尝试 ' + deployed + '</span>');
       }
       if (m.last_deploy_block_reason) {
-        parts.push('<span style="color:#e6a23c">环境阻断（' + P._fmtTime(m.last_deploy_block_at || '') + '）: '
+        // 中性措辞：该字段现在也承载「未绑定站点」等非环境类阻断
+        parts.push('<span style="color:#e6a23c">部署阻断（' + P._fmtTime(m.last_deploy_block_at || '') + '）: '
           + P._e(m.last_deploy_block_reason) + '</span>');
       }
       return parts.join('<span class="ssl-stat-sep">|</span>');
@@ -547,7 +548,7 @@
 
     // ===== 统计计算 =====
     _calcStats: function (certs) {
-      var total = certs.length, enabled = 0, expiring = 0, expired = 0, halted = 0;
+      var total = certs.length, enabled = 0, expiring = 0, expired = 0, halted = 0, noApi = 0;
       var now = new Date();
       var threshold = 14 * 24 * 60 * 60 * 1000;
       for (var i = 0; i < certs.length; i++) {
@@ -555,6 +556,7 @@
         if (c.enabled !== false) enabled++;
         var halt = P._haltInfo(c);
         if (halt && halt.halted) halted++;
+        if (P._missingApi(c)) noApi++;
         var exp = (c.metadata || {}).cert_expires_at || '';
         if (!exp) continue;
         try {
@@ -564,7 +566,8 @@
           else if (diff <= threshold) expiring++;
         } catch (e) {}
       }
-      return { total: total, enabled: enabled, expiring: expiring, expired: expired, halted: halted };
+      return { total: total, enabled: enabled, expiring: expiring, expired: expired,
+               halted: halted, noApi: noApi };
     },
 
     _renderStatsBar: function (stats) {
@@ -579,6 +582,10 @@
       h += '已过期 <span class="ssl-stat-num" style="color:' + (stats.expired > 0 ? '#f56c6c' : '') + '">' + stats.expired + '</span>';
       h += '<span class="ssl-stat-sep">|</span>';
       h += '已停更 <span class="ssl-stat-num" style="color:' + (stats.halted > 0 ? '#f56c6c' : '') + '">' + stats.halted + '</span>';
+      if (stats.noApi > 0) {
+        h += '<span class="ssl-stat-sep">|</span>';
+        h += '缺 API 配置 <span class="ssl-stat-num" style="color:#f56c6c">' + stats.noApi + '</span>';
+      }
       h += '</div>';
       h += '<div class="ssl-stats-right">';
       h += '<button class="ssl-btn ssl-btn-success ssl-btn-sm" onclick="sslbt.addCert()">一键部署</button>';
@@ -590,6 +597,11 @@
     },
 
     // ===== 状态标签 =====
+    _missingApi: function (cert) {
+      var api = cert.api || {};
+      return !api.url || !api.token_masked;
+    },
+
     _statusTag: function (cert) {
       var m = cert.metadata || {};
       var exp = m.cert_expires_at || '';
@@ -599,6 +611,17 @@
       // 终态优先于到期判断：这些证书已停止自动续签，不能显示为「正常」
       var halt = P._haltInfo(cert);
       if (halt) return '<span class="ssl-tag ssl-tag-' + halt.level + '">' + P._e(halt.label) + '</span>';
+      // 缺 API 配置的证书永远不会进入续签流程，且续签汇总里完全看不到它
+      // （连 renew_status 的计数都不含），面板是唯一能暴露它的地方。
+      // 判据两者都要：_get_api_for_cert 要求 url 和 token 都非空，
+      // 而 get_cert_list 只在 token 非空时才回传 token_masked
+      if (P._missingApi(cert)) return '<span class="ssl-tag ssl-tag-danger">缺少 API 配置</span>';
+      // 已签发过的证书失去全部绑定（站点被删后解绑等）：证书有效却无处部署，
+      // 必须在到期判断之前拦下——否则 exp 非空会一路落到「正常」，
+      // 而灰色「未绑定」标签只在 exp 为空时可达，恰好漏掉这个更严重的形态
+      if (!sites.length && exp) {
+        return '<span class="ssl-tag ssl-tag-warning">未绑定站点</span>';
+      }
       if (!exp) {
         if (!sites.length) return '<span class="ssl-tag ssl-tag-info">未绑定</span>';
         if (!deployed) return '<span class="ssl-tag ssl-tag-primary">待部署</span>';
@@ -804,7 +827,20 @@
           } else {
             matchTag = '<span class="ssl-tag ssl-tag-info">无匹配</span>';
           }
-          var deployStatus = m.last_deploy_at ? '<span class="ssl-tag ssl-tag-success">已部署</span>' : '<span class="ssl-tag ssl-tag-info">未部署</span>';
+          // 逐站点结果：此前用证书级 last_deploy_at 渲染每一行，
+          // 部分失败时失败的那个站点也显示「已部署」，而它其实还挂着旧证书
+          var siteStat = (m.site_deploy_status || {})[sd.site_name];
+          var deployStatus;
+          if (!siteStat) {
+            deployStatus = m.last_deploy_at
+              ? '<span class="ssl-tag ssl-tag-success">已部署</span>'
+              : '<span class="ssl-tag ssl-tag-info">未部署</span>';
+          } else if (siteStat.status) {
+            deployStatus = '<span class="ssl-tag ssl-tag-success">已部署</span>';
+          } else {
+            deployStatus = '<span class="ssl-tag ssl-tag-danger" title="'
+              + P._e(siteStat.message || '') + '">部署失败</span>';
+          }
           sitesHtml += '<div class="ssl-site-row"><span>' + P._e(sd.site_name) + '</span><span class="ssl-site-tags">' + matchTag + deployStatus + '</span></div>';
           if (sd.match && sd.match.type === 'partial' && sd.match.unmatched && sd.match.unmatched.length) {
             sitesHtml += '<div class="ssl-unmatched">未覆盖: ' + P._e(sd.match.unmatched.join(', ')) + '</div>';

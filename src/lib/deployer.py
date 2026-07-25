@@ -6,6 +6,7 @@ import sys
 from datetime import datetime, timezone, timedelta
 
 from . import cert_utils
+from .config import DEPLOY_SUCCESS_RESET_KEYS
 
 # 宝塔站点证书文件目录（与 site_manager._check_ssl 的路径约定一致）
 _BT_CERT_DIRS = (
@@ -177,37 +178,7 @@ class Deployer:
                 if self._logger:
                     self._logger.warning("站点部署失败: site=%s, error=%s", site_name, str(e))
 
-        success_count = sum(1 for r in results if r.get('status'))
         now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
-
-        # 仅在至少一个站点成功时更新 metadata（全部失败保留重试状态）
-        # 解析或写入失败视为部署未完成：本地 cert_expires_at 缺失会导致 cron 永不接手
-        meta_error = None
-        if order_id and success_count > 0:
-            cert_info = cert_utils.parse_cert_info(
-                fullchain_pem, logger=self._logger)
-            if not cert_info or not cert_info.get('not_after'):
-                meta_error = '证书解析失败，无法记录到期时间'
-            else:
-                # 部署成功清零签发与部署状态（deploy-spec §3.8）
-                meta = {
-                    'last_deploy_at': now,
-                    'cert_expires_at': cert_info['not_after'].strftime('%Y-%m-%dT%H:%M:%SZ'),
-                    'cert_serial': cert_info.get('serial', ''),
-                    'last_issue_state': '',
-                    'issue_retry_count': 0,
-                    'deploy_attempt_count': 0,
-                    'deploy_started': False,
-                    'csr_submitted_at': '',
-                    'last_csr_hash': '',
-                    # 部署成功即证明环境已恢复，清除阻断标记避免面板留存过期原因
-                    'last_deploy_block_reason': '',
-                    'last_deploy_block_at': '',
-                }
-                try:
-                    self._config.update_metadata(order_id, meta)
-                except Exception as e:
-                    meta_error = 'metadata 更新失败: %s' % str(e)
 
         # 已确认删除（连续两轮缺失）的站点：从证书绑定中移除并持久化（自愈），计入结果供回调
         prune_succeeded = True
@@ -231,6 +202,46 @@ class Deployer:
         # 结果为空说明入参站点清单为空：绝不能让 all([]) == True 发出 success 回调
         if not results:
             raise DeployError('无可部署站点', phase='validate')
+
+        # metadata 写入分三组，判据都基于同一份完整 results（含站点缺失项），
+        # 与编排层的 counts_cleared / _deploy_callback_decision 天然同源、不会漂移
+        success_count = sum(1 for r in results if r.get('status'))
+        all_success = success_count == len(results)
+        meta_error = None
+        if order_id:
+            meta = {}
+
+            # 组 1（无条件）：逐站点结果。面板此前用证书级 last_deploy_at 渲染每一个站点行，
+            # 部分失败时失败站点也显示「已部署」
+            meta['site_deploy_status'] = {
+                r['site_name']: {'status': bool(r.get('status')),
+                                 'message': r.get('message', ''), 'at': now}
+                for r in results
+            }
+
+            # 组 2（任一成功）：计数清零。与编排层 counts_cleared=any(...) 镜像。
+            # 不收紧到「全部成功」——一张证书绑 3 个站点、其中 1 个永久坏时，
+            # 计数只增不减会在 10 轮后把整张证书推入 CAPPED，两个健康站点跟着一起停更
+            if success_count > 0:
+                meta.update(DEPLOY_SUCCESS_RESET_KEYS)
+
+            # 组 3（全部成功）：到期时间与序列号。部分失败时保留旧值，
+            # needs_renewal 因此继续为 True，明天重试失败的站点；
+            # 此前无条件前推会让失败站点等到新证书临期（90 天证书约 76 天）才再试一次
+            if all_success:
+                cert_info = cert_utils.parse_cert_info(fullchain_pem, logger=self._logger)
+                if not cert_info or not cert_info.get('not_after'):
+                    meta_error = '证书解析失败，无法记录到期时间'
+                else:
+                    meta['last_deploy_at'] = now
+                    meta['cert_expires_at'] = cert_info['not_after'].strftime('%Y-%m-%dT%H:%M:%SZ')
+                    meta['cert_serial'] = cert_info.get('serial', '')
+
+            if not meta_error:
+                try:
+                    self._config.update_metadata(order_id, meta)
+                except Exception as e:
+                    meta_error = 'metadata 更新失败: %s' % str(e)
 
         # 发送部署回调（任一站点失败或 metadata 未落盘即 failure，附各失败原因）
         # send_callback=False 时底层不发（自动续签编排层在结果落盘后统一发送）
@@ -423,6 +434,12 @@ class Deployer:
             remaining = [s for s in current if s not in deleted_sites]
             if remaining != current:
                 self._config.update_cert(order_id, {'site_name': remaining})
+                # 同步剔除逐站点状态，否则已解绑站点会永久堆积在 config.json 里并继续渲染
+                meta = cert.get('metadata', {})
+                statuses = meta.get('site_deploy_status', {})
+                if isinstance(statuses, dict) and any(s in statuses for s in deleted_sites):
+                    self._config.update_metadata(order_id, {'site_deploy_status': {
+                        k: v for k, v in statuses.items() if k not in deleted_sites}})
                 if self._logger:
                     self._logger.warning("已解除已删除站点的证书绑定: order_id=%s, sites=%s",
                                          order_id, ','.join(deleted_sites))

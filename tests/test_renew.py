@@ -2,6 +2,9 @@
 
 import os
 import json
+import fcntl
+import time
+import threading
 import pytest
 from datetime import datetime, timezone, timedelta
 from unittest.mock import MagicMock, patch
@@ -133,7 +136,11 @@ class TestRenewEngine:
         assert result is False
 
     def test_pull_renew_no_site(self, engine):
-        """未绑定站点 → 跳过"""
+        """服务端已签发但无绑定站点 → 记录阻断原因并按失败上报
+
+        此前只记 warning 并返回 False，本轮被计为「等待签发」，服务端零回调、
+        面板对已有到期时间的证书显示「正常」——两侧都看不出证书压根没部署上。
+        """
         engine._mock_api.query_order.return_value = {
             'status': 'active',
             'certificate': '---CERT---',
@@ -142,8 +149,20 @@ class TestRenewEngine:
         }
         cert = _make_cert_entry(10)
         cert['site_name'] = []
-        result = engine._renew_pull(cert, engine._mock_api)
-        assert result is False
+        engine._config.add_cert(
+            order_id=cert['order_id'], cert_name=cert['cert_name'],
+            domains=cert['domains'], site_names=[],
+        )
+        engine._config.update_metadata(cert['order_id'], cert['metadata'])
+        with pytest.raises(RuntimeError, match='未绑定站点'):
+            engine._renew_pull(engine._config.get_cert(cert['order_id']), engine._mock_api)
+
+        engine._mock_api.callback.assert_called_once()
+        assert engine._mock_api.callback.call_args[1]['status'] == 'failure'
+        meta = engine._config.get_cert(cert['order_id'])['metadata']
+        assert '未绑定任何站点' in meta['last_deploy_block_reason']
+        # 不计数：否则 10 轮后静默 CAPPED，用户绑好站点还要人工解除
+        assert meta.get('deploy_attempt_count', 0) == 0
 
     def test_check_and_renew_all_empty(self, engine):
         results = engine.check_and_renew_all()
@@ -1180,7 +1199,11 @@ class TestDeployFailureRetainsPendingKey:
         assert not os.path.exists(key_path)  # 成功后清理
 
     def test_handle_processing_partial_success_cleans_pending_key(self, engine):
-        """部分成功（至少一个站点成功）→ 清理 pending key（key 已被消费，现行为）"""
+        """部分成功：本轮按失败上报（与回调口径一致），但私钥已被消费必须清理
+
+        清理判据是「私钥是否已写入站点」，与 _check_deploy_results 是否抛错解耦——
+        任一站点成功即已消费，不清理就是泄漏。
+        """
         cert, key_path = self._setup_processing_cert(
             engine, 8103, site_names=['example.com', 's2.example.com'])
         engine._mock_api.query_order.return_value = {
@@ -1188,8 +1211,8 @@ class TestDeployFailureRetainsPendingKey:
         engine._deployer.deploy_multi.return_value = [
             {'site_name': 'example.com', 'status': True, 'message': '部署成功'},
             {'site_name': 's2.example.com', 'status': False, 'message': '超时'}]
-        result = engine._handle_processing(cert, engine._mock_api)
-        assert result is True
+        with pytest.raises(RuntimeError, match='部分站点部署失败'):
+            engine._handle_processing(cert, engine._mock_api)
         assert not os.path.exists(key_path)
 
     def test_handle_processing_partial_success_with_missing_cleans_pending_key(self, engine):
@@ -2158,3 +2181,144 @@ class TestConfigDegradedAbortsRenew:
 
         with open(os.path.join(tmp_data_dir, 'renew_status.json')) as f:
             assert json.load(f)['aborted_reason']
+
+
+class TestCollectIsolation:
+    """阶段 1 逐证书异常隔离（F7/C2）
+
+    核心风险：阶段 1 此前一行 try 都没有，而 APIClient.__init__ 会对 SSRF 命中、
+    token 非法、协议非法主动 raise ValueError。一张证书构造失败会让整批后续证书
+    连一次 API 调用都没有，且 renew_status 保留上一轮的成功记录，面板完全健康。
+    """
+
+    @pytest.fixture
+    def engine(self, tmp_data_dir):
+        config = ConfigManager(tmp_data_dir)
+        deployer = MagicMock()
+        deployer.deploy_multi.return_value = [
+            {'site_name': 'example.com', 'status': True, 'message': '部署成功'}]
+        return config, deployer
+
+    def test_one_bad_cert_does_not_block_others(self, engine, tmp_data_dir):
+        config, deployer = engine
+        # 每张证书用独立站点：add_cert 有站点唯一绑定校验，共用站点会被静默过滤成空绑定
+        for oid in (9001, 9002, 9003):
+            c = _make_cert_entry(10, order_id=oid)
+            site = 'site%d.example.com' % oid
+            config.add_cert(order_id=oid, cert_name='order-%d' % oid,
+                            domains=c['domains'], site_names=[site])
+            config.update_metadata(oid, c['metadata'])
+
+        built = []
+
+        def factory(cert):
+            if cert['order_id'] == 9001:
+                raise ValueError('API 地址指向内网，已拒绝')
+            api = MagicMock()
+            api.query_order.return_value = {
+                'status': 'active', 'certificate': '---C---',
+                'ca_certificate': '---CA---', 'private_key': '---K---'}
+            built.append(cert['order_id'])
+            return api
+
+        deployer.deploy_multi.side_effect = lambda site_names, **kw: [
+            {'site_name': s, 'status': True, 'message': '部署成功'} for s in site_names]
+
+        eng = RenewEngine(config, factory, deployer, MagicMock())
+        with patch('lib.renew.probe_panel_runtime', return_value=None):
+            results = eng.check_and_renew_all()
+
+        assert built == [9002, 9003], '后续证书必须照常处理'
+        by_id = {r['order_id']: r for r in results}
+        assert by_id[9001]['status'] == 'failure'
+        assert '预处理失败' in by_id[9001]['message']
+        assert by_id[9002]['status'] == 'success'
+
+    def test_bad_cert_appears_in_renew_status(self, engine, tmp_data_dir):
+        """预处理失败必须进汇总：否则 renew_status 保留上一轮成功记录，面板看不出异常"""
+        config, deployer = engine
+        c = _make_cert_entry(10, order_id=9101)
+        config.add_cert(order_id=9101, cert_name='order-9101',
+                        domains=c['domains'], site_names=['site9101.example.com'])
+        config.update_metadata(9101, c['metadata'])
+
+        def factory(cert):
+            raise ValueError('token 格式非法')
+
+        eng = RenewEngine(config, factory, deployer, MagicMock())
+        with patch('lib.renew.probe_panel_runtime', return_value=None):
+            eng.check_and_renew_all()
+
+        with open(os.path.join(tmp_data_dir, 'renew_status.json')) as f:
+            status = json.load(f)
+        assert status['failure'] == 1
+        assert status['total'] == 1
+
+
+class TestLockWaitAndSkip:
+    """抢锁重试与跳过可见性（F11/C6）"""
+
+    @pytest.fixture
+    def engine(self, tmp_data_dir):
+        config = ConfigManager(tmp_data_dir)
+        return RenewEngine(config, MagicMock(), MagicMock(), MagicMock())
+
+    def test_lock_held_records_skip_without_touching_renew_status(self, engine, tmp_data_dir):
+        """抢锁失败写独立小文件，绝不读改写 renew_status.json
+
+        那条路径按定义就是没拿到锁的进程，与正在收尾的持锁进程并发读改写，
+        会用陈旧快照覆盖对方刚写的真实计数。
+        """
+        status_path = os.path.join(tmp_data_dir, 'renew_status.json')
+        with open(status_path, 'w') as f:
+            json.dump({'last_run': '2020-01-01T00:00:00Z', 'total': 9,
+                       'success': 9, 'pending': 0, 'failure': 0}, f)
+        with open(status_path) as f:
+            original = f.read()
+
+        holder = open(os.path.join(tmp_data_dir, 'renew.lock'), 'w')
+        fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            results = engine.check_and_renew_all(lock_wait=0)
+        finally:
+            fcntl.flock(holder, fcntl.LOCK_UN)
+            holder.close()
+
+        assert results == []
+        assert engine.last_abort_reason, '被锁挡下必须能与"无需续签"区分'
+        with open(status_path) as f:
+            assert f.read() == original, 'renew_status 不得被覆盖'
+        assert os.path.exists(os.path.join(tmp_data_dir, 'renew_lock_skip.json'))
+
+    def test_lock_wait_retries_until_released(self, engine, tmp_data_dir):
+        """cron 可以等锁：丢掉当天唯一的续签窗口，代价远大于多等几秒"""
+        holder = open(os.path.join(tmp_data_dir, 'renew.lock'), 'w')
+        fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+        released = []
+
+        def release_soon():
+            time.sleep(0.3)
+            fcntl.flock(holder, fcntl.LOCK_UN)
+            holder.close()
+            released.append(True)
+
+        t = threading.Thread(target=release_soon)
+        t.start()
+        with patch('lib.renew.probe_panel_runtime', return_value=None), \
+             patch('lib.renew.LOCK_RETRY_INTERVAL', 0.1):
+            engine.check_and_renew_all(lock_wait=5)
+        t.join()
+
+        assert released, '锁应已被释放'
+        assert engine.last_abort_reason == '', '等到锁之后应正常执行'
+
+    def test_unopenable_lock_aborts_visibly(self, engine, tmp_data_dir, monkeypatch):
+        """锁文件打不开时不得整轮静默消失"""
+        def boom(*a, **kw):
+            raise OSError('read-only file system')
+
+        monkeypatch.setattr(os, 'open', boom)
+        results = engine.check_and_renew_all()
+        assert results == []
+        assert '锁文件' in engine.last_abort_reason

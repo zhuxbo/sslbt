@@ -28,6 +28,11 @@ RENEW_SLEEP_MAX = 120
 SPREAD_TOTAL_MAX = 600  # 分散延迟总量上限（秒）
 MAX_RENEW_BATCH = 100   # 单次续签证书数量上限
 
+# 抢锁重试间隔（秒）。总等待窗口由调用方给出：cron 可以等，面板同步请求不能
+LOCK_RETRY_INTERVAL = 5
+CRON_LOCK_WAIT = 120    # cron 续签：覆盖典型交互式部署（几秒到几十秒）
+PANEL_LOCK_WAIT = 6     # 面板「续签」按钮：同步 HTTP，超过几秒就是页面卡死
+
 # 服务端"已在处理"类状态统一归一为 processing（只查询、不重复提交、不增计数、不重生 CSR）：
 # 提交响应只会是 pending / processing；查询在 processing → active 之间可能出现短暂中间态 approving
 _PROCESSING_ALIASES = ('processing', 'pending', 'approving')
@@ -134,22 +139,36 @@ class RenewEngine:
         # 二者都返回空列表，但对用户的含义相反
         self.last_abort_reason = ''
 
-    def check_and_renew_all(self, spread=False):
+    def check_and_renew_all(self, spread=False, lock_wait=0):
         """检查并续签所有证书
 
         Args:
             spread: 是否在续签间加随机延迟，避免集中请求 API（cron 调用时为 True）
+            lock_wait: 抢锁最长等待秒数。cron 不赶时间，可以等；面板按钮是同步 HTTP
+                请求，必须短等——窗口若硬编码在这里，点一次按钮会让页面挂住两分钟。
+                手动部署与 cron 共用同一把 data/renew.lock，撞车是真实路径，
+                零重试会让 cron 白白丢掉当天唯一的续签窗口。
         """
         self.last_abort_reason = ''
-        # 并发保护：非阻塞获取进程锁
         lock_path = os.path.join(self._data_dir, 'renew.lock')
-        lock_fd = open(lock_path, 'w')
         try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
+            # O_NOFOLLOW 与 _write_renew_status 的 mkstemp 硬化标准对齐；
+            # 打不开时（data/ 只读、inode 耗尽、路径被换成符号链接）不能让整轮静默消失
+            lock_fd = os.fdopen(
+                os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600), 'w')
+        except OSError as e:
+            self.last_abort_reason = '无法打开续签锁文件: %s' % e
+            if self._logger:
+                self._logger.error("无法打开续签锁文件，本轮中止: %s", str(e))
+            self._write_renew_status([], aborted_reason=self.last_abort_reason)
+            return []
+
+        if not self._acquire_lock(lock_fd, lock_wait):
             lock_fd.close()
+            self.last_abort_reason = '另一个部署或续签任务正在执行，本轮已跳过'
             if self._logger:
                 self._logger.info("另一个续签进程正在运行，跳过本次检查")
+            self._write_lock_skip()
             return []
 
         try:
@@ -157,6 +176,46 @@ class RenewEngine:
         finally:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
             lock_fd.close()
+
+    @staticmethod
+    def _acquire_lock(lock_fd, lock_wait):
+        """非阻塞抢锁，最多重试到 lock_wait 秒；拿到返回 True"""
+        deadline = time.time() + max(0, lock_wait)
+        while True:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return True
+            except OSError:
+                if time.time() >= deadline:
+                    return False
+                time.sleep(min(LOCK_RETRY_INTERVAL, max(0.1, deadline - time.time())))
+
+    def _write_lock_skip(self):
+        """抢锁失败写独立小文件，绝不去读改写 renew_status.json
+
+        那条路径按定义就是没拿到锁的进程，与正在收尾的持锁进程并发读改写会用陈旧快照
+        覆盖对方刚写的真实计数——修一个竞态时不该新造一个。
+        """
+        path = os.path.join(self._data_dir, 'renew_lock_skip.json')
+        data = json.dumps({
+            'at': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+        }, ensure_ascii=False).encode('utf-8')
+        try:
+            fd, tmp = tempfile.mkstemp(dir=self._data_dir, prefix='.lock_skip-', suffix='.tmp')
+        except OSError:
+            return
+        try:
+            try:
+                os.write(fd, data)
+            finally:
+                os.close(fd)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, path)
+        except OSError:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
     def _do_renew_all(self, spread=False):
         """实际续签逻辑（已持有进程锁）"""
@@ -184,56 +243,75 @@ class RenewEngine:
 
         # 阶段 1: 收集需续签的证书和对应 API 客户端
         pending_list = []
+        collect_failures = []
         for cert in certs:
-            if not cert.get('enabled', True):
-                continue
-            order_id = cert.get('order_id')
-            if not order_id:
-                continue
-            meta = cert.get('metadata', {})
-            state = meta.get('last_issue_state', '')
-
-            # 触顶 / 过期 / policy 阻断为终态：静默跳过，不启动新动作、不发回调、不计数
-            if state in TERMINAL_ISSUE_STATES:
-                continue
-
-            renew_mode = self._config.get_renew_mode(cert)
-
-            # 触顶检查（计数分离）：签发（仅 local）与部署各自 >= 10 → 进入 CAPPED，不发回调
-            # 签发触顶只拦截"新的 CSR 提交"；已进入 processing（CSR 已被接受）的证书继续轮询签发，
-            # 不因签发计数被误判触顶而停止部署
-            if renew_mode == RENEW_MODE_LOCAL and state != ISSUE_STATE_PROCESSING \
-                    and meta.get('issue_retry_count', 0) >= MAX_ISSUE_RETRY_COUNT:
-                self._enter_capped(cert, CAP_STAGE_ISSUE)
-                continue
-            if meta.get('deploy_attempt_count', 0) >= MAX_DEPLOY_ATTEMPT_COUNT:
-                self._enter_capped(cert, CAP_STAGE_DEPLOY)
-                continue
-
-            # 到期准入：已过期 → 转 EXPIRED 静默；剩余 < 安全余量 → 本轮不启动新动作
-            hours = _remaining_hours(meta)
-            if hours is not None:
-                if hours <= 0:
-                    self._enter_expired(cert)
-                    continue
-                if hours < SAFETY_MARGIN_HOURS:
-                    if self._logger:
-                        self._logger.info(
-                            "剩余有效期不足安全余量（%.1fh < %dh），本轮不启动新动作: order_id=%s",
-                            hours, SAFETY_MARGIN_HOURS, order_id)
-                    continue
-
-            renew_days = self._config.get_renew_before_days(cert)
-            if not needs_renewal(cert, renew_days):
-                continue
-            api = self._api_factory(cert)
-            if not api:
+            try:
+                self._collect_one(cert, pending_list)
+            except Exception as e:
+                # 逐证书隔离：此前阶段 1 一行 try 都没有，而 APIClient.__init__ 会对
+                # SSRF 命中 / token 非法 / 协议非法主动 raise ValueError——一张证书的
+                # 构造失败会让整批后续证书连一次 API 调用都没有，且 renew_status 保留
+                # 上一轮的成功记录，面板看起来完全健康
+                oid = cert.get('order_id', '?')
                 if self._logger:
-                    self._logger.warning("证书 order_id=%s 缺少 API 配置，跳过续签", order_id)
-                continue
-            pending_list.append((cert, api, renew_mode))
+                    self._logger.error("证书预处理失败，跳过该证书: order_id=%s, error=%s", oid, str(e))
+                collect_failures.append({
+                    'order_id': oid, 'status': 'failure', 'message': '预处理失败: %s' % e})
 
-        # 阶段 2: 截断并计算延迟
+        return self._process_pending(pending_list, spread, collect_failures)
+
+    def _collect_one(self, cert, pending_list):
+        """阶段 1 的单证书前置过滤：命中任一跳过条件即返回，否则追加到待处理列表"""
+        if not cert.get('enabled', True):
+            return
+        order_id = cert.get('order_id')
+        if not order_id:
+            return
+        meta = cert.get('metadata', {})
+        state = meta.get('last_issue_state', '')
+
+        # 触顶 / 过期 / policy 阻断为终态：静默跳过，不启动新动作、不发回调、不计数
+        if state in TERMINAL_ISSUE_STATES:
+            return
+
+        renew_mode = self._config.get_renew_mode(cert)
+
+        # 触顶检查（计数分离）：签发（仅 local）与部署各自 >= 10 → 进入 CAPPED，不发回调
+        # 签发触顶只拦截"新的 CSR 提交"；已进入 processing（CSR 已被接受）的证书继续轮询签发，
+        # 不因签发计数被误判触顶而停止部署
+        if renew_mode == RENEW_MODE_LOCAL and state != ISSUE_STATE_PROCESSING \
+                and meta.get('issue_retry_count', 0) >= MAX_ISSUE_RETRY_COUNT:
+            self._enter_capped(cert, CAP_STAGE_ISSUE)
+            return
+        if meta.get('deploy_attempt_count', 0) >= MAX_DEPLOY_ATTEMPT_COUNT:
+            self._enter_capped(cert, CAP_STAGE_DEPLOY)
+            return
+
+        # 到期准入：已过期 → 转 EXPIRED 静默；剩余 < 安全余量 → 本轮不启动新动作
+        hours = _remaining_hours(meta)
+        if hours is not None:
+            if hours <= 0:
+                self._enter_expired(cert)
+                return
+            if hours < SAFETY_MARGIN_HOURS:
+                if self._logger:
+                    self._logger.info(
+                        "剩余有效期不足安全余量（%.1fh < %dh），本轮不启动新动作: order_id=%s",
+                        hours, SAFETY_MARGIN_HOURS, order_id)
+                return
+
+        renew_days = self._config.get_renew_before_days(cert)
+        if not needs_renewal(cert, renew_days):
+            return
+        api = self._api_factory(cert)
+        if not api:
+            if self._logger:
+                self._logger.warning("证书 order_id=%s 缺少 API 配置，跳过续签", order_id)
+            return
+        pending_list.append((cert, api, renew_mode))
+
+    def _process_pending(self, pending_list, spread, collect_failures):
+        """阶段 2/3：截断、计算延迟、逐个续签并汇总"""
         if len(pending_list) > MAX_RENEW_BATCH:
             if self._logger:
                 self._logger.warning(
@@ -242,12 +320,13 @@ class RenewEngine:
             pending_list = pending_list[:MAX_RENEW_BATCH]
         sleep_min, sleep_max = self._calc_spread_delay(len(pending_list))
 
-        # 阶段 3: 逐个续签
-        results = []
-        for cert, api, renew_mode in pending_list:
+        # 阶段 3: 逐个续签。预处理失败的证书先计入，确保它们出现在汇总与面板里
+        results = list(collect_failures)
+        for idx, (cert, api, renew_mode) in enumerate(pending_list):
             order_id = cert['order_id']
 
-            if spread and results:
+            # 延迟只在证书之间加，第一个不等（idx 而非 results 长度——后者已含预处理失败项）
+            if spread and idx:
                 delay = random.randint(sleep_min, sleep_max)
                 if self._logger:
                     self._logger.info("等待 %d 秒后处理下一个证书", delay)
@@ -371,12 +450,16 @@ class RenewEngine:
         suspected = [r['site_name'] for r in results if r.get('site_missing')]
         if suspected:
             raise RuntimeError("站点疑似已删除，待二次确认: %s" % ','.join(suspected))
-        if fail_count > 0 and self._logger:
+        if fail_count > 0:
+            # 部分失败改判为失败，恢复内部一致性：_deploy_callback_decision 在任一站点失败时
+            # 就已返回 failure 并上报服务端，而此处曾返回 True 让本地汇总与面板显示成功——
+            # 正是 _check_deploy_environment 注释所反对的双口径
             failed = [r['site_name'] for r in results if not r.get('status')]
-            self._logger.warning(
-                "部分站点部署失败: order_id=%s, failed_sites=%s",
-                order_id, ','.join(failed),
-            )
+            if self._logger:
+                self._logger.warning(
+                    "部分站点部署失败: order_id=%s, failed_sites=%s",
+                    order_id, ','.join(failed))
+            raise RuntimeError("部分站点部署失败: %s" % ','.join(failed))
         return True
 
     def _update_renew_before_days(self, api):
@@ -485,6 +568,26 @@ class RenewEngine:
         meta['last_deploy_block_at'] = ''
         if self._logger:
             self._logger.info("Web 服务配置已恢复，清除环境阻断标记: order_id=%s", order_id)
+
+    def _report_block(self, cert_entry, api, order_id, message):
+        """记录部署阻断原因并按变化触发上报一次（与环境闸门同一机制与纪律）
+
+        不递增 deploy_attempt_count：这不是一次"新的部署尝试意图"，且计数会让证书在
+        10 轮后静默 CAPPED，问题修好还要人工解除。
+        """
+        now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        meta = cert_entry.setdefault('metadata', {})
+        prev_reason = meta.get('last_deploy_block_reason', '')
+        if self._logger:
+            self._logger.error("部署阻断: order_id=%s, reason=%s", order_id, message)
+        self._persist_meta(order_id, {
+            'last_deploy_block_reason': message,
+            'last_deploy_block_at': now,
+        })
+        meta['last_deploy_block_reason'] = message
+        meta['last_deploy_block_at'] = now
+        if message != prev_reason:
+            self._send_failure_callback(api, order_id, message)
 
     def _check_deploy_environment(self, cert_entry, api, order_id):
         """部署前环境闸门：Web 配置本就损坏时放弃本轮，返回阻断原因或 None。
@@ -605,9 +708,12 @@ class RenewEngine:
         domains = cert_entry.get('domains', [])
 
         if not site_names:
-            if self._logger:
-                self._logger.warning("未绑定站点，跳过部署")
-            return False
+            # 服务端已签发 active 证书，客户端却没有部署目标：复用既有阻断机制记录原因
+            # （已持久化、已在面板渲染成橙色告警、环境恢复时自动清除），并按失败上报一次。
+            # 此前只记 warning 并返回 False，本轮被计为「等待签发」，服务端零回调，
+            # 面板对已有到期时间的证书显示「正常」——两侧都看不出证书压根没部署上
+            self._report_block(cert_entry, api, order_id, '证书已签发但未绑定任何站点，无法部署')
+            raise RuntimeError('未绑定站点，无法部署')
 
         results = self._deploy_and_report(
             cert_entry, api, fullchain, private_key, site_names, domains, order_id)

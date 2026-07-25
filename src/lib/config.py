@@ -29,6 +29,34 @@ CAP_STAGE_LEGACY = 'legacy'
 # 触顶/过期/policy 阻断为终态：不再启动新动作、不发回调、迁移不再改写
 TERMINAL_ISSUE_STATES = (ISSUE_STATE_CAPPED, ISSUE_STATE_EXPIRED, ISSUE_STATE_POLICY_BLOCKED)
 
+# 部署成功时要清零/清空的 metadata 键（deploy-spec §3.8）。
+# 集中在此而非散在调用点硬编码：漏同步的表现是「面板显示一个已经消失的旧原因」——
+# 测试不会变红、用户也不会报，只会某天让人对面板失去信任。
+# 值为该键的重置值；调用方在其上叠加本次部署的新值（last_deploy_at 等）。
+DEPLOY_SUCCESS_RESET_KEYS = {
+    'last_issue_state': '',
+    'issue_retry_count': 0,
+    'deploy_attempt_count': 0,
+    'deploy_started': False,
+    'csr_submitted_at': '',
+    'last_csr_hash': '',
+    'last_deploy_block_reason': '',
+    'last_deploy_block_at': '',
+}
+
+# 用户手动「恢复自动续签」时要清除的键（reset_issue_state）。
+# 与部署成功集的差异：不含 last_csr_hash（在途 CSR 标记由恢复流程自行判断），
+# 额外含 cap_stage（触顶阶段仅在终态下有意义）。
+MANUAL_RESET_KEYS = {
+    'last_issue_state': '',
+    'cap_stage': '',
+    'issue_retry_count': 0,
+    'deploy_attempt_count': 0,
+    'deploy_started': False,
+    'last_deploy_block_reason': '',
+    'last_deploy_block_at': '',
+}
+
 
 def domains_contain_ip(domains):
     """判断域名列表是否含 IP（IPv4/IPv6）"""
