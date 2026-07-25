@@ -148,6 +148,8 @@
   .ssl-btn-success:hover { background: #85ce61; border-color: #85ce61; }
   .ssl-btn-danger { color: #fff; background: #f56c6c; border-color: #f56c6c; }
   .ssl-btn-danger:hover { background: #f78989; border-color: #f78989; }
+  .ssl-btn-warning { color: #fff; background: #e6a23c; border-color: #e6a23c; }
+  .ssl-btn-warning:hover { background: #ebb563; border-color: #ebb563; }
   .ssl-btn-sm { padding: 0 10px; font-size: 12px; height: 28px; line-height: 28px; }
 
   /* 下拉框 */
@@ -479,14 +481,68 @@
       }, promptRestart);
     },
 
+    // ===== 续签终态识别 =====
+    // CAPPED / EXPIRED / policy 阻断下续签引擎不再启动新动作且不发回调（deploy-spec §3.2），
+    // 面板是用户侧唯一提示入口，不能让这些证书继续显示为「正常」。
+    _CAP_STAGE_LABEL: {
+      issue: '签发重试超限',
+      deploy: '部署重试超限',
+      legacy: '升级前已超限'
+    },
+
+    _haltInfo: function (cert) {
+      var m = cert.metadata || {};
+      var s = m.last_issue_state || '';
+      if (!s || s === 'processing') return null;
+      if (s === 'CAPPED') {
+        var stage = P._CAP_STAGE_LABEL[m.cap_stage || ''] || '重试超限';
+        return { label: '已停更（' + stage + '）', level: 'danger', halted: true };
+      }
+      if (s === 'EXPIRED') {
+        return { label: '已过期停更', level: 'danger', halted: true };
+      }
+      if (s === 'policy_blocked_needs_setup') {
+        return { label: '需重设续签策略', level: 'warning', halted: true };
+      }
+      // 订单终态（cancelled / revoked 等）：续签引擎已停止等待人工处理
+      return { label: '订单异常: ' + s, level: 'warning', halted: true };
+    },
+
+    // 详情页「续签状态」行：终态标签 + 计数 + 环境阻断原因
+    _renewStateHtml: function (cert) {
+      var m = cert.metadata || {};
+      var halt = P._haltInfo(cert);
+      var parts = [];
+      if (halt) {
+        parts.push('<span class="ssl-tag ssl-tag-' + halt.level + '">' + P._e(halt.label) + '</span>');
+        parts.push('<span style="color:#909399">已停止自动续签，需人工处理</span>');
+      } else if ((m.last_issue_state || '') === 'processing') {
+        parts.push('<span class="ssl-tag ssl-tag-primary">等待签发</span>');
+      } else {
+        parts.push('<span class="ssl-tag ssl-tag-success">自动续签中</span>');
+      }
+      var issued = m.issue_retry_count || 0;
+      var deployed = m.deploy_attempt_count || 0;
+      if (issued || deployed) {
+        parts.push('<span style="color:#909399">签发尝试 ' + issued + ' / 部署尝试 ' + deployed + '</span>');
+      }
+      if (m.last_deploy_block_reason) {
+        parts.push('<span style="color:#e6a23c">环境阻断（' + P._fmtTime(m.last_deploy_block_at || '') + '）: '
+          + P._e(m.last_deploy_block_reason) + '</span>');
+      }
+      return parts.join('<span class="ssl-stat-sep">|</span>');
+    },
+
     // ===== 统计计算 =====
     _calcStats: function (certs) {
-      var total = certs.length, enabled = 0, expiring = 0, expired = 0;
+      var total = certs.length, enabled = 0, expiring = 0, expired = 0, halted = 0;
       var now = new Date();
       var threshold = 14 * 24 * 60 * 60 * 1000;
       for (var i = 0; i < certs.length; i++) {
         var c = certs[i];
         if (c.enabled !== false) enabled++;
+        var halt = P._haltInfo(c);
+        if (halt && halt.halted) halted++;
         var exp = (c.metadata || {}).cert_expires_at || '';
         if (!exp) continue;
         try {
@@ -496,7 +552,7 @@
           else if (diff <= threshold) expiring++;
         } catch (e) {}
       }
-      return { total: total, enabled: enabled, expiring: expiring, expired: expired };
+      return { total: total, enabled: enabled, expiring: expiring, expired: expired, halted: halted };
     },
 
     _renderStatsBar: function (stats) {
@@ -509,6 +565,8 @@
       h += '即将过期 <span class="ssl-stat-num" style="color:' + (stats.expiring > 0 ? '#e6a23c' : '') + '">' + stats.expiring + '</span>';
       h += '<span class="ssl-stat-sep">|</span>';
       h += '已过期 <span class="ssl-stat-num" style="color:' + (stats.expired > 0 ? '#f56c6c' : '') + '">' + stats.expired + '</span>';
+      h += '<span class="ssl-stat-sep">|</span>';
+      h += '已停更 <span class="ssl-stat-num" style="color:' + (stats.halted > 0 ? '#f56c6c' : '') + '">' + stats.halted + '</span>';
       h += '</div>';
       h += '<div class="ssl-stats-right">';
       h += '<button class="ssl-btn ssl-btn-success ssl-btn-sm" onclick="sslbt.addCert()">一键部署</button>';
@@ -526,6 +584,9 @@
       var deployed = m.last_deploy_at || '';
       var sites = cert.site_name || [];
       if (typeof sites === 'string') sites = sites ? [sites] : [];
+      // 终态优先于到期判断：这些证书已停止自动续签，不能显示为「正常」
+      var halt = P._haltInfo(cert);
+      if (halt) return '<span class="ssl-tag ssl-tag-' + halt.level + '">' + P._e(halt.label) + '</span>';
       if (!exp) {
         if (!sites.length) return '<span class="ssl-tag ssl-tag-info">未绑定</span>';
         if (!deployed) return '<span class="ssl-tag ssl-tag-primary">待部署</span>';
@@ -646,6 +707,7 @@
       }
       h += '<div class="ssl-detail-item"><span class="ssl-detail-label">API 配置</span><span class="ssl-detail-val">' + apiInfo + '</span></div>';
       h += '<div class="ssl-detail-item"><span class="ssl-detail-label">上次部署</span><span class="ssl-detail-val">' + P._fmtTime(lastDeploy) + '</span></div>';
+      h += '<div class="ssl-detail-item"><span class="ssl-detail-label">续签状态</span><span class="ssl-detail-val">' + P._renewStateHtml(d) + '</span></div>';
       h += '</div>';
 
       // 绑定站点（与证书信息同布局）
@@ -679,6 +741,9 @@
 
       // 操作按钮
       h += '<div class="ssl-detail-actions">';
+      if (P._haltInfo(d)) {
+        h += '<button class="ssl-btn ssl-btn-warning ssl-btn-sm" onclick="sslbt.resetIssueState(' + oid + ')">恢复自动续签</button>';
+      }
       h += '<button class="ssl-btn ssl-btn-success ssl-btn-sm" onclick="sslbt.deployCert(' + oid + ')">部署</button>';
       h += '<button class="ssl-btn ssl-btn-sm" onclick="sslbt.checkCert(' + oid + ')">检查</button>';
       h += '<button class="ssl-btn ssl-btn-sm" onclick="sslbt.editCert(' + oid + ')">编辑</button>';
@@ -864,11 +929,9 @@
       var closeLoading = P._loading('正在添加...');
 
       var total = certs.length;
-      var done = 0;
       var results = [];
       var deployResults = [];
 
-      var deployPending = 0;
       var finishAll = function () {
         closeLoading();
         var addOk = 0, addFail = [];
@@ -891,30 +954,26 @@
         P._certCache = {};
         P.loadCerts();
       };
-      for (var i = 0; i < certs.length; i++) {
-        (function (idx) {
-          var c = certs[idx];
-          var sites = certSites[idx] || [];
-          P._call('add_cert', {
-            order_id: c.order_id,
-            site_names: sites.join(','),
-            renew_mode: '',
-            session_id: c._session_id || ''
-          }, function (r) {
-            results.push({ order_id: c.order_id, status: r.status, msg: r.msg });
-            if (r.status && sites.length) {
-              deployPending++;
-              P._call('deploy_cert', { order_id: c.order_id }, function (dr) {
-                deployResults.push({ order_id: c.order_id, status: dr && dr.status, msg: dr && dr.msg });
-                deployPending--;
-                if (done === total && deployPending === 0) finishAll();
-              });
-            }
-            done++;
-            if (done === total && deployPending === 0) finishAll();
+      // 串行处理：部署持有全局互斥锁（与 cron 续签共用），并发发起会互相抢锁失败
+      var step = function (idx) {
+        if (idx >= total) { finishAll(); return; }
+        var c = certs[idx];
+        var sites = certSites[idx] || [];
+        P._call('add_cert', {
+          order_id: c.order_id,
+          site_names: sites.join(','),
+          renew_mode: '',
+          session_id: c._session_id || ''
+        }, function (r) {
+          results.push({ order_id: c.order_id, status: r.status, msg: r.msg });
+          if (!(r.status && sites.length)) { step(idx + 1); return; }
+          P._call('deploy_cert', { order_id: c.order_id }, function (dr) {
+            deployResults.push({ order_id: c.order_id, status: dr && dr.status, msg: dr && dr.msg });
+            step(idx + 1);
           });
-        })(i);
-      }
+        });
+      };
+      step(0);
     },
 
     // ===== 证书操作 =====
@@ -927,7 +986,8 @@
           closeLoading();
           if (r.need_key) { sslbt._askPrivateKey(oid); return; }
           layer.msg(r.msg, { icon: r.status ? 1 : 2 });
-          if (r.status) { delete P._certCache[oid]; P.loadCerts(); }
+          // 部分站点成功时后端返回 status=false，状态已变化，同样要刷新
+          delete P._certCache[oid]; P.loadCerts();
         });
       };
       if (extraParams) { doIt(); return; }
@@ -954,6 +1014,19 @@
       });
     },
 
+    // 终态（CAPPED / EXPIRED / policy 阻断 / 订单异常）后清除本地计数与状态，
+    // 让续签引擎下一轮重新接手。签发触顶的证书订单卡在 pending 时，这是唯一出路。
+    resetIssueState: function (oid) {
+      layer.confirm('确定恢复订单 ' + oid + ' 的自动续签？将清除本地重试计数与停更状态。',
+        { offset: 'auto', closeBtn: 2 }, function (idx) {
+          layer.close(idx);
+          P._call('reset_issue_state', { order_id: oid }, function (r) {
+            layer.msg(r.msg, { icon: r.status ? 1 : 2 });
+            if (r.status) { delete P._certCache[oid]; P.loadCerts(); }
+          });
+        });
+    },
+
     _getSelectedOids: function () {
       var oids = [];
       $('.ssl-cert-cb:checked').each(function () { oids.push($(this).data('oid')); });
@@ -970,7 +1043,8 @@
         P._call('deploy_all', params, function (r) {
           closeLoading();
           layer.msg(r.msg, { icon: r.status ? 1 : 2 });
-          if (r.status) { P._certCache = {}; P.loadCerts(); }
+          // 部分失败时后端返回 status=false，但已有站点写入成功，仍需刷新列表
+          P._certCache = {}; P.loadCerts();
         });
       });
     },
@@ -1158,8 +1232,10 @@
         var rs = r.data || [];
         if (!rs.length) { layer.msg('无需续签的证书', { icon: 1 }); return; }
         var h = '<div style="padding:15px 20px"><table class="ssl-table"><thead><tr><th>订单</th><th>状态</th><th>信息</th></tr></thead><tbody>';
+        // message 可能含 nginx 配置诊断等任意文本，必须转义
         for (var i = 0; i < rs.length; i++)
-          h += '<tr><td>' + rs[i].order_id + '</td><td>' + rs[i].status + '</td><td>' + rs[i].message + '</td></tr>';
+          h += '<tr><td>' + P._e(rs[i].order_id) + '</td><td>' + P._e(rs[i].status)
+            + '</td><td>' + P._e(rs[i].message) + '</td></tr>';
         h += '</tbody></table></div>';
         layer.open({ type: 1, closeBtn: 2, title: '续签结果', area: ['560px', '400px'], offset: 'auto', content: h });
         P._certCache = {};

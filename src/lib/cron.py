@@ -175,9 +175,10 @@ class CronManager:
     def _build_script(self):
         """构建续签检查脚本
 
-        使用注册时进程的解释器（面板 Python，sys.executable）而非裸 python3，
+        优先使用注册时进程的解释器（面板 Python，sys.executable）而非裸 python3，
         避免面板 pyenv 与系统 python3 环境不一致导致续签整体不可运行。
-        取不到时回退 python3；旧条目经 setup() 的 remove+重建替换。
+        脚本内做存在性检查：面板 Python 升级/迁移后该绝对路径会失效，届时回退
+        PATH 中的 python3，避免计划任务静默不再运行（脚本只在 setup 时重建）。
         """
         log_file = '%s/logs/cron.log' % self._data_dir
         python_bin = sys.executable or 'python3'
@@ -188,7 +189,10 @@ if [ -f "$LOG_FILE" ] && [ "$(wc -l < "$LOG_FILE")" -gt 1000 ]; then
     tail -500 "$LOG_FILE" > "$LOG_FILE.tmp" && mv "$LOG_FILE.tmp" "$LOG_FILE"
 fi
 cd "%s"
-"%s" -c "
+# 注册时的面板解释器；路径失效（面板 Python 升级/迁移）时回退 PATH 中的 python3
+PY_BIN="%s"
+[ -x "$PY_BIN" ] || PY_BIN="$(command -v python3)"
+"$PY_BIN" -c "
 import sys
 sys.path.insert(0, '/www/server/panel/class/')
 sys.path.insert(0, '%s')

@@ -1452,3 +1452,184 @@ class TestUpdateClearsPolicyBlocked:
         assert cert['renew_mode'] == 'local'
         assert cert['validation_method'] == 'file'
         assert cert['metadata']['last_issue_state'] == ''
+
+
+class TestResetIssueState:
+    """终态手动恢复入口：清除停更状态与本地计数（deploy-spec §3.2）"""
+
+    def _add(self, plugin, order_id=900):
+        plugin._config.add_cert(order_id=order_id, cert_name='c', domains=['a.example.com'],
+                                api_url='https://api.example.com', api_token=TOKEN)
+        return order_id
+
+    def test_clears_capped_and_counts(self, plugin):
+        oid = self._add(plugin)
+        plugin._config.update_metadata(oid, {
+            'last_issue_state': 'CAPPED',
+            'cap_stage': 'issue',
+            'issue_retry_count': 10,
+            'deploy_attempt_count': 4,
+            'deploy_started': True,
+            'last_deploy_block_reason': 'Web 服务配置校验失败: boom',
+            'last_deploy_block_at': '2026-07-01T00:00:00Z',
+        })
+        result = plugin.reset_issue_state({'order_id': str(oid)})
+        assert result['status'] is True
+        meta = plugin._config.get_cert(oid)['metadata']
+        assert meta['last_issue_state'] == ''
+        assert meta['cap_stage'] == ''
+        assert meta['issue_retry_count'] == 0
+        assert meta['deploy_attempt_count'] == 0
+        assert meta['deploy_started'] is False
+        assert meta['last_deploy_block_reason'] == ''
+        assert meta['last_deploy_block_at'] == ''
+
+    def test_reset_makes_renewal_eligible_again(self, plugin):
+        """恢复后续签引擎重新接手：不再命中终态跳过、也不再命中触顶"""
+        from lib.config import TERMINAL_ISSUE_STATES, MAX_ISSUE_RETRY_COUNT
+
+        oid = self._add(plugin, 901)
+        plugin._config.update_metadata(oid, {
+            'last_issue_state': 'CAPPED', 'cap_stage': 'issue',
+            'issue_retry_count': MAX_ISSUE_RETRY_COUNT,
+        })
+        plugin.reset_issue_state({'order_id': str(oid)})
+        meta = plugin._config.get_cert(oid)['metadata']
+        assert meta['last_issue_state'] not in TERMINAL_ISSUE_STATES
+        assert meta['issue_retry_count'] < MAX_ISSUE_RETRY_COUNT
+
+    def test_missing_order_id(self, plugin):
+        assert plugin.reset_issue_state({})['status'] is False
+
+    def test_unknown_order(self, plugin):
+        assert plugin.reset_issue_state({'order_id': '99999'})['status'] is False
+
+
+class TestRenewStatusSymlinkGuard:
+    def test_rejects_symlink(self, plugin, tmp_data_dir):
+        """状态文件被替换为符号链接时拒绝读取，与其他状态文件读写约定一致"""
+        target = os.path.join(tmp_data_dir, 'outside.json')
+        with open(target, 'w', encoding='utf-8') as f:
+            json.dump({'last_run': 'x'}, f)
+        link = os.path.join(tmp_data_dir, 'renew_status.json')
+        os.symlink(target, link)
+        result = plugin.get_renew_status()
+        assert result['status'] is False
+        assert '符号链接' in result['msg']
+
+
+class TestDeployLockBusyMessage:
+    """部署/续签互斥锁：提示语不再谎称是续签任务，且先重试再放弃"""
+
+    def test_busy_message_mentions_deploy_or_renew(self, plugin, tmp_data_dir, monkeypatch):
+        import sslbt_main as main_mod
+
+        monkeypatch.setattr(main_mod, 'LOCK_RETRIES', 2)
+        monkeypatch.setattr(main_mod, 'LOCK_RETRY_INTERVAL', 0)
+        holder = open(os.path.join(tmp_data_dir, 'renew.lock'), 'w')
+        fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            result = plugin.deploy_cert({'order_id': '1'})
+        finally:
+            fcntl.flock(holder, fcntl.LOCK_UN)
+            holder.close()
+        assert result['status'] is False
+        assert result['msg'] == main_mod.BUSY_MSG
+        assert '部署' in result['msg'] and '续签' in result['msg']
+
+    def test_retries_before_giving_up(self, plugin, tmp_data_dir, monkeypatch):
+        """抢锁失败先重试若干次，覆盖面板并发请求的短窗口"""
+        import sslbt_main as main_mod
+
+        sleeps = []
+        monkeypatch.setattr(main_mod, 'LOCK_RETRIES', 3)
+        monkeypatch.setattr(main_mod, 'LOCK_RETRY_INTERVAL', 0)
+        monkeypatch.setattr(main_mod.time, 'sleep', lambda s: sleeps.append(s))
+        holder = open(os.path.join(tmp_data_dir, 'renew.lock'), 'w')
+        fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            plugin.deploy_all({})
+        finally:
+            fcntl.flock(holder, fcntl.LOCK_UN)
+            holder.close()
+        assert len(sleeps) == 2  # 3 次尝试之间等待 2 次
+
+    def test_nested_deploy_reenters_without_new_lock(self, plugin):
+        """deploy_all 内部嵌套 deploy_cert 走可重入分支，不再抢锁"""
+        with plugin._renew_lock() as outer:
+            assert outer is True
+            with plugin._renew_lock() as inner:
+                assert inner is True
+
+
+class TestManualDeployEnvironmentGate:
+    """手动部署遇到坏配置必须直接给出原因，而不是只报「0 成功 N 失败」"""
+
+    @pytest.fixture(autouse=True)
+    def _broken_config(self, monkeypatch):
+        import public
+        monkeypatch.setattr(
+            public, 'checkWebConfig',
+            lambda: 'nginx: [emerg] unknown directive "-" in /www/.../a.conf:13\n'
+                    'nginx: configuration file test failed')
+
+    def _add(self, plugin, order_id=950):
+        plugin._config.add_cert(order_id=order_id, cert_name='c', domains=['a.example.com'],
+                                site_names=['a.example.com'],
+                                api_url='https://api.example.com', api_token=TOKEN)
+        return order_id
+
+    def test_deploy_cert_reports_reason(self, plugin):
+        oid = self._add(plugin)
+        result = plugin.deploy_cert({'order_id': str(oid)})
+        assert result['status'] is False
+        assert 'Web 服务配置校验失败（非本次部署导致' in result['msg']
+        assert 'unknown directive' in result['msg']
+        assert '成功' not in result['msg']
+
+    def test_deploy_cert_fails_before_api_query(self, plugin):
+        """环境闸门在查询 API 之前，避免无谓的网络往返"""
+        oid = self._add(plugin, 951)
+        api = MagicMock()
+        with patch.object(plugin, '_get_api_for_cert', return_value=api):
+            plugin.deploy_cert({'order_id': str(oid)})
+        api.query_order.assert_not_called()
+
+    def test_deploy_all_fails_whole_batch_once(self, plugin):
+        self._add(plugin, 952)
+        self._add(plugin, 953)
+        result = plugin.deploy_all({})
+        assert result['status'] is False
+        assert 'Web 服务配置校验失败（非本次部署导致' in result['msg']
+
+    def test_reason_is_single_line_and_capped(self, plugin):
+        oid = self._add(plugin, 954)
+        msg = plugin.deploy_cert({'order_id': str(oid)})['msg']
+        assert '\n' not in msg
+
+
+class TestRenewSummaryMessage:
+    """续签汇总口径：全失败时不得显示成功语气"""
+
+    def test_summary_counts(self, plugin):
+        results = [
+            {'order_id': 1, 'status': 'success'},
+            {'order_id': 2, 'status': 'pending'},
+            {'order_id': 3, 'status': 'failure'},
+            {'order_id': 4, 'status': 'failure'},
+        ]
+        msg = plugin._renew_summary(results)
+        assert msg == '续签检查完成：1 成功，1 等待，2 失败'
+
+    def test_summary_empty(self, plugin):
+        assert plugin._renew_summary([]) == '续签检查完成：无需续签'
+
+    def test_run_renew_msg_reflects_failures(self, plugin, monkeypatch):
+        from lib import renew as renew_mod
+
+        monkeypatch.setattr(
+            renew_mod.RenewEngine, 'check_and_renew_all',
+            lambda self, spread=False: [{'order_id': 1, 'status': 'failure', 'message': 'boom'}])
+        result = plugin.run_renew()
+        assert result['status'] is True  # 检查本身跑完了，明细在 data 里
+        assert '0 成功' in result['msg'] and '1 失败' in result['msg']

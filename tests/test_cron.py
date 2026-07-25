@@ -230,3 +230,29 @@ class TestCronManager:
         assert 'LOG_FILE=' in script
         assert 'tail -500' in script
         assert 'cron.log' in script
+
+
+class TestCronInterpreterFallback:
+    """cron 脚本解释器回退：面板 Python 升级/迁移后路径失效不得静默停跑（D1）"""
+
+    def test_script_falls_back_to_path_python3(self, tmp_data_dir):
+        from lib.cron import CronManager
+
+        script = CronManager(tmp_data_dir)._build_script()
+        assert 'PY_BIN=' in script
+        assert '[ -x "$PY_BIN" ] || PY_BIN="$(command -v python3)"' in script
+        assert '"$PY_BIN" -c' in script
+
+    def test_script_prefers_registering_interpreter(self, tmp_data_dir, monkeypatch):
+        import lib.cron as cron_mod
+        from lib.cron import CronManager
+
+        monkeypatch.setattr(cron_mod.sys, 'executable', '/www/server/panel/pyenv/bin/python')
+        script = CronManager(tmp_data_dir)._build_script()
+        assert 'PY_BIN="/www/server/panel/pyenv/bin/python"' in script
+
+    def test_script_still_matched_by_plugin_dir_lookup(self, tmp_data_dir):
+        """脚本仍需包含插件路径，否则 _find_cron_ids 的 LIKE 匹配失效"""
+        from lib.cron import CronManager, PLUGIN_DIR
+
+        assert PLUGIN_DIR in CronManager(tmp_data_dir)._build_script()

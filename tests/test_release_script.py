@@ -339,3 +339,36 @@ def test_remote_installer_rejects_missing_checksum():
     assert '版本索引缺少 sslbt.zip 的 SHA256，拒绝安装' in content
     assert '跳过 SHA256 校验' not in content
     assert "cfg['upgrade_channel'] = channel" in content
+
+
+def test_publish_verifies_each_node_exactly_once(tmp_path):
+    """正常发布路径只做一次全节点验收
+
+    publish_nodes 以「失败即回滚」语义验收后，收尾的 finish_forward_transaction
+    不再重复验收：其间无任何远端写、发布锁仍持有，第二遍不可能得出不同结果，
+    只会为每个节点多花 2~3 次 SSH 往返。
+    """
+    env, nodes = mock_release_env(tmp_path)
+    bundle = tmp_path / 'bundle'
+    result = run_release(['--dev', '9.9.1-rc.1', '--bundle', str(bundle)], env)
+
+    for name in ('one', 'two'):
+        assert result.stdout.count('%s 资产与索引一致' % name) == 1, result.stdout
+    for node in nodes:
+        assert (node / 'dev' / 'v9.9.1-rc.1' / 'sslbt.zip').exists()
+
+
+def test_forward_only_path_still_verifies(tmp_path):
+    """索引已是候选的快路径（中断恢复）没有人验收过，收尾必须自行验收"""
+    env, nodes = mock_release_env(tmp_path)
+    bundle = tmp_path / 'bundle'
+    run_release(['--prepare', '9.9.2-rc.1', '--bundle', str(bundle)], env)
+    run_release(['--stage', str(bundle)], env)
+    failing_env = dict(env, FAIL_CLEANUP_HOST='node2')
+    assert run_release(['--publish', str(bundle)], failing_env, check=False).returncode != 0
+
+    result = run_release(['--publish', str(bundle)], env)
+    for name in ('one', 'two'):
+        assert '%s 资产与索引一致' % name in result.stdout, result.stdout
+    for node in nodes:
+        assert json.loads((node / 'releases.json').read_text())['dev']['latest'] == '9.9.2-rc.1'

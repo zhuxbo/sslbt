@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 
 from . import cert_utils
 from .api_client import APIError
-from .deployer import DeployError
+from .deployer import DeployError, check_web_config
 from .config import (
     MAX_ISSUE_RETRY_COUNT, MAX_DEPLOY_ATTEMPT_COUNT,
     ISSUE_STATE_PROCESSING, ISSUE_STATE_CAPPED, ISSUE_STATE_EXPIRED,
@@ -60,6 +60,12 @@ def _remaining_hours(meta):
     except (ValueError, AttributeError):
         return None
     return (exp_dt - datetime.now(timezone.utc)).total_seconds() / 3600.0
+
+
+def _compact_reason(text, limit=300):
+    """压平多行诊断为单行并限长：面板与回调都直接展示，原样带换行会撑爆布局"""
+    compact = ' '.join(str(text).split())
+    return compact[:limit] + '...' if len(compact) > limit else compact
 
 
 def _deploy_callback_decision(results):
@@ -440,12 +446,59 @@ class RenewEngine:
             self._config.update_metadata(order_id, {'deploy_started': False})
             meta['deploy_started'] = False
 
+    def _clear_deploy_block(self, cert_entry, order_id):
+        """环境恢复后清除阻断标记，避免面板一直显示已消失的旧原因"""
+        meta = cert_entry.setdefault('metadata', {})
+        if not meta.get('last_deploy_block_reason') and not meta.get('last_deploy_block_at'):
+            return
+        self._persist_meta(order_id, {'last_deploy_block_reason': '', 'last_deploy_block_at': ''})
+        meta['last_deploy_block_reason'] = ''
+        meta['last_deploy_block_at'] = ''
+        if self._logger:
+            self._logger.info("Web 服务配置已恢复，清除环境阻断标记: order_id=%s", order_id)
+
+    def _check_deploy_environment(self, cert_entry, api, order_id):
+        """部署前环境闸门：Web 配置本就损坏时放弃本轮，返回阻断原因或 None。
+
+        计数语义：环境阻断不是"一个新的部署尝试意图"，不递增 deploy_attempt_count——
+        否则一个无关站点的坏配置会在 10 轮后把所有证书静默推入 CAPPED，且配置修好后
+        还要人工解除。不计数则修好即自动恢复。
+
+        回调语义：仍按"明确部署失败"上报一次（spec §2.8 排除的只有触顶/过期/policy 阻断）。
+        服务端以"订单最新一条上报仍为 failure"做状态判定并按 TTL 提醒，不上报会让该订单
+        从服务端的失败视图里消失，才是真正的静默过期。
+
+        本轮结果同样计为失败而非等待：既然已按 failure 上报服务端，本地汇总与面板
+        必须给出一致口径，否则用户看到"续签成功"却什么都没发生。
+        """
+        env_err = check_web_config()
+        if not env_err:
+            self._clear_deploy_block(cert_entry, order_id)
+            return None
+        now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        message = 'Web 服务配置校验失败（非本次部署导致）: %s' % _compact_reason(env_err)
+        if self._logger:
+            self._logger.error("环境阻断，本轮跳过部署且不计数: order_id=%s, error=%s", order_id, env_err)
+        self._persist_meta(order_id, {
+            'last_deploy_block_reason': message,
+            'last_deploy_block_at': now,
+        })
+        meta = cert_entry.setdefault('metadata', {})
+        meta['last_deploy_block_reason'] = message
+        meta['last_deploy_block_at'] = now
+        self._send_failure_callback(api, order_id, message)
+        return message
+
     def _deploy_and_report(self, cert_entry, api, fullchain, key_pem, site_names, domains, order_id):
-        """编排层统一部署：递增部署意图 → 底层部署（抑制回调）→ 结果落盘后统一发部署结果回调。
+        """编排层统一部署：环境闸门 → 递增部署意图 → 底层部署（抑制回调）→ 结果落盘后统一回调。
 
         底层 deploy_multi 只返回结构化结果、不自行回调；每次成功与每次明确失败各尽力上报一次；
-        第 10 次（最后一次）失败在 message 标注"已达重试上限"。返回底层结果列表。
+        第 10 次（最后一次）失败在 message 标注"已达重试上限"。返回底层结果列表；
+        环境阻断时已上报 failure，抛 RuntimeError 让本轮按失败收敛（口径与服务端一致）。
         """
+        block_reason = self._check_deploy_environment(cert_entry, api, order_id)
+        if block_reason:
+            raise RuntimeError(block_reason)
         count = self._begin_deploy_attempt(order_id, cert_entry)
         at_cap = count >= MAX_DEPLOY_ATTEMPT_COUNT
         now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
@@ -879,6 +932,13 @@ class RenewEngine:
     def _save_pending_key(self, cert_entry, key_pem):
         path = self._pending_key_path(cert_entry)
         os.makedirs(os.path.dirname(path), exist_ok=True)
+        # 先删残留再以 O_EXCL 创建：O_EXCL 对悬空符号链接同样报 FileExistsError，
+        # 不清理会让该证书每轮续签都异常（与 _save_pending_csr 同一处理）
+        try:
+            if os.path.lexists(path):
+                os.remove(path)
+        except OSError:
+            pass
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
             os.write(fd, key_pem.encode('utf-8'))
@@ -897,7 +957,8 @@ class RenewEngine:
     def _cleanup_pending_key(self, cert_entry):
         path = self._pending_key_path(cert_entry)
         try:
-            if os.path.isfile(path):
+            # lexists 而非 isfile：悬空符号链接也要清掉，否则下次 O_EXCL 创建失败
+            if os.path.lexists(path):
                 os.remove(path)
             # 清理空目录
             dir_path = os.path.dirname(path)

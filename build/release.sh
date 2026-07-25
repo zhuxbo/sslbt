@@ -497,7 +497,8 @@ publish_nodes() {
             die "全节点验收失败，已尝试回滚公开索引和资产"
         fi
     done
-    finish_forward_transaction
+    # 刚以「失败即回滚」语义全节点验收过，收尾无需重复验收（其间无任何远端写、锁仍持有）
+    finish_forward_transaction verified
 }
 
 rollback_nodes() {
@@ -525,10 +526,14 @@ rollback_nodes() {
 }
 
 finish_forward_transaction() {
-    local server
-    for server in "${SERVERS[@]}"; do
-        verify_one_node "$server" || die "forward-only 全节点验收失败；保留原事务继续恢复"
-    done
+    # $1 = verified 表示调用方刚完成全节点验收，跳过重复验收；
+    # 从「索引已是候选」快路径（含 --resume 中断恢复）进入时无人验收过，必须自行验收
+    local server verified="${1:-}"
+    if [ "$verified" != verified ]; then
+        for server in "${SERVERS[@]}"; do
+            verify_one_node "$server" || die "forward-only 全节点验收失败；保留原事务继续恢复"
+        done
+    fi
     assert_all_indexes_candidate
     for server in "${SERVERS[@]}"; do
         cleanup_one_node "$server" || die "旧版本清理失败；保留 bundle 后重新验收"

@@ -595,8 +595,8 @@ class TestRenewEngine:
         mock_api.query_order.assert_not_called()
 
     @patch('lib.renew.os.remove', side_effect=OSError('permission denied'))
-    @patch('lib.renew.os.path.isfile', return_value=True)
-    def test_cleanup_pending_key_failure_logs_error(self, mock_isfile, mock_remove, engine):
+    @patch('lib.renew.os.path.lexists', return_value=True)
+    def test_cleanup_pending_key_failure_logs_error(self, mock_lexists, mock_remove, engine):
         """cleanup 失败记录 error 日志"""
         cert = _make_cert_entry(10)
         engine._cleanup_pending_key(cert)
@@ -1766,3 +1766,176 @@ class TestCallbackOwnershipConvergence:
         meta = config.get_cert(6401)['metadata']
         assert meta['deploy_attempt_count'] == 0
         assert meta.get('deploy_started') is False
+
+
+class TestDeployEnvironmentGate:
+    """Web 配置损坏时的环境闸门：不计数、发回调、修好即自愈（B2）
+
+    核心风险：checkWebConfig 天然全局，任何无关站点的坏配置都会命中。若按部署尝试
+    计数，10 轮后全部证书静默进入 CAPPED；不计数则配置修好后自动恢复。
+    """
+
+    @pytest.fixture
+    def engine(self, tmp_data_dir):
+        config = ConfigManager(tmp_data_dir)
+        mock_api = MagicMock()
+        api_factory = MagicMock(return_value=mock_api)
+        deployer = MagicMock()
+        deployer.deploy_multi.return_value = [
+            {'site_name': 'example.com', 'status': True, 'message': '部署成功'}]
+        eng = RenewEngine(config, api_factory, deployer, MagicMock())
+        eng._mock_api = mock_api
+        return eng
+
+    def _seed(self, engine, order_id=7100):
+        cert = _make_cert_entry(10, order_id=order_id)
+        engine._config.add_cert(
+            order_id=cert['order_id'], cert_name=cert['cert_name'],
+            domains=cert['domains'], site_names=cert['site_name'],
+        )
+        engine._config.update_metadata(cert['order_id'], cert['metadata'])
+        engine._mock_api.query_order.return_value = {
+            'status': 'active',
+            'certificate': '---CERT---',
+            'ca_certificate': '---CA---',
+            'private_key': '---KEY---',
+        }
+        return engine._config.get_cert(cert['order_id'])
+
+    @staticmethod
+    def _break_config(monkeypatch, broken=True):
+        import public
+        monkeypatch.setattr(
+            public, 'checkWebConfig',
+            (lambda: 'nginx: [emerg] unrelated site broken') if broken else (lambda: True))
+
+    def test_blocked_does_not_deploy_or_count(self, engine, monkeypatch):
+        self._break_config(monkeypatch)
+        cert = self._seed(engine)
+        # 已按 failure 上报服务端，本地口径必须一致：本轮计为失败而非等待
+        with pytest.raises(RuntimeError, match='Web 服务配置校验失败'):
+            engine._renew_pull(cert, engine._mock_api)
+        engine._deployer.deploy_multi.assert_not_called()
+        meta = engine._config.get_cert(cert['order_id'])['metadata']
+        assert meta.get('deploy_attempt_count', 0) == 0
+        assert meta.get('deploy_started', False) is False
+
+    def test_blocked_reports_failure_callback(self, engine, monkeypatch):
+        """必须上报：服务端按「订单最新一条仍为 failure」做状态判定并按 TTL 提醒，
+        不上报会让该订单从服务端失败视图消失，才是真正的静默过期"""
+        self._break_config(monkeypatch)
+        cert = self._seed(engine, 7101)
+        with pytest.raises(RuntimeError):
+            engine._renew_pull(cert, engine._mock_api)
+        engine._mock_api.callback.assert_called_once()
+        kwargs = engine._mock_api.callback.call_args[1]
+        assert kwargs['status'] == 'failure'
+        assert 'Web 服务配置校验失败' in kwargs['message']
+
+    def test_blocked_records_reason_for_panel(self, engine, monkeypatch):
+        self._break_config(monkeypatch)
+        cert = self._seed(engine, 7102)
+        with pytest.raises(RuntimeError):
+            engine._renew_pull(cert, engine._mock_api)
+        meta = engine._config.get_cert(cert['order_id'])['metadata']
+        assert 'nginx: [emerg] unrelated site broken' in meta['last_deploy_block_reason']
+        assert meta['last_deploy_block_at']
+
+    def test_many_blocked_rounds_never_cap(self, engine, monkeypatch):
+        """连续多轮环境阻断不得推入 CAPPED（否则配置修好还要人工解除）"""
+        from lib.config import MAX_DEPLOY_ATTEMPT_COUNT, TERMINAL_ISSUE_STATES
+
+        self._break_config(monkeypatch)
+        cert = self._seed(engine, 7103)
+        for _ in range(MAX_DEPLOY_ATTEMPT_COUNT * 2):
+            with pytest.raises(RuntimeError):
+                engine._renew_pull(engine._config.get_cert(cert['order_id']), engine._mock_api)
+        meta = engine._config.get_cert(cert['order_id'])['metadata']
+        assert meta.get('deploy_attempt_count', 0) == 0
+        assert meta.get('last_issue_state', '') not in TERMINAL_ISSUE_STATES
+
+    def test_recovers_after_config_fixed(self, engine, monkeypatch):
+        """配置修复后下一轮正常部署，无需任何人工干预"""
+        self._break_config(monkeypatch)
+        cert = self._seed(engine, 7104)
+        with pytest.raises(RuntimeError):
+            engine._renew_pull(engine._config.get_cert(cert['order_id']), engine._mock_api)
+        engine._deployer.deploy_multi.assert_not_called()
+        assert engine._config.get_cert(cert['order_id'])['metadata']['last_deploy_block_reason']
+
+        self._break_config(monkeypatch, broken=False)
+        result = engine._renew_pull(engine._config.get_cert(cert['order_id']), engine._mock_api)
+        assert result is True
+        engine._deployer.deploy_multi.assert_called_once()
+        # 环境恢复后阻断标记必须清除，否则面板会一直显示已消失的旧原因
+        meta = engine._config.get_cert(cert['order_id'])['metadata']
+        assert meta['last_deploy_block_reason'] == ''
+        assert meta['last_deploy_block_at'] == ''
+
+    def test_blocked_round_counts_as_failure_in_summary(self, engine, monkeypatch):
+        """环境阻断在续签汇总里记为失败：与上报服务端的 failure 口径一致，
+        不能让面板显示「续签成功」而实际什么都没发生"""
+        self._break_config(monkeypatch)
+        self._seed(engine, 7106)
+        results = engine._do_renew_all()
+        assert len(results) == 1
+        assert results[0]['status'] == 'failure'
+        assert 'Web 服务配置校验失败' in results[0]['message']
+
+    def test_block_reason_is_single_line_and_capped(self, engine, monkeypatch):
+        """nginx -t 的多行输出压平为单行并限长，避免撑爆面板布局"""
+        import public
+        monkeypatch.setattr(public, 'checkWebConfig', lambda: 'line one\nline two\n' + 'x' * 500)
+        cert = self._seed(engine, 7107)
+        with pytest.raises(RuntimeError):
+            engine._renew_pull(cert, engine._mock_api)
+        reason = engine._config.get_cert(cert['order_id'])['metadata']['last_deploy_block_reason']
+        assert '\n' not in reason
+        assert 'line one line two' in reason
+        assert len(reason) < 400
+
+    def test_processing_path_keeps_pending_key(self, engine, monkeypatch):
+        """local 模式 processing 路径被阻断时保留 pending key 待下轮"""
+        cert = _make_cert_entry(10, renew_mode='local', issue_state='processing', order_id=7105)
+        engine._config.add_cert(
+            order_id=cert['order_id'], cert_name=cert['cert_name'],
+            domains=cert['domains'], site_names=cert['site_name'], renew_mode='local',
+        )
+        engine._config.update_metadata(cert['order_id'], cert['metadata'])
+        engine._mock_api.query_order.return_value = {
+            'status': 'active', 'certificate': '---CERT---', 'ca_certificate': '---CA---',
+        }
+        entry = engine._config.get_cert(cert['order_id'])
+        engine._save_pending_key(entry, '---PENDING-KEY---')
+        self._break_config(monkeypatch)
+
+        with pytest.raises(RuntimeError, match='Web 服务配置校验失败'):
+            engine._handle_processing(entry, engine._mock_api)
+        assert engine._read_pending_key(entry) == '---PENDING-KEY---'
+
+
+class TestPendingKeyDanglingSymlink:
+    """悬空符号链接不清理会让 O_EXCL 创建每轮失败（D2）"""
+
+    @pytest.fixture
+    def engine(self, tmp_data_dir):
+        return RenewEngine(ConfigManager(tmp_data_dir), MagicMock(), MagicMock(), MagicMock())
+
+    def test_save_overwrites_dangling_symlink(self, engine):
+        cert = _make_cert_entry(10, order_id=7200)
+        path = engine._pending_key_path(cert)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        os.symlink(os.path.join(os.path.dirname(path), 'nonexistent-target.pem'), path)
+
+        engine._save_pending_key(cert, '---KEY---')
+        assert not os.path.islink(path)
+        assert engine._read_pending_key(cert) == '---KEY---'
+
+    def test_cleanup_removes_dangling_symlink(self, engine):
+        cert = _make_cert_entry(10, order_id=7201)
+        path = engine._pending_key_path(cert)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        os.symlink(os.path.join(os.path.dirname(path), 'nonexistent-target.pem'), path)
+
+        engine._cleanup_pending_key(cert)
+        assert not os.path.lexists(path)

@@ -1,6 +1,7 @@
 """证书部署模块。通过宝塔 panelSite.SetSSL() 部署证书。"""
 
 import os
+import re
 from datetime import datetime, timezone, timedelta
 
 from . import cert_utils
@@ -43,20 +44,45 @@ class DeployError(Exception):
         self.retryable = retryable
 
 
-# serviceReload 返回 ExecShell 的 (stdout, stderr)，stderr 含以下特征视为重载失败
-_RELOAD_ERROR_MARKERS = ('emerg', 'alert', 'crit', 'fatal', 'error', 'failed', 'not running')
+# serviceReload 返回 ExecShell 的 (stdout, stderr)，stderr 命中以下模式才视为重载失败。
+# 必须用结构化模式而非裸词匹配：nginx/apache 正常输出里常见 error_log、ErrorLog 等
+# 配置项名称，裸词 'error' 会把成功的重载误判为失败并触发不必要的回滚。
+_RELOAD_ERROR_PATTERNS = (
+    re.compile(r'\[(?:emerg|alert|crit|error)\]', re.I),        # nginx 结构化日志级别
+    re.compile(r'^\s*nginx:\s*\[?(?:emerg|alert|crit)\]?', re.I | re.M),
+    re.compile(r'^\s*job for \S+ failed', re.I | re.M),         # systemd
+    re.compile(r'failed to (?:start|reload|restart)', re.I),
+    re.compile(r'\bis not running\b', re.I),
+    re.compile(r'AH\d{5}:.*(?:fatal|could not|failed)', re.I),  # apache
+)
+
+
+def check_web_config():
+    """运行宝塔 checkWebConfig，返回错误信息字符串或 None（配置正常/不可用）
+
+    nginx 配置检查天然全局，任何站点的坏配置都会导致其返回错误。
+    定义在模块级而非实例方法：这是宿主机的全局属性，与具体 Deployer 实例无关，
+    续签编排层也需要在创建部署意图之前独立调用它做环境闸门。
+    """
+    import public
+    check = getattr(public, 'checkWebConfig', None)
+    if not callable(check):
+        return None
+    result = check()
+    if result is not True:
+        return str(result)
+    return None
 
 
 def _extract_reload_error(result):
-    """从 serviceReload 返回值提取错误信息；stderr 无错误特征或形态无法识别时返回 ''"""
+    """从 serviceReload 返回值提取错误信息；stderr 未命中失败模式或形态无法识别时返回 ''"""
     if not isinstance(result, (tuple, list)) or len(result) < 2:
         return ''
     stderr = str(result[1] or '').strip()
     if not stderr:
         return ''
-    lowered = stderr.lower()
-    for marker in _RELOAD_ERROR_MARKERS:
-        if marker in lowered:
+    for pattern in _RELOAD_ERROR_PATTERNS:
+        if pattern.search(stderr):
             return stderr[:300]
     return ''
 
@@ -137,6 +163,9 @@ class Deployer:
                     'deploy_started': False,
                     'csr_submitted_at': '',
                     'last_csr_hash': '',
+                    # 部署成功即证明环境已恢复，清除阻断标记避免面板留存过期原因
+                    'last_deploy_block_reason': '',
+                    'last_deploy_block_at': '',
                 }
                 try:
                     self._config.update_metadata(order_id, meta)
@@ -161,6 +190,10 @@ class Deployer:
             results.append({'site_name': sn, 'status': False,
                             'message': '站点疑似已删除，待下一轮确认（本轮暂不解绑）',
                             'site_missing': True})
+
+        # 结果为空说明入参站点清单为空：绝不能让 all([]) == True 发出 success 回调
+        if not results:
+            raise DeployError('无可部署站点', phase='validate')
 
         # 发送部署回调（任一站点失败或 metadata 未落盘即 failure，附各失败原因）
         # send_callback=False 时底层不发（自动续签编排层在结果落盘后统一发送）
@@ -370,7 +403,9 @@ class Deployer:
         1. Pre-flight：写入前校验既有 Web 配置，本就损坏则快速失败不写入
         2. 写入前捕获站点当前证书/私钥，用于回滚
         3. SetSSL 写入（仅 dict 且 status is True 视为成功，异常形态一律判失败）
-        4. 写入后校验配置并重载，失败则恢复原证书后按 reload 阶段抛错
+        4. 写入后分两级判定：
+           - 配置校验失败 → preflight 已证明写前配置是好的，因果闭合归因本次写入 → 回滚
+           - 仅重载失败 → 配置有效，问题在服务层，回滚证书解决不了且多一次写入 → 不回滚
         """
         import panelSite
 
@@ -408,48 +443,48 @@ class Deployer:
             self._rollback_after_setssl_failure(site_obj, site_name, prev)
             raise DeployError(msg, phase='deploy', retryable=True)
 
-        # 4. 写入后校验并重载，失败则回滚原证书
-        verify_err = self._verify_web_service()
-        if verify_err:
+        # 4. 写入后校验并重载
+        kind, verify_err = self._verify_web_service()
+        if kind == 'config':
+            # 配置从「好」变「坏」只可能由本次写入引起，回滚正当
             rollback_note = self._rollback_ssl(site_obj, site_name, prev)
             raise DeployError('%s；%s' % (verify_err, rollback_note),
-                              phase='reload', retryable=True)
+                              phase='config', retryable=True)
+        if kind == 'reload':
+            # 配置有效但服务未能重载：证书文件已就位，下次任意重载即可生效，不回滚
+            if self._logger:
+                self._logger.error("配置校验通过但服务重载失败（不回滚）: site=%s, %s", site_name, verify_err)
+            raise DeployError(
+                '%s；证书已写入但未生效，请人工检查 Web 服务后重载' % verify_err,
+                phase='reload', retryable=True)
 
         return result
 
-    @staticmethod
-    def _check_web_config():
-        """运行宝塔 checkWebConfig，返回错误信息字符串或 None（配置正常/不可用）
-
-        nginx 配置检查天然全局，任何站点的坏配置都会导致其返回错误。
-        """
-        import public
-        check = getattr(public, 'checkWebConfig', None)
-        if not callable(check):
-            return None
-        result = check()
-        if result is not True:
-            return str(result)
-        return None
+    _check_web_config = staticmethod(check_web_config)
 
     def _verify_web_service(self):
-        """SetSSL 后校验 Web 配置并重载，返回错误信息或 None（不再直接抛错）
+        """SetSSL 后校验 Web 配置并重载，返回 (kind, message)
 
-        宝塔 SetSSL 内部虽会调用 serviceReload()，但丢弃其结果；此处显式复核：
-        checkWebConfig 校验配置有效性，serviceReload 幂等重载并检查错误输出。
+        kind 取值 'config' / 'reload' / None，供调用方区分是否该回滚：
+        - 'config'：配置校验失败。写入前 preflight 已通过，因果闭合归因本次写入，应回滚。
+        - 'reload'：配置有效但服务未能重载，属服务层问题，回滚证书无助于修复，不应回滚。
+          注意重载后再跑一次 checkWebConfig 无意义——它校验的是磁盘配置语法，
+          重载前后磁盘内容未变，结果必然相同，对「重载是否生效」零信息量。
+
+        宝塔 SetSSL 内部虽会调用 serviceReload()，但丢弃其结果；此处显式复核。
         """
         import public
 
         err = self._check_web_config()
         if err:
-            return 'Web 服务配置校验失败: %s' % err
+            return 'config', 'Web 服务配置校验失败: %s' % err
 
         reload_fn = getattr(public, 'serviceReload', None)
         if callable(reload_fn):
             rerr = _extract_reload_error(reload_fn())
             if rerr:
-                return 'Web 服务重载失败: %s' % rerr
-        return None
+                return 'reload', 'Web 服务重载失败: %s' % rerr
+        return None, None
 
     @classmethod
     def _capture_current_ssl(cls, site_obj, site_name):
@@ -533,7 +568,7 @@ class Deployer:
                 self._logger.error("回滚 SetSSL 失败: site=%s, result=%r", site_name, result)
             return '回滚失败，站点证书可能处于异常状态，请人工检查'
 
-        verify_err = self._verify_web_service()
+        _, verify_err = self._verify_web_service()
         if verify_err:
             if self._logger:
                 self._logger.error("回滚后校验/重载失败: site=%s, %s", site_name, verify_err)
