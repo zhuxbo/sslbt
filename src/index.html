@@ -496,9 +496,10 @@
     // ===== 续签终态识别 =====
     // CAPPED / EXPIRED / policy 阻断下续签引擎不再启动新动作且不发回调（deploy-spec §3.2），
     // 面板是用户侧唯一提示入口，不能让这些证书继续显示为「正常」。
-    _CAP_STAGE_LABEL: {
+    _CAPPED_PHASE_LABEL: {
       issue: '签发重试超限',
       deploy: '部署重试超限',
+      stalled: '长期无进展',
       legacy: '升级前已超限'
     },
 
@@ -507,7 +508,7 @@
       var s = m.last_issue_state || '';
       if (!s || s === 'processing') return null;
       if (s === 'CAPPED') {
-        var stage = P._CAP_STAGE_LABEL[m.cap_stage || ''] || '重试超限';
+        var stage = P._CAPPED_PHASE_LABEL[m.capped_phase || ''] || '重试超限';
         return { label: '已停更（' + stage + '）', level: 'danger', halted: true };
       }
       if (s === 'EXPIRED') {
@@ -614,9 +615,20 @@
     // ===== 状态标签 =====
     // 服务端不会再签发的订单状态。renewed/reissued 是证书链延续标记（服务端查询会
     // 自动跟链到接替订单）、cancelling 是过渡态，都不算停机
-    ORDER_HALT_STATUSES: ['cancelled', 'revoked', 'failed', 'expired'],
+    // order_not_found / cert_not_found / invalid_order 是 deploy-spec §2.2 的订单级
+    // 确定性失败：服务端已明确拒绝，自动路径不会自愈，与订单终态同样按「停更」呈现
+    ORDER_HALT_STATUSES: ['cancelled', 'revoked', 'failed', 'expired',
+      'order_not_found', 'cert_not_found', 'invalid_order'],
     ORDER_STATUS_LABEL: {
-      cancelled: '已取消', revoked: '已吊销', failed: '签发失败', expired: '已过期'
+      cancelled: '已取消', revoked: '已吊销', failed: '签发失败', expired: '已过期',
+      order_not_found: '不存在或无权访问', cert_not_found: '无可用证书',
+      invalid_order: '订单号非法'
+    },
+    // token / 账号级阻断（spec §2.2）：这类失败下回调用的是同一个坏 token、必然也发不出去
+    AUTH_BLOCK_LABEL: {
+      rate_limited: '请求频率超限', token_missing: '未携带 Token',
+      token_invalid: 'Token 无效或已失效', token_disabled: 'Token 已被禁用',
+      account_disabled: '账号已被禁用', ip_not_allowed: '来源 IP 不在白名单'
     },
 
     _missingApi: function (cert) {
@@ -679,6 +691,15 @@
       // 否则一台永久跑不动的机器会被判为健康
       if (d.aborted_reason) {
         return '最近一次自动续签未执行：' + d.aborted_reason;
+      }
+      // token 被服务端拒绝时回调用的是同一个坏 token、必然也发不出去，
+      // 面板是唯一提示入口（spec §2.2）
+      var blocks = d.auth_blocks || [];
+      if (blocks.length) {
+        var b = blocks[0];
+        var label = P.AUTH_BLOCK_LABEL[b.error_code] || b.error_code || '未知原因';
+        return 'API 拒绝了部署 Token（' + label + (b.api_host ? '，' + b.api_host : '')
+          + '），本轮已跳过使用该 Token 的证书，请到「设置」检查 Token 配置。';
       }
       var t = Date.parse(d.last_run);
       if (isNaN(t)) return '';
@@ -1488,6 +1509,13 @@
         el.style.color = '';
         el.textContent = t + '：共 ' + (d.total || 0) + '，成功 ' + (d.success || 0) +
           '，等待 ' + (d.pending || 0) + '，失败 ' + (d.failure || 0);
+        var blocks = d.auth_blocks || [];
+        if (blocks.length) {
+          var b = blocks[0];
+          el.textContent += '（Token 被拒：'
+            + (P.AUTH_BLOCK_LABEL[b.error_code] || b.error_code || '未知原因') + '）';
+          el.style.color = '#f56c6c';
+        }
       });
     },
 

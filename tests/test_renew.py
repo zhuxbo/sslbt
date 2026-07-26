@@ -9,12 +9,17 @@ import pytest
 from datetime import datetime, timezone, timedelta
 from unittest.mock import MagicMock, patch
 
-from lib.config import ConfigManager
+from lib.config import (
+    ConfigManager, MAX_NO_PROGRESS_DAYS, MAX_BLOCK_REPORT_COUNT,
+    ISSUE_STATE_CAPPED, CAPPED_PHASE_STALLED, CAPPED_PHASE_ISSUE,
+    classify_order_status, DEPLOY_SUCCESS_RESET_KEYS,
+)
+from lib.api_client import APIError
 from lib.renew import (
-    RenewEngine, needs_renewal,
+    RenewEngine, needs_renewal, _normalize_issue_status,
     RENEW_DEFAULT_DAYS, MAX_ISSUE_RETRY_COUNT, MAX_DEPLOY_ATTEMPT_COUNT,
     RENEW_SLEEP_MIN, RENEW_SLEEP_MAX, SPREAD_TOTAL_MAX,
-    MAX_RENEW_BATCH,
+    MAX_RENEW_BATCH, CALLBACK_BREAKER_THRESHOLD,
 )
 
 
@@ -276,7 +281,7 @@ class TestRenewEngine:
         engine._mock_api.submit_csr.assert_not_called()
         meta = engine._config.get_cert(cert['order_id'])['metadata']
         assert meta['last_issue_state'] == 'CAPPED'
-        assert meta['cap_stage'] == 'issue'
+        assert meta['capped_phase'] == 'issue'
 
     @patch('lib.renew.cert_utils.generate_csr')
     def test_issue_count_below_cap_still_submits(self, mock_csr, engine, tmp_data_dir):
@@ -471,7 +476,7 @@ class TestRenewEngine:
         # 已置 CAPPED(issue) 终态
         meta = config.get_cert(cert['order_id'])['metadata']
         assert meta['last_issue_state'] == 'CAPPED'
-        assert meta['cap_stage'] == 'issue'
+        assert meta['capped_phase'] == 'issue'
 
     def test_check_and_renew_all_api_none(self, tmp_data_dir):
         """api_factory 返回 None 时证书被跳过且记录 warn"""
@@ -1394,7 +1399,7 @@ class TestDeployCountAndCap:
         engine._mock_api.callback.assert_not_called()
         meta = engine._config.get_cert(6002)['metadata']
         assert meta['last_issue_state'] == 'CAPPED'
-        assert meta['cap_stage'] == 'deploy'
+        assert meta['capped_phase'] == 'deploy'
 
     def test_deploy_failure_increments_deploy_count(self, engine):
         """部署失败递增 deploy_attempt_count，签发计数不受污染（计数分离）"""
@@ -1471,7 +1476,7 @@ class TestDeployCountAndCap:
         assert engine._deployer.deploy_multi.call_count == 10  # 无第 11 次部署
         meta = engine._config.get_cert(7400)['metadata']
         assert meta['last_issue_state'] == 'CAPPED'
-        assert meta['cap_stage'] == 'deploy'
+        assert meta['capped_phase'] == 'deploy'
 
     def test_deploy_started_replay_no_double_increment(self, engine):
         """崩溃恢复：deploy_started 已置位 → 重放同一部署意图不再自增计数（spec §4.1.2）"""
@@ -1514,7 +1519,7 @@ class TestDeployCountAndCap:
     def test_terminal_capped_skipped_silently(self, engine):
         """已 CAPPED 的证书前置过滤直接跳过，不查询、不部署、不回调"""
         self._add_pull_cert(engine, 6206)
-        engine._config.update_metadata(6206, {'last_issue_state': 'CAPPED', 'cap_stage': 'deploy'})
+        engine._config.update_metadata(6206, {'last_issue_state': 'CAPPED', 'capped_phase': 'deploy'})
         results = engine.check_and_renew_all()
         assert results == []
         engine._mock_api.query_order.assert_not_called()
@@ -1642,24 +1647,34 @@ class TestResponseLossRecovery:
         engine._mock_api.submit_csr.assert_not_called()
         assert engine._config.get_cert(7105)['metadata']['last_issue_state'] == 'processing'
 
-    def test_recovery_abnormal_status_persists_and_does_not_resubmit(self, engine):
-        """在途 CSR 查询到异常业务状态时持久化并停止，不推断为未收到后重复 POST。"""
+    def test_unpaid_is_waiting_and_never_posts(self, engine):
+        """unpaid 是可自愈中间态（spec §2.4），必须按在途等待处置——**绝不 POST**
+
+        POST 会触发服务端 pay 扣费，涉及资金的动作不由客户端自动发起。此前 unpaid 被当作
+        终态写进 last_issue_state，该值既不在 TERMINAL_ISSUE_STATES（前置过滤拦不住）、
+        又不等于 processing（不再走查询分支），下一轮就落到 _submit_new_csr 发出 POST。
+        """
         cert = self._add_local(engine, 7103)
         engine._save_pending_key(cert, 'KEY')
         engine._save_pending_csr(cert, 'CSR-ORIG')
         engine._config.update_metadata(7103, {'issue_retry_count': 1})
         engine._mock_api.query_order.return_value = {'status': 'unpaid'}
         engine._mock_api.submit_csr.return_value = {'status': 'processing'}
-        result = engine._renew_local(engine._config.get_cert(7103), engine._mock_api)
-        assert result is False
+
+        # 连续多轮：每轮都只查询，一次 POST 都不该发生
+        for _ in range(3):
+            assert engine._renew_local(engine._config.get_cert(7103), engine._mock_api) is False
+
         engine._mock_api.submit_csr.assert_not_called()
         meta = engine._config.get_cert(7103)['metadata']
-        assert meta['last_issue_state'] == 'unpaid'
+        assert meta['last_issue_state'] == 'processing', 'unpaid 应归一在途，不得写成终态'
+        assert meta['last_order_status'] == 'unpaid', '订单状态只进展示字段'
         assert meta['issue_retry_count'] == 1
+        assert meta['no_progress_since'], '纯查询路径必须由无进展时限兜底'
         assert engine._has_pending_csr(engine._config.get_cert(7103))
 
-    def test_processing_abnormal_status_persists_actual_state(self, engine):
-        """processing 查询到异常状态时保留实际状态，停止等待人工处理。"""
+    def test_processing_terminal_status_goes_to_display_field_only(self, engine):
+        """processing 查询到真终态：状态只写展示字段，停止自动动作等待人工处理（spec §2.4）"""
         cert = self._add_local(engine, 7106)
         engine._save_pending_key(cert, 'KEY')
         engine._save_pending_csr(cert, 'CSR')
@@ -1674,7 +1689,9 @@ class TestResponseLossRecovery:
         assert result is False
         engine._mock_api.submit_csr.assert_not_called()
         meta = engine._config.get_cert(7106)['metadata']
-        assert meta['last_issue_state'] == 'cancelled'
+        # 订单状态只进 last_order_status；在途标记保持不动，本路径恒为「只查询」
+        assert meta['last_order_status'] == 'cancelled'
+        assert meta['last_issue_state'] == 'processing'
         assert meta['issue_retry_count'] == 2
 
     def test_processing_approving_treated_as_waiting(self, engine):
@@ -1725,9 +1742,11 @@ class TestResponseLossRecovery:
         })
         engine._mock_api.query_order.return_value = {'status': 'cancelled'}
 
-        engine._renew_local(engine._config.get_cert(7109), engine._mock_api)  # 首轮：processing → cancelled
+        engine._renew_local(engine._config.get_cert(7109), engine._mock_api)  # 首轮：状态首次变化
         assert engine._logger.error.call_count == 1
-        assert engine._config.get_cert(7109)['metadata']['last_issue_state'] == 'cancelled'
+        meta = engine._config.get_cert(7109)['metadata']
+        assert meta['last_order_status'] == 'cancelled'
+        assert meta['last_issue_state'] == 'processing'
 
         with patch.object(engine._config, 'update_metadata') as mock_update:
             engine._renew_local(engine._config.get_cert(7109), engine._mock_api)  # 次轮：状态未变化
@@ -1751,7 +1770,7 @@ class TestResponseLossRecovery:
         assert engine._mock_api.submit_csr.call_count == 10  # 无第 11 次提交
         meta = engine._config.get_cert(7300)['metadata']
         assert meta['last_issue_state'] == 'CAPPED'
-        assert meta['cap_stage'] == 'issue'
+        assert meta['capped_phase'] == 'issue'
 
 
 class TestCallbackOwnershipConvergence:
@@ -2348,31 +2367,30 @@ class TestCertUnchangedDetection:
 
     def test_same_serial_twice_reports_failure(self, engine):
         cert = self._cert(engine, 9501, 'AABB')
-        assert engine._track_cert_unchanged(cert, 9501, 'AABB') == ''      # 第 1 轮仅计数
-        assert '未实际更新' in engine._track_cert_unchanged(cert, 9501, 'AABB')
+        # 两端序列号由调用方传入（prev, new）——本方法不读 metadata
+        assert engine._track_cert_unchanged(cert, 9501, 'AABB', 'AABB') == ''   # 第 1 轮仅计数
+        assert '未实际更新' in engine._track_cert_unchanged(cert, 9501, 'AABB', 'AABB')
 
     def test_changed_serial_resets_counter(self, engine):
         cert = self._cert(engine, 9502, 'AABB')
-        engine._track_cert_unchanged(cert, 9502, 'AABB')
+        engine._track_cert_unchanged(cert, 9502, 'AABB', 'AABB')
         assert cert['metadata']['unchanged_cert_rounds'] == 1
         # 新证书：计数归零，绝不能累积到误报
-        engine._config.update_metadata(9502, {'cert_serial': 'CCDD'})
-        cert = engine._config.get_cert(9502)
-        assert engine._track_cert_unchanged(cert, 9502, 'AABB') == ''
+        assert engine._track_cert_unchanged(cert, 9502, 'AABB', 'CCDD') == ''
         assert cert['metadata']['unchanged_cert_rounds'] == 0
 
     def test_empty_serial_never_triggers(self, engine):
         """两端都要非空：解析失败返回 ''，老 OpenSSL 上 '' == '' 会让每次部署都误报"""
         cert = self._cert(engine, 9503, '')
         for _ in range(5):
-            assert engine._track_cert_unchanged(cert, 9503, '') == ''
+            assert engine._track_cert_unchanged(cert, 9503, '', '') == ''
         assert cert['metadata'].get('unchanged_cert_rounds', 0) == 0
 
     def test_partial_failure_round_does_not_accumulate(self, engine):
         """部分失败轮次不写 cert_serial，prev 与 new 不同 → 不累积（F8×F9 无假阳性）"""
         cert = self._cert(engine, 9504, 'AABB')
         # 部分失败：deploy_multi 未写 cert_serial，metadata 仍是旧值，但 prev 取的是部署前值
-        assert engine._track_cert_unchanged(cert, 9504, '') == ''
+        assert engine._track_cert_unchanged(cert, 9504, '', 'AABB') == ''
         assert cert['metadata'].get('unchanged_cert_rounds', 0) == 0
 
 
@@ -2543,3 +2561,778 @@ class TestBatchFairness:
     def test_under_limit_returns_all(self, engine):
         items = [self._item(i) for i in range(10)]
         assert engine._select_batch(items) == items
+
+
+def _backdate_no_progress(config, order_id, days):
+    """把停更计时起点往前拨，模拟真实经过的天数（cron 每天才跑一次）"""
+    past = (datetime.now(timezone.utc) - timedelta(days=days)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    config.update_metadata(order_id, {'no_progress_since': past})
+
+
+class TestNoProgressBound:
+    """纯 GET 轮询的绝对边界（spec §3.2）
+
+    轮询按 spec 不计入任何尝试计数，此前唯一的边界是到期闸门——而 _remaining_hours()
+    在 cert_expires_at 为空时返回 None，整段闸门被跳过。新增证书默认就是空到期时间
+    且只有全部站点部署成功才回填，所以"从未成功部署过"的证书会每天空查询到永远，
+    pending 私钥同步永驻磁盘。
+    """
+
+    def _engine(self, tmp_data_dir, api):
+        return RenewEngine(ConfigManager(tmp_data_dir), MagicMock(return_value=api),
+                           MagicMock(), MagicMock())
+
+    def _rounds(self, engine, n):
+        with patch('lib.renew.probe_panel_runtime', return_value=None):
+            for _ in range(n):
+                engine.check_and_renew_all(spread=False, lock_wait=0)
+
+    def test_local_processing_converges_and_clears_key(self, tmp_data_dir):
+        """local 卡 processing + 到期时间未知：超时后零拉取、转 CAPPED、清 pending 私钥"""
+        api = MagicMock()
+        api.last_renew_before_days = 0
+        api.query_order.return_value = {'order_id': 9401, 'status': 'processing'}
+        engine = self._engine(tmp_data_dir, api)
+        engine._config.add_cert(order_id=9401, cert_name='order-9401', domains=['a.com'],
+                                site_names=['a.com'], renew_mode='local')
+        engine._config.update_metadata(9401, {
+            'last_issue_state': 'processing', 'cert_expires_at': ''})
+        cert = engine._config.get_cert(9401)
+        engine._save_pending_key(cert, 'PENDING-KEY')
+        engine._save_pending_csr(cert, 'PENDING-CSR')
+
+        self._rounds(engine, 3)
+        _backdate_no_progress(engine._config, 9401, MAX_NO_PROGRESS_DAYS + 1)
+        before = api.query_order.call_count
+        self._rounds(engine, 50)
+
+        meta = engine._config.get_cert(9401)['metadata']
+        assert api.query_order.call_count == before, '超时后不得再拉取'
+        assert meta['last_issue_state'] == ISSUE_STATE_CAPPED
+        assert meta['capped_phase'] == CAPPED_PHASE_STALLED
+        assert not os.path.isfile(engine._pending_key_path(cert)), 'pending 私钥必须清理'
+        assert not os.path.isfile(engine._pending_csr_path(cert))
+
+    def test_pull_terminal_order_converges(self, tmp_data_dir):
+        """pull 模式订单已 cancelled + 到期时间未知：超时后停止轮询"""
+        api = MagicMock()
+        api.last_renew_before_days = 0
+        api.query_order.return_value = {'order_id': 9402, 'status': 'cancelled'}
+        engine = self._engine(tmp_data_dir, api)
+        engine._config.add_cert(order_id=9402, cert_name='order-9402', domains=['b.com'],
+                                site_names=['b.com'], renew_mode='pull')
+        engine._config.update_metadata(9402, {'cert_expires_at': ''})
+
+        self._rounds(engine, 3)
+        _backdate_no_progress(engine._config, 9402, MAX_NO_PROGRESS_DAYS + 1)
+        before = api.query_order.call_count
+        self._rounds(engine, 50)
+
+        meta = engine._config.get_cert(9402)['metadata']
+        assert api.query_order.call_count == before
+        assert meta['last_issue_state'] == ISSUE_STATE_CAPPED
+        assert meta['capped_phase'] == CAPPED_PHASE_STALLED
+
+    def test_under_limit_keeps_polling(self, tmp_data_dir):
+        """未达时限必须照常轮询：边界不能提前误伤正常等待签发的证书"""
+        api = MagicMock()
+        api.last_renew_before_days = 0
+        api.query_order.return_value = {'order_id': 9403, 'status': 'processing'}
+        engine = self._engine(tmp_data_dir, api)
+        engine._config.add_cert(order_id=9403, cert_name='order-9403', domains=['c.com'],
+                                site_names=['c.com'], renew_mode='local')
+        engine._config.update_metadata(9403, {
+            'last_issue_state': 'processing', 'cert_expires_at': ''})
+
+        self._rounds(engine, 2)
+        _backdate_no_progress(engine._config, 9403, MAX_NO_PROGRESS_DAYS - 1)
+        before = api.query_order.call_count
+        self._rounds(engine, 5)
+
+        assert api.query_order.call_count == before + 5
+        assert engine._config.get_cert(9403)['metadata']['last_issue_state'] == 'processing'
+
+    def test_clock_jump_reanchors_instead_of_capping(self, tmp_data_dir):
+        """时间戳落在时钟合理区间之外：重新锚定，不得据此判定停更"""
+        api = MagicMock()
+        api.last_renew_before_days = 0
+        api.query_order.return_value = {'order_id': 9404, 'status': 'processing'}
+        engine = self._engine(tmp_data_dir, api)
+        engine._config.add_cert(order_id=9404, cert_name='order-9404', domains=['d.com'],
+                                site_names=['d.com'], renew_mode='local')
+        engine._config.update_metadata(9404, {
+            'last_issue_state': 'processing', 'cert_expires_at': ''})
+
+        self._rounds(engine, 1)
+        _backdate_no_progress(engine._config, 9404, 400)
+        self._rounds(engine, 3)
+
+        assert engine._config.get_cert(9404)['metadata']['last_issue_state'] == 'processing'
+
+    def test_progress_resets_the_clock(self, tmp_data_dir):
+        """订单恢复可用后计时清零，不带着旧的停滞历史进入下一次等待"""
+        api = MagicMock()
+        api.last_renew_before_days = 0
+        api.query_order.return_value = {'order_id': 9405, 'status': 'processing'}
+        engine = self._engine(tmp_data_dir, api)
+        engine._config.add_cert(order_id=9405, cert_name='order-9405', domains=['e.com'],
+                                site_names=['e.com'], renew_mode='pull')
+        engine._config.update_metadata(9405, {'cert_expires_at': ''})
+        self._rounds(engine, 1)
+        assert engine._config.get_cert(9405)['metadata']['no_progress_since']
+
+        api.query_order.return_value = {
+            'order_id': 9405, 'status': 'active', 'certificate': 'C',
+            'ca_certificate': 'CA', 'private_key': 'K'}
+        engine._deployer.deploy_multi.return_value = [
+            {'site_name': 'e.com', 'status': True, 'message': '部署成功'}]
+        self._rounds(engine, 1)
+        assert engine._config.get_cert(9405)['metadata']['no_progress_since'] == ''
+
+
+class TestBlockCallbackBound:
+    """环境阻断回调的次数上限（spec §2.8）
+
+    阻断按设计不递增 deploy_attempt_count（修好即自动恢复，不必人工解除），
+    此前唯一的抑制是原因字符串相等——原因串含 PID/路径/异常文本等可变内容时
+    每轮都算"变化"，整条回调路径因此没有任何上限。
+    """
+
+    def _engine(self, tmp_data_dir, api):
+        return RenewEngine(ConfigManager(tmp_data_dir), MagicMock(return_value=api),
+                           MagicMock(), MagicMock())
+
+    def _cert(self, engine, order_id):
+        engine._config.add_cert(order_id=order_id, cert_name='order-%d' % order_id,
+                                domains=['x.com'], site_names=['x.com'], renew_mode='pull')
+        engine._config.update_metadata(order_id, {'cert_expires_at': (
+            datetime.now(timezone.utc) + timedelta(days=5)).strftime('%Y-%m-%dT%H:%M:%SZ')})
+
+    def _rounds(self, engine, n):
+        with patch('lib.renew.probe_panel_runtime', return_value=None):
+            for _ in range(n):
+                engine.check_and_renew_all(spread=False, lock_wait=0)
+
+    def test_varying_reason_is_capped(self, tmp_data_dir):
+        """阻断原因每轮不同：回调总数封顶，不再每轮一发"""
+        api = MagicMock()
+        api.last_renew_before_days = 0
+        api.query_order.return_value = {
+            'order_id': 9501, 'status': 'active', 'certificate': 'C',
+            'ca_certificate': 'CA', 'private_key': 'K'}
+        engine = self._engine(tmp_data_dir, api)
+        self._cert(engine, 9501)
+        seq = iter(range(10000))
+        with patch('lib.renew.check_web_config',
+                   side_effect=lambda: 'nginx: [emerg] 错误 (pid %d)' % next(seq)):
+            self._rounds(engine, 60)
+
+        assert api.callback.call_count == MAX_BLOCK_REPORT_COUNT
+        assert engine._config.get_cert(9501)['metadata']['block_report_count'] \
+            == MAX_BLOCK_REPORT_COUNT
+
+    def test_stable_reason_still_reports_once(self, tmp_data_dir):
+        """原因稳定时仍只发一次：上限不改变既有的边沿触发语义"""
+        api = MagicMock()
+        api.last_renew_before_days = 0
+        api.query_order.return_value = {
+            'order_id': 9502, 'status': 'active', 'certificate': 'C',
+            'ca_certificate': 'CA', 'private_key': 'K'}
+        engine = self._engine(tmp_data_dir, api)
+        self._cert(engine, 9502)
+        with patch('lib.renew.check_web_config', return_value='nginx: [emerg] 固定错误'):
+            self._rounds(engine, 30)
+        assert api.callback.call_count == 1
+
+    def test_recovery_restores_the_budget(self, tmp_data_dir):
+        """环境恢复过就是新一轮故障，上报额度重置"""
+        api = MagicMock()
+        api.last_renew_before_days = 0
+        api.query_order.return_value = {
+            'order_id': 9503, 'status': 'active', 'certificate': 'C',
+            'ca_certificate': 'CA', 'private_key': 'K'}
+        engine = self._engine(tmp_data_dir, api)
+        self._cert(engine, 9503)
+        with patch('lib.renew.check_web_config', return_value='坏了'):
+            self._rounds(engine, 3)
+        assert api.callback.call_count == 1
+        with patch('lib.renew.check_web_config', return_value=None):
+            self._rounds(engine, 1)
+        assert engine._config.get_cert(9503)['metadata']['block_report_count'] == 0
+
+
+class TestErrorCodeClassification:
+    """deploy-spec §2.2：确定性失败必须停止本轮动作，不得当作网络错误逐轮重试"""
+
+    def _engine(self, tmp_data_dir, api):
+        return RenewEngine(ConfigManager(tmp_data_dir), MagicMock(return_value=api),
+                           MagicMock(), MagicMock())
+
+    def _run(self, engine):
+        with patch('lib.renew.probe_panel_runtime', return_value=None):
+            return engine.check_and_renew_all(spread=False, lock_wait=0)
+
+    @staticmethod
+    def _api_err(error_code, retry_after=0, msg='rejected'):
+        return APIError(msg, code=0, error_code=error_code, retry_after=retry_after)
+
+    def _add(self, engine, order_id, api_url='https://api.example.com', **kw):
+        engine._config.add_cert(order_id=order_id, cert_name='order-%s' % order_id,
+                                domains=['d%s.com' % order_id],
+                                site_names=['d%s.com' % order_id],
+                                api_url=api_url, api_token='t' * 32, **kw)
+        engine._config.update_metadata(order_id, {'cert_expires_at': ''})
+
+    def test_rate_limited_stops_the_round_for_that_token(self, tmp_data_dir):
+        """限流是 token 级的：同 token 的后续证书本轮不再发起任何调用"""
+        api = MagicMock()
+        api.last_renew_before_days = 0
+        api.query_order.side_effect = self._api_err('rate_limited', retry_after=100)
+        engine = self._engine(tmp_data_dir, api)
+        for oid in (9601, 9602, 9603):
+            self._add(engine, oid, renew_mode='pull')
+
+        self._run(engine)
+        # 只有触发阻断的第一张真的查过；其余两张被拉黑跳过
+        assert api.query_order.call_count == 1
+
+        with open(os.path.join(tmp_data_dir, 'renew_status.json')) as f:
+            status = json.load(f)
+        assert status['auth_blocks'][0]['error_code'] == 'rate_limited'
+        assert status['auth_blocks'][0]['retry_after'] == 100
+        reasons = [s['reason'] for s in status['skipped']]
+        assert reasons.count('auth_blocked:rate_limited') == 2
+
+    def test_other_token_still_runs(self, tmp_data_dir):
+        """按 (url, token) 拉黑而非全局：别的 token 必须照常跑"""
+        bad, good = MagicMock(), MagicMock()
+        bad.last_renew_before_days = good.last_renew_before_days = 0
+        bad.query_order.side_effect = self._api_err('token_disabled')
+        good.query_order.return_value = {'order_id': 9612, 'status': 'processing'}
+
+        cfg = ConfigManager(tmp_data_dir)
+        engine = RenewEngine(cfg, lambda cert: bad if cert['order_id'] == 9611 else good,
+                             MagicMock(), MagicMock())
+        self._add(engine, 9611, api_url='https://bad.example.com', renew_mode='pull')
+        self._add(engine, 9612, api_url='https://good.example.com', renew_mode='pull')
+
+        self._run(engine)
+        assert bad.query_order.call_count == 1
+        assert good.query_order.call_count == 1, '不同 token 不应被连带拉黑'
+
+    def test_auth_block_does_not_burn_issue_count(self, tmp_data_dir):
+        """限流/认证失败被中间件拒在业务层之外，那次尝试从未发生：必须回滚签发计数"""
+        api = MagicMock()
+        api.last_renew_before_days = 0
+        api.query_order.return_value = {'order_id': 9621, 'status': 'active',
+                                        'certificate': '', 'expires_at': ''}
+        api.submit_csr.side_effect = self._api_err('rate_limited', retry_after=9)
+        engine = self._engine(tmp_data_dir, api)
+        self._add(engine, 9621, renew_mode='local', validation_method='file')
+
+        cert = engine._config.get_cert(9621)
+        before = cert['metadata'].get('issue_retry_count', 0)
+        with patch('lib.cert_utils.generate_csr',
+                   return_value=('---CSR---', '---KEY---', 'hash1')):
+            with pytest.raises(APIError):
+                engine._submit_new_csr(engine._config.get_cert(9621), api)
+
+        meta = engine._config.get_cert(9621)['metadata']
+        assert meta['issue_retry_count'] == before, '认证类失败不得消耗签发额度'
+        assert meta['csr_submitted_at'] == ''
+        assert meta['last_csr_hash'] == ''
+        assert not os.path.isfile(engine._pending_key_path(engine._config.get_cert(9621)))
+
+    def test_business_rejection_still_burns_issue_count(self, tmp_data_dir):
+        """对照组：服务端确实处理并拒绝了这次提交，计数必须保留"""
+        api = MagicMock()
+        api.last_renew_before_days = 0
+        api.submit_csr.side_effect = APIError('该产品不支持文件验证', code=0)
+        engine = self._engine(tmp_data_dir, api)
+        self._add(engine, 9622, renew_mode='local', validation_method='file')
+
+        with patch('lib.cert_utils.generate_csr',
+                   return_value=('---CSR---', '---KEY---', 'hash1')):
+            with pytest.raises(APIError):
+                engine._submit_new_csr(engine._config.get_cert(9622), api)
+
+        meta = engine._config.get_cert(9622)['metadata']
+        assert meta['issue_retry_count'] == 1, '明确业务拒绝仍是一次真实尝试'
+
+    def test_order_not_found_anchors_no_progress_clock(self, tmp_data_dir):
+        """订单已被删除：查询每轮抛异常，必须仍起停更计时，否则 14 天边界形同不存在"""
+        api = MagicMock()
+        api.last_renew_before_days = 0
+        api.query_order.side_effect = self._api_err('order_not_found', msg='未找到匹配的订单')
+        engine = self._engine(tmp_data_dir, api)
+        self._add(engine, 9631, renew_mode='pull')
+
+        self._run(engine)
+        meta = engine._config.get_cert(9631)['metadata']
+        assert meta['no_progress_since'], '订单级拒绝必须锚定停更计时'
+        assert meta['last_order_status'] == 'order_not_found'
+
+        _backdate_no_progress(engine._config, 9631, MAX_NO_PROGRESS_DAYS + 1)
+        before = api.query_order.call_count
+        for _ in range(5):
+            self._run(engine)
+        meta = engine._config.get_cert(9631)['metadata']
+        assert api.query_order.call_count == before, '超时后不得再拉取'
+        assert meta['last_issue_state'] == ISSUE_STATE_CAPPED
+        assert meta['capped_phase'] == CAPPED_PHASE_STALLED
+
+    def test_order_level_error_does_not_block_other_certs(self, tmp_data_dir):
+        """订单级失败只影响单张证书，同 token 的其他证书照常处理"""
+        api = MagicMock()
+        api.last_renew_before_days = 0
+
+        def query(order_id):
+            if int(order_id) == 9641:
+                raise self._api_err('order_not_found')
+            return {'order_id': order_id, 'status': 'processing'}
+
+        api.query_order.side_effect = query
+        engine = self._engine(tmp_data_dir, api)
+        self._add(engine, 9641, renew_mode='pull')
+        self._add(engine, 9642, renew_mode='pull')
+
+        self._run(engine)
+        assert api.query_order.call_count == 2, '订单级拒绝不得拉黑整个 token'
+
+    def test_unclassified_error_keeps_old_behavior(self, tmp_data_dir):
+        """无 error_code 的错误维持原状：逐证书失败，不拉黑、不跳过"""
+        api = MagicMock()
+        api.last_renew_before_days = 0
+        api.query_order.side_effect = APIError('boom', code=0)
+        engine = self._engine(tmp_data_dir, api)
+        self._add(engine, 9651, renew_mode='pull')
+        self._add(engine, 9652, renew_mode='pull')
+
+        results = self._run(engine)
+        assert api.query_order.call_count == 2
+        assert all(r['status'] == 'failure' for r in results)
+        with open(os.path.join(tmp_data_dir, 'renew_status.json')) as f:
+            status = json.load(f)
+        assert status['auth_blocks'] == []
+
+
+class TestCallbackBreaker:
+    """非关键上报熔断（spec §11）
+
+    单次回调最坏 = MAX_RETRIES(3) × TIMEOUT_POST(60s) + 退避 ≈ 183 秒，而 cron 批量
+    上限 100 张：逐张各等一份完整超时预算时最坏耗时随证书数线性放大到数小时。
+    """
+
+    def _engine(self, tmp_data_dir, api=None):
+        return RenewEngine(ConfigManager(tmp_data_dir), MagicMock(return_value=api or MagicMock()),
+                           MagicMock(), MagicMock())
+
+    def test_opens_after_threshold_and_stops_calling(self, tmp_data_dir):
+        api = MagicMock()
+        api.callback.side_effect = OSError('connection refused')
+        engine = self._engine(tmp_data_dir, api)
+
+        for _ in range(CALLBACK_BREAKER_THRESHOLD + 5):
+            engine._send_failure_callback(api, 1, 'boom')
+
+        assert api.callback.call_count == CALLBACK_BREAKER_THRESHOLD, \
+            '熔断后不得再发起同类上报'
+
+    def test_success_resets_the_streak(self, tmp_data_dir):
+        api = MagicMock()
+        engine = self._engine(tmp_data_dir, api)
+
+        # 连续失败两次（未达阈值），随后一次成功应清零
+        api.callback.side_effect = [OSError('x'), OSError('x'), None]
+        for _ in range(3):
+            engine._send_failure_callback(api, 1, 'boom')
+        assert engine._callback_fail_streak == 0
+
+        # 清零后重新获得完整额度
+        api.callback.side_effect = OSError('x')
+        for _ in range(CALLBACK_BREAKER_THRESHOLD + 3):
+            engine._send_failure_callback(api, 1, 'boom')
+        assert api.callback.call_count == 3 + CALLBACK_BREAKER_THRESHOLD
+
+    def test_deploy_result_and_block_reports_share_the_counter(self, tmp_data_dir):
+        """两类非关键上报共享计数：通道坏了就是坏了，不该各自再试三次"""
+        api = MagicMock()
+        api.callback.side_effect = OSError('x')
+        engine = self._engine(tmp_data_dir, api)
+
+        engine._send_deploy_callback(api, 1, 'failure', '2026-07-26T00:00:00Z', 'm', False)
+        engine._send_deploy_callback(api, 2, 'failure', '2026-07-26T00:00:00Z', 'm', False)
+        assert api.callback.call_count == 2
+        # 第三次由 failure 回调触发即达阈值，之后两类都不再发
+        engine._send_failure_callback(api, 3, 'boom')
+        assert api.callback.call_count == CALLBACK_BREAKER_THRESHOLD
+        engine._send_deploy_callback(api, 4, 'failure', '2026-07-26T00:00:00Z', 'm', False)
+        engine._send_failure_callback(api, 5, 'boom')
+        assert api.callback.call_count == CALLBACK_BREAKER_THRESHOLD
+
+    def test_breaker_does_not_consume_block_report_budget(self, tmp_data_dir):
+        """熔断打开时阻断上报根本没发出去，不得消耗 block_report_count 额度
+
+        否则一次上报通道故障就能烧完 10 次额度，通道恢复时该证书已永久静默。
+        """
+        api = MagicMock()
+        api.callback.side_effect = OSError('x')
+        engine = self._engine(tmp_data_dir, api)
+        engine._config.add_cert(order_id=9701, cert_name='order-9701', domains=['a.com'],
+                                site_names=['a.com'], renew_mode='pull')
+
+        # 先把熔断打开（用不消耗额度的部署结果回调）
+        for _ in range(CALLBACK_BREAKER_THRESHOLD):
+            engine._send_deploy_callback(api, 9701, 'failure', '2026-07-26T00:00:00Z', 'm', False)
+        assert engine._callback_breaker_open()
+
+        cert = engine._config.get_cert(9701)
+        for i in range(5):
+            engine._report_block(cert, api, 9701, 'reason-%d' % i)
+
+        meta = engine._config.get_cert(9701)['metadata']
+        assert meta['block_report_count'] == 0, '未发出的上报不得消耗额度'
+        assert meta['last_deploy_block_reason'] == 'reason-4', '本地记录仍须落盘'
+
+    def test_block_report_consumes_budget_when_attempted(self, tmp_data_dir):
+        """对照组：通道正常时每次变化都真的发一次并消耗额度"""
+        api = MagicMock()
+        engine = self._engine(tmp_data_dir, api)
+        engine._config.add_cert(order_id=9702, cert_name='order-9702', domains=['b.com'],
+                                site_names=['b.com'], renew_mode='pull')
+
+        cert = engine._config.get_cert(9702)
+        for i in range(3):
+            engine._report_block(cert, api, 9702, 'reason-%d' % i)
+
+        meta = engine._config.get_cert(9702)['metadata']
+        assert meta['block_report_count'] == 3
+        assert api.callback.call_count == 3
+
+
+class TestOrderStatusClassification:
+    """服务端订单状态显式分类（spec §2.4）
+
+    spec 明令禁止「其余即终态」兜底：服务端枚举含 unpaid / cancelling 这类可自愈中间态，
+    误判为终态会让证书停在等人工而实际无人需处理；未知新增状态当终态更会误伤全量证书。
+    """
+
+    @pytest.mark.parametrize('status,expected', [
+        ('active', 'active'),
+        ('pending', 'waiting'),
+        ('processing', 'waiting'),
+        ('approving', 'waiting'),
+        ('unpaid', 'waiting'),
+        ('cancelling', 'waiting'),
+        ('failed', 'terminal'),
+        ('cancelled', 'terminal'),
+        ('revoked', 'terminal'),
+        ('expired', 'terminal'),
+        ('renewed', 'chain'),
+        ('reissued', 'chain'),
+        ('brand_new_state', 'unknown'),
+        ('', 'unknown'),
+        (None, 'unknown'),
+    ])
+    def test_every_status_is_explicitly_classified(self, status, expected):
+        assert classify_order_status(status) == expected
+
+    @pytest.mark.parametrize('status', ['pending', 'approving', 'unpaid', 'cancelling',
+                                        'brand_new_state', ''])
+    def test_waiting_and_unknown_normalize_to_processing(self, status):
+        """在途等待与未知新增状态一律归一 processing：只查询、不重复提交"""
+        assert _normalize_issue_status(status) == 'processing'
+
+    @pytest.mark.parametrize('status', ['cancelled', 'revoked', 'failed', 'renewed'])
+    def test_terminal_and_chain_are_not_normalized(self, status):
+        assert _normalize_issue_status(status) == status
+
+    def _engine(self, tmp_data_dir, api):
+        return RenewEngine(ConfigManager(tmp_data_dir), MagicMock(return_value=api),
+                           MagicMock(), MagicMock())
+
+    def test_unknown_status_keeps_polling_instead_of_halting(self, tmp_data_dir):
+        """服务端新增未知状态：保守当在途等待，不得写终态、不得计入失败"""
+        api = MagicMock()
+        api.last_renew_before_days = 0
+        api.query_order.return_value = {'order_id': 9801, 'status': 'some_new_status'}
+        engine = self._engine(tmp_data_dir, api)
+        engine._config.add_cert(order_id=9801, cert_name='order-9801', domains=['a.com'],
+                                site_names=['a.com'], renew_mode='local')
+        engine._config.update_metadata(9801, {'last_issue_state': 'processing',
+                                              'cert_expires_at': ''})
+
+        with patch('lib.renew.probe_panel_runtime', return_value=None):
+            results = engine.check_and_renew_all(spread=False, lock_wait=0)
+
+        meta = engine._config.get_cert(9801)['metadata']
+        assert meta['last_issue_state'] == 'processing', '未知状态不得升级为终态'
+        assert meta['last_order_status'] == 'some_new_status'
+        assert all(r['status'] != 'failure' for r in results), '未知状态不该计入失败统计'
+
+    def test_chain_status_warns_once_then_stays_quiet(self, tmp_data_dir):
+        """链式状态（renewed/reissued）= 链数据异常：首次告警，之后静默等自愈"""
+        api = MagicMock()
+        api.last_renew_before_days = 0
+        api.query_order.return_value = {'order_id': 9802, 'status': 'renewed'}
+        logger = MagicMock()
+        engine = RenewEngine(ConfigManager(tmp_data_dir), MagicMock(return_value=api),
+                             MagicMock(), logger)
+        engine._config.add_cert(order_id=9802, cert_name='order-9802', domains=['b.com'],
+                                site_names=['b.com'], renew_mode='local')
+        engine._config.update_metadata(9802, {'last_issue_state': 'processing',
+                                              'cert_expires_at': ''})
+
+        with patch('lib.renew.probe_panel_runtime', return_value=None):
+            for _ in range(3):
+                engine.check_and_renew_all(spread=False, lock_wait=0)
+
+        chain_errors = [c for c in logger.error.call_args_list if '链数据异常' in str(c)]
+        assert len(chain_errors) == 1, '仅状态首次变化时告警，之后静默'
+        meta = engine._config.get_cert(9802)['metadata']
+        assert meta['last_order_status'] == 'renewed'
+        assert meta['last_issue_state'] == 'processing', '链式状态同样不写在途标记'
+
+    def test_terminal_order_never_falls_through_to_post(self, tmp_data_dir):
+        """终态订单连续多轮：绝不落到 _submit_new_csr（POST 会触发服务端扣费）"""
+        api = MagicMock()
+        api.last_renew_before_days = 0
+        api.query_order.return_value = {'order_id': 9803, 'status': 'cancelled'}
+        engine = self._engine(tmp_data_dir, api)
+        engine._config.add_cert(order_id=9803, cert_name='order-9803', domains=['c.com'],
+                                site_names=['c.com'], renew_mode='local')
+        # 到期时间已知且临期：这正是旧实现会落到 POST 的条件
+        soon = (datetime.now(timezone.utc) + timedelta(days=3)).strftime('%Y-%m-%dT%H:%M:%SZ')
+        engine._config.update_metadata(9803, {'last_issue_state': 'processing',
+                                              'cert_expires_at': soon})
+
+        with patch('lib.renew.probe_panel_runtime', return_value=None):
+            for _ in range(5):
+                engine.check_and_renew_all(spread=False, lock_wait=0)
+
+        api.submit_csr.assert_not_called()
+
+
+class TestCertUnchangedIntegration:
+    """证书更替检测的**集成**契约（spec §3.8）
+
+    既有测试全是对 _track_cert_unchanged 的孤立单测、手工传入 prev_serial，从未跑过
+    _deploy_and_report → deploy_multi → 检测 的真实链路，因此两个缺陷同时对测试隐形：
+
+    1. deploy_multi 只 update_metadata 写盘、不回写内存 cert_entry，检测若从 metadata
+       读"新序列号"，拿到的永远是部署前的旧值 → 与 prev 恒等 → 每张正常续签的证书在
+       第二次续签时被误判 failure，而服务端失败提醒是电平驱动，健康证书永久留在失败视图；
+    2. unchanged_cert_rounds 一旦进入 DEPLOY_SUCCESS_RESET_KEYS，计数每轮先归零再递增
+       到 1，永远达不到阈值（spec §3.8 明文点名的陷阱）。
+    """
+
+    def _engine(self, tmp_data_dir, serials):
+        """serials: 每轮 deploy_multi 落盘的 cert_serial（模拟服务端交付的证书）"""
+        cfg = ConfigManager(tmp_data_dir)
+        cfg.add_cert(order_id=1, cert_name='o1', domains=['a.com'], site_names=['s1'])
+        cfg.update_metadata(1, {'cert_serial': serials[0]})
+        api = MagicMock()
+        api.last_renew_before_days = 0
+        deployer = MagicMock()
+        engine = RenewEngine(cfg, MagicMock(return_value=api), deployer, MagicMock())
+        engine._check_deploy_environment = lambda *a, **k: None   # 跳过环境闸门
+
+        state = {'i': 0}
+
+        def fake_deploy_multi(**kw):
+            """忠实模拟 deploy_multi：只写盘、不回写内存 cert_entry"""
+            state['i'] += 1
+            meta = {'site_deploy_status': {'s1': {'status': True}}}
+            meta.update(DEPLOY_SUCCESS_RESET_KEYS)
+            meta['cert_serial'] = serials[min(state['i'], len(serials) - 1)]
+            cfg.update_metadata(1, meta)
+            return [{'site_name': 's1', 'status': True, 'message': ''}]
+
+        deployer.deploy_multi = fake_deploy_multi
+        return engine, cfg, api, state
+
+    def _round(self, engine, cfg, api, serial_of_this_round):
+        """跑一轮编排层部署；serial_of_this_round 即 fullchain 解析出的序列号"""
+        cert = cfg.get_cert(1)      # 每轮重新从盘加载，等同 cron 新进程
+        with patch('lib.renew.cert_utils.parse_cert_info',
+                   return_value={'serial': serial_of_this_round}):
+            engine._deploy_and_report(cert, api, 'FULLCHAIN', 'KEY', ['s1'], ['a.com'], 1)
+        return api.callback.call_args.kwargs
+
+    def test_new_cert_each_round_never_false_positives(self, tmp_data_dir):
+        """服务端每轮都给新证书：绝不能报 failure（此前从第 2 轮起必误报）"""
+        serials = ['S0', 'S1', 'S2', 'S3']
+        engine, cfg, api, _ = self._engine(tmp_data_dir, serials)
+
+        for rnd in range(1, 4):
+            cb = self._round(engine, cfg, api, serials[rnd])
+            assert cb['status'] == 'success', \
+                '第 %d 轮误报：服务端确实换了证书（%s）' % (rnd, serials[rnd])
+
+    def test_same_cert_twice_is_detected_end_to_end(self, tmp_data_dir):
+        """服务端反复返回同一张证书：第 2 轮必须改判 failure 并上报"""
+        engine, cfg, api, _ = self._engine(tmp_data_dir, ['SAME'])
+
+        cb1 = self._round(engine, cfg, api, 'SAME')
+        assert cb1['status'] == 'success', '第 1 轮仅计数，不改判'
+        assert cfg.get_cert(1)['metadata']['unchanged_cert_rounds'] == 1
+
+        cb2 = self._round(engine, cfg, api, 'SAME')
+        assert cb2['status'] == 'failure', '连续 2 轮同一张证书必须改判失败'
+        assert '未实际更新' in cb2['message']
+
+    def test_deploy_success_must_not_reset_the_counter(self, tmp_data_dir):
+        """spec §3.8：计数所有权归检测本身，绝不能随部署成功清零
+
+        这道断言直接钉住那张清零列表——把 unchanged_cert_rounds 加回
+        DEPLOY_SUCCESS_RESET_KEYS 就会让它变红。
+        """
+        assert 'unchanged_cert_rounds' not in DEPLOY_SUCCESS_RESET_KEYS
+
+        engine, cfg, api, _ = self._engine(tmp_data_dir, ['SAME'])
+        self._round(engine, cfg, api, 'SAME')
+        # 本轮部署是成功的（deploy_multi 写入了整张成功清零表），计数仍须留存
+        assert cfg.get_cert(1)['metadata']['unchanged_cert_rounds'] == 1
+
+    def test_serial_change_clears_accumulated_rounds(self, tmp_data_dir):
+        """中途换成新证书：累计计数必须清零，不留到下次凑够阈值误报"""
+        engine, cfg, api, _ = self._engine(tmp_data_dir, ['SAME'])
+        self._round(engine, cfg, api, 'SAME')
+        assert cfg.get_cert(1)['metadata']['unchanged_cert_rounds'] == 1
+
+        cb = self._round(engine, cfg, api, 'BRAND-NEW')
+        assert cb['status'] == 'success'
+        assert cfg.get_cert(1)['metadata']['unchanged_cert_rounds'] == 0
+
+
+class TestPostErrorCodePolicy:
+    """§2.6 提交路径上确定性失败的处置分档（spec §2.2 单条目组）
+
+    order_in_progress 是唯一的过渡态；其余永久码刻意不分档——「有界」由签发计数上限
+    提供、「可见」由 error_code 进错误文本提供，不为它们各造终态（立即终态会杀死自动
+    恢复：用户充值/开开关后还得回面板点「恢复自动续签」）。
+    """
+
+    def _engine(self, tmp_data_dir, submit_error, order_status='processing'):
+        cfg = ConfigManager(tmp_data_dir)
+        cfg.add_cert(order_id=1, cert_name='o1', domains=['a.com'], site_names=['s1'],
+                     renew_mode='local', validation_method='file',
+                     api_url='https://api.example.com', api_token='t' * 32)
+        soon = (datetime.now(timezone.utc) + timedelta(days=5)).strftime('%Y-%m-%dT%H:%M:%SZ')
+        cfg.update_metadata(1, {'cert_expires_at': soon})   # 临期 + 到期时间已知 → 走提交路径
+        api = MagicMock()
+        api.last_renew_before_days = 0
+        api.query_order.return_value = {'order_id': 1, 'status': order_status}
+        api.submit_csr.side_effect = submit_error
+        engine = RenewEngine(cfg, MagicMock(return_value=api), MagicMock(), MagicMock())
+        return engine, cfg, api
+
+    def _rounds(self, engine, n):
+        with patch('lib.renew.probe_panel_runtime', return_value=None), \
+                patch('lib.cert_utils.generate_csr', return_value=('CSR', 'KEY', 'h')):
+            out = []
+            for _ in range(n):
+                out.append(engine.check_and_renew_all(spread=False, lock_wait=0))
+            return out
+
+    def test_order_in_progress_normalizes_and_stops_posting(self, tmp_data_dir):
+        """过渡态：归一 processing，只提交一次，之后零 POST、计数不再增长"""
+        err = APIError('订单处于 pending 状态 [order_in_progress]', code=0,
+                       error_code='order_in_progress')
+        engine, cfg, api = self._engine(tmp_data_dir, err)
+
+        self._rounds(engine, 5)
+
+        assert api.submit_csr.call_count == 1, '归一后不得再重复提交（会每轮烧签发额度）'
+        meta = cfg.get_cert(1)['metadata']
+        assert meta['last_issue_state'] == 'processing'
+        assert meta['issue_retry_count'] == 1, '计数停在首次提交，绝不涨到触顶'
+        assert meta['last_issue_state'] != ISSUE_STATE_CAPPED
+
+    def test_order_in_progress_clears_this_round_pending(self, tmp_data_dir):
+        """本轮 pending key/CSR 必须清掉：服务端签的是更早那个 CSR，留着必然不配对
+
+        留着会让 deployer 的配对校验抛 DeployError，把坑从签发侧挪到部署侧
+        （转而烧部署额度，10 轮后 CAPPED(deploy)）。
+        """
+        err = APIError('order in progress [order_in_progress]', code=0,
+                       error_code='order_in_progress')
+        engine, cfg, api = self._engine(tmp_data_dir, err)
+
+        self._rounds(engine, 1)
+
+        cert = cfg.get_cert(1)
+        assert not os.path.isfile(engine._pending_key_path(cert)), 'pending 私钥必须清理'
+        assert not engine._has_pending_csr(cert), '在途 CSR 标记必须清理'
+
+    @pytest.mark.parametrize('code,msg', [
+        ('insufficient_balance', '余额不足以支付本次续费'),
+        ('auto_renew_disabled', '订单未开启自动续费'),
+        ('validation_method_unsupported', '该产品不支持文件验证'),
+    ])
+    def test_permanent_codes_are_bounded_and_visible(self, tmp_data_dir, code, msg):
+        """永久码：每轮一次提交、计数递增，10 轮触顶后零请求；error_code 全程在文本里"""
+        err = APIError('%s [%s]' % (msg, code), code=0, error_code=code)
+        engine, cfg, api = self._engine(tmp_data_dir, err)
+
+        rounds = self._rounds(engine, 12)
+
+        assert api.submit_csr.call_count == MAX_ISSUE_RETRY_COUNT, \
+            '触顶后不得再发起提交'
+        meta = cfg.get_cert(1)['metadata']
+        assert meta['last_issue_state'] == ISSUE_STATE_CAPPED
+        assert meta['capped_phase'] == CAPPED_PHASE_ISSUE
+        # 可见性：失败文本必须带 error_code，这是运维判断「为何停止」的唯一线索
+        assert code in rounds[0][0]['message']
+
+    def test_permanent_code_recovers_when_fixed_within_bound(self, tmp_data_dir):
+        """额度内修好（充值/开开关）→ 下轮自动恢复，无需人工点「恢复自动续签」
+
+        这正是不为永久码另造立即终态的理由：立即终态会让这条自愈路径消失。
+        """
+        err = APIError('余额不足 [insufficient_balance]', code=0,
+                       error_code='insufficient_balance')
+        engine, cfg, api = self._engine(tmp_data_dir, err)
+
+        self._rounds(engine, 3)
+        assert cfg.get_cert(1)['metadata']['issue_retry_count'] == 3
+
+        # 用户充值后服务端接受提交
+        api.submit_csr.side_effect = None
+        api.submit_csr.return_value = {'order_id': 1, 'status': 'processing'}
+        self._rounds(engine, 1)
+
+        meta = cfg.get_cert(1)['metadata']
+        assert meta['last_issue_state'] == 'processing', '修好后应自动继续，无需人工解除'
+        assert meta['last_issue_state'] != ISSUE_STATE_CAPPED
+
+
+class TestAuthBlockRoundSummary:
+    """Token 被拒的轮末汇总（spec §2.2：单条目降 debug，轮末统一一条）"""
+
+    def test_summary_reports_token_and_skipped_counts(self, tmp_data_dir):
+        cfg = ConfigManager(tmp_data_dir)
+        api = MagicMock()
+        api.last_renew_before_days = 0
+        api.query_order.side_effect = APIError(
+            'Invalid token [token_invalid]', code=0, error_code='token_invalid')
+        logger = MagicMock()
+        engine = RenewEngine(cfg, MagicMock(return_value=api), MagicMock(), logger)
+        for oid in (1, 2, 3):
+            cfg.add_cert(order_id=oid, cert_name='o%d' % oid, domains=['d%d.com' % oid],
+                         site_names=['s%d' % oid], api_url='https://api.example.com',
+                         api_token='t' * 32)
+            cfg.update_metadata(oid, {'cert_expires_at': ''})
+
+        with patch('lib.renew.probe_panel_runtime', return_value=None):
+            engine.check_and_renew_all(spread=False, lock_wait=0)
+
+        summaries = [c for c in logger.error.call_args_list
+                     if '个部署 Token 被服务端拒绝' in str(c)]
+        assert len(summaries) == 1, '轮末必须有且只有一条汇总'
+        args = summaries[0][0]
+        assert args[1] == 1, '被拒 token 数'
+        assert 'token_invalid' in args[2]
+        assert args[3] == 2, '被跳过的证书数（首张探明结果，其余零请求跳过）'
+        # 单条目降 debug，不占 error 通道
+        assert any('跳过该证书' in str(c) for c in logger.debug.call_args_list)

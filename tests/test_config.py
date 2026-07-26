@@ -510,7 +510,7 @@ class TestSemanticMigration:
         meta = cm.get_cert(5000)['metadata']
         assert meta['last_issue_state'] == expected_state
         if expected_stage:
-            assert meta.get('cap_stage') == expected_stage
+            assert meta.get('capped_phase') == expected_stage
         # 部署计数始终从零，不从旧签发计数推断
         assert meta['deploy_attempt_count'] == 0
 
@@ -522,7 +522,7 @@ class TestSemanticMigration:
         cm2 = ConfigManager(tmp_data_dir)  # 二次加载
         meta = cm2.get_cert(5000)['metadata']
         assert meta['last_issue_state'] == 'CAPPED'
-        assert meta['cap_stage'] == 'legacy'
+        assert meta['capped_phase'] == 'legacy'
 
     @pytest.mark.parametrize('domains,mode,vm,expected', [
         (['1.2.3.4'], 'pull', '', 'policy_blocked_needs_setup'),          # IP + pull
@@ -730,3 +730,59 @@ class TestConfigDegradedMode:
         assert cfg.is_degraded() is False
         cfg.add_cert(order_id=1, cert_name='order-1', domains=['a.com'], site_names=[])
         assert len(cfg.get_certs()) == 1
+
+
+class TestMetadataFieldMigration:
+    """metadata 层字段迁移（此前迁移引擎只覆盖全局层与证书层，够不到 cert['metadata']）"""
+
+    def test_cap_stage_renamed_to_capped_phase(self, tmp_data_dir):
+        """cap_stage → capped_phase：v0.3.9 已发布旧名，线上盘上确有该键
+
+        不迁移的表现是面板丢掉具体触顶阶段（退回泛化文案「重试超限」），
+        且旧键永久滞留成死数据。
+        """
+        _write_legacy_config(tmp_data_dir, {
+            'cert_expires_at': '', 'last_issue_state': 'CAPPED', 'cap_stage': 'stalled',
+        })
+        cm = ConfigManager(tmp_data_dir)
+        meta = cm.get_cert(5000)['metadata']
+        assert meta['capped_phase'] == 'stalled', '旧值必须搬到新键'
+        assert 'cap_stage' not in meta, '旧键必须移除，不留死数据'
+
+    def test_migration_persists_to_disk(self, tmp_data_dir):
+        """迁移结果要落盘，否则每次加载都重算、且外部读 config.json 仍是旧名"""
+        _write_legacy_config(tmp_data_dir, {
+            'cert_expires_at': '', 'last_issue_state': 'CAPPED', 'cap_stage': 'issue',
+        })
+        ConfigManager(tmp_data_dir)
+        with open(os.path.join(tmp_data_dir, 'config.json')) as f:
+            raw = json.load(f)
+        meta = raw['certificates'][0]['metadata']
+        assert meta['capped_phase'] == 'issue'
+        assert 'cap_stage' not in meta
+
+    def test_migration_is_idempotent(self, tmp_data_dir):
+        """重复加载不产生副作用（迁移引擎的幂等性要求）"""
+        _write_legacy_config(tmp_data_dir, {
+            'cert_expires_at': '', 'last_issue_state': 'CAPPED', 'cap_stage': 'deploy',
+        })
+        ConfigManager(tmp_data_dir)
+        cm = ConfigManager(tmp_data_dir)
+        assert cm.get_cert(5000)['metadata']['capped_phase'] == 'deploy'
+
+    def test_new_value_wins_when_both_keys_present(self, tmp_data_dir):
+        """新旧键并存（部分升级/回滚过的盘）：保留新值，不被旧值覆盖"""
+        _write_legacy_config(tmp_data_dir, {
+            'cert_expires_at': '', 'last_issue_state': 'CAPPED',
+            'cap_stage': 'legacy', 'capped_phase': 'stalled',
+        })
+        cm = ConfigManager(tmp_data_dir)
+        meta = cm.get_cert(5000)['metadata']
+        assert meta['capped_phase'] == 'stalled'
+        assert 'cap_stage' not in meta
+
+    def test_absent_old_key_is_noop(self, tmp_data_dir):
+        """全新安装无旧键：不得凭空造出 capped_phase"""
+        _write_legacy_config(tmp_data_dir, {'cert_expires_at': ''})
+        cm = ConfigManager(tmp_data_dir)
+        assert 'capped_phase' not in cm.get_cert(5000)['metadata']
