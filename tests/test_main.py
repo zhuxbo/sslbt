@@ -659,6 +659,17 @@ class TestFetchDeployUrl:
         assert result['status'] is False
         assert 'order' in result['msg']
 
+    @pytest.mark.parametrize('order', ['example.com', '100,example.com', 'abc', '1;2'])
+    @patch('sslbt_main.APIClient')
+    def test_domain_form_link_rejected_with_actionable_msg(self, mock_api_cls, plugin, order):
+        """spec §2.3 起 order 只接受订单 ID：域名形态的旧链接给可执行提示，且不发请求"""
+        result = plugin.fetch_deploy_url(
+            {'url': 'https://api.example.com/api/deploy?token=' + TOKEN + '&order=' + order})
+        assert result['status'] is False
+        assert '订单 ID' in result['msg']
+        assert '重新复制部署链接' in result['msg']
+        mock_api_cls.assert_not_called()
+
     @patch('sslbt_main.APIClient')
     def test_success_returns_session_id(self, mock_api_cls, plugin):
         """正常流程返回 session_id 而非明文 token"""
@@ -1466,7 +1477,7 @@ class TestResetIssueState:
         oid = self._add(plugin)
         plugin._config.update_metadata(oid, {
             'last_issue_state': 'CAPPED',
-            'cap_stage': 'issue',
+            'capped_phase': 'issue',
             'issue_retry_count': 10,
             'deploy_attempt_count': 4,
             'deploy_started': True,
@@ -1477,7 +1488,7 @@ class TestResetIssueState:
         assert result['status'] is True
         meta = plugin._config.get_cert(oid)['metadata']
         assert meta['last_issue_state'] == ''
-        assert meta['cap_stage'] == ''
+        assert meta['capped_phase'] == ''
         assert meta['issue_retry_count'] == 0
         assert meta['deploy_attempt_count'] == 0
         assert meta['deploy_started'] is False
@@ -1490,7 +1501,7 @@ class TestResetIssueState:
 
         oid = self._add(plugin, 901)
         plugin._config.update_metadata(oid, {
-            'last_issue_state': 'CAPPED', 'cap_stage': 'issue',
+            'last_issue_state': 'CAPPED', 'capped_phase': 'issue',
             'issue_retry_count': MAX_ISSUE_RETRY_COUNT,
         })
         plugin.reset_issue_state({'order_id': str(oid)})

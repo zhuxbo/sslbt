@@ -29,7 +29,7 @@ from lib.config import (  # noqa: E402
     MANUAL_RESET_KEYS,
 )
 from lib.logger import Logger  # noqa: E402
-from lib.api_client import APIClient, APIError  # noqa: E402
+from lib.api_client import APIClient, APIError, ORDER_PARAM_PATTERN  # noqa: E402
 from lib.cert_utils import build_fullchain, parse_cert_info, verify_cert_key_match, validate_key_pem  # noqa: E402
 from lib.site_manager import SiteManager  # noqa: E402
 from lib.deployer import Deployer, DeployError, check_web_config  # noqa: E402
@@ -806,6 +806,13 @@ class sslbt_main:
             if not order_list:
                 return _err('URL 中缺少 order 参数')
             order_value = order_list[0]
+
+            # order 形态本地先判（spec §2.3 起只接受订单 ID）：按域名查询与空参数列全量
+            # 已移除，旧链接会被服务端判 invalid_order。在这里给可执行的提示，
+            # 而不是把服务端原文抛给用户
+            if not ORDER_PARAM_PATTERN.match(str(order_value).strip()):
+                return _err('部署链接中的 order 必须是订单 ID（多个用英文逗号分隔）。'
+                            '按域名生成的旧链接已不再支持，请到管理端重新复制部署链接')
 
             # 构造 api_url，交给项目统一 API 客户端发请求：HTTPS 强制（拒绝 http，仅
             # localhost 例外）+ SSRF/DNS Rebinding 防护 + token 校验，避免绕过统一安全出口。
