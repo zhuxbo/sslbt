@@ -45,14 +45,63 @@ index.html              ← 前端 UI（纯 JS，3 Tab: 证书管理/设置/日�
 
 Bearer Token 认证，部署链接格式：`https://domain/api/deploy?token=xxx&order=123`
 
+### 错误响应分类（deploy-spec §2.2）
+
+错误恒 HTTP 200 + `code=0`，分类只经 `errors.error_code`（取值见 spec，一旦发布不得改动）。
+`APIError` 携带 `error_code` / `retry_after`，并给出两个判据：
+
+- `auth_blocked`（限流 / token / 账号 / IP 类）：失败发生在服务端中间件、与订单无关，
+  同一 token 的后续调用必然同样失败 → `_process_pending` 按 `(url, token)` 轮内拉黑，
+  其余证书记 `skipped` 而非逐张重试；`auth_blocks` 写入 `renew_status.json` 供面板红条
+  （这类失败下回调用的是同一个坏 token、必然也发不出去，面板是唯一提示入口）
+- `order_rejected`（`invalid_order` / `order_not_found` / `cert_not_found`）：只影响单张证书，
+  经 `_query_order` 记 `last_order_status` 并 `_mark_no_progress` 后抛出。**必须锚定停更计时**——
+  否则订单被删除的证书每轮都在查询处抛异常，永远走不到 `_mark_no_progress`，14 天边界形同不存在
+- 无 `error_code` 的错误维持既有语义（未分类，沿用原重试策略），不得因此放宽或收紧
+
+计数纪律：`auth_blocked` 在 CSR 提交路径会**回滚** `issue_retry_count`（连同 `csr_submitted_at`/
+`last_csr_hash`，快照由 `_submit_new_csr` 传入）——请求被拒于业务层之外，那次尝试事实上不存在；
+若不回滚，一次限流风暴就能烧掉全部 10 次额度并把整批证书打成 `CAPPED(issue)`，每张都要人工 reset。
+对照：明确业务拒绝（服务端确实处理并拒绝）计数保留。
+
+轮末汇总：单条目被 token 黑名单跳过只记 debug，轮末统一一条 error（被拒 token 数、跳过条目数、
+处置指引）。缺了它，「本轮几乎什么都没做」的真正原因会被埋掉——整批同一 token 时，
+常规汇总行只会显示成一个无害的小数字。
+
+### §2.6 提交路径的确定性失败分档
+
+这四个码只可能来自 local 模式的 CSR 提交（`submit_csr` 全仓仅 `_do_submit_csr` 一个调用点；
+pull 模式续签根本不 POST）：
+
+- `order_in_progress` —— **唯一的过渡态**，归一 `processing`：服务端已在签发，完成后自行消失。
+  按业务拒绝停止会每轮重生并重提 CSR、每轮烧一次签发额度，10 轮后把一张正在正常签发的证书
+  误判触顶，正是 spec「不做永久停止或退避升级」所禁止的。
+  与 sslctl 的**刻意差异**：归一时**清掉本轮 pending key/CSR**。能走到 `_submit_new_csr` 说明
+  本地认为无在途单而服务端说有 → 服务端签的是更早那个 CSR，本轮私钥必然不配对，留着只会让
+  `deployer` 的配对校验抛 `DeployError`，把坑从签发侧挪到部署侧（转烧部署额度 → `CAPPED(deploy)`）。
+  清掉后订单真签出时走 `_handle_processing` 的「pending key 不存在」分支清空状态，下轮重新提交
+- `validation_method_unsupported` / `auto_renew_disabled` / `insufficient_balance` ——
+  **刻意不分档**，沿用既有业务拒绝路径（清 pending、计数保留、10 轮触顶静默）。「有界」由计数
+  上限提供、「可见」由 `error_code` 进错误文本提供。**不要为它们另造终态**：立即终态会杀死自动
+  恢复——用户充值/开开关/改配置后必须再回面板点「恢复自动续签」，只做了前一步的人会以为插件
+  坏了。现状是额度内修好则次日自动继续，超出才需人工解除（那时人本就在处理这张证书）
+
+`test_connection` 刻意不带 `order`：必被判 `invalid_order`，而该错误恰好证明请求已穿过
+认证中间件抵达业务层，是最省事的连通性+认证探针（无需持有真实订单号）。
+
 ### GET /api/deploy — 查询
 
-参数 `order`（统一）：纯数字=ID，字符串=域名，含逗号=批量。不传返回最新 active 订单。
-分页参数：`currentPage`、`pageSize`（max 100）
+`order` **必填且只接受订单 ID**（单个或逗号分隔，上限 100，形态 `^\d+(,\d+)*$`）。
+按域名查询与空参数列全量已于 2026-07 移除；`field` 拉取模式与本插件无关（spec §2.3.1）。
 
-统一分页响应：
+**无分页**：不返回也不接受 `total`/`page`/`page_size`。`query_batch` 单次请求取完即止，
+**禁止任何翻页循环**——终止只依赖服务端自报的计数与非空页，两者同时失真即无限翻页且
+累积内存无界。形态校验在 `validate_order_param()` 本地先做（发请求前），对旧域名链接
+给可执行提示而非服务端原文；`fetch_deploy_url` 同口径先挡一道。
+
+响应：
 ```json
-{"code": 1, "data": {"total": N, "currentPage": 1, "pageSize": 100, "data": [...]}}
+{"code": 1, "data": {"data": [...], "renew_before_days": 14}}
 ```
 
 每条数据：
@@ -125,7 +174,21 @@ SetSSL 部署：写入前 pre-flight 校验既有配置（`check_web_config()`�
 - 行为契约以 `deploy-spec.md`（§1.5/§2.6/§2.8/§3.2/§3.5/§5.1/§5.2）为准，本节仅记实现要点
 - Pull 模式：查询订单，active 且证书完整则直接部署
 - Local 模式：派生策略 → 生成 CSR → 提交 → processing 状态轮询 → active 后部署
-- 计数分离与终止（`config` 常量）：签发 `issue_retry_count`（CSR 提交）与部署 `deploy_attempt_count` 分别计数、各自 `>= 10` 触顶；触顶置 `last_issue_state=CAPPED` 并记 `metadata.cap_stage`（issue/deploy/legacy）静默；已过期置 `EXPIRED` 静默；剩余有效期 < `SAFETY_MARGIN_HOURS=24` 不启动新动作。触顶/过期/policy 阻断均不发回调。前置过滤对 `processing` 证书豁免签发触顶（CSR 已被接受，继续轮询）
+- 计数分离与终止（`config` 常量）：签发 `issue_retry_count`（CSR 提交）与部署 `deploy_attempt_count` 分别计数、各自 `>= 10` 触顶；触顶置 `last_issue_state=CAPPED` 并记 `metadata.capped_phase`（issue/deploy/stalled/legacy）静默；已过期置 `EXPIRED` 静默；剩余有效期 < `SAFETY_MARGIN_HOURS=24` 不启动新动作。触顶/过期/policy 阻断均不发回调。前置过滤对 `processing` 证书豁免签发触顶（CSR 已被接受，继续轮询）
+- 订单状态分类（`config.classify_order_status`，spec §2.4）：**禁止「其余即终态」兜底**。
+  五类——`active` 部署 / `waiting`（`pending`/`processing`/`approving`/`unpaid`/`cancelling`）
+  归一 processing 只查询 / `terminal`（`failed`/`cancelled`/`revoked`/`expired`）停止等人工 /
+  `chain`（`renewed`/`reissued`）链数据异常按终态并告警 / `unknown` **保守当在途等待**，
+  由无进展时限兜底。未知当终态会让服务端新增一个中间态就误伤全量证书
+- **订单状态只写 `last_order_status`（展示专用），绝不写 `last_issue_state`**（spec §2.4）。
+  后者语义是「有无在途订单」（`IN_FLIGHT_ISSUE_STATES` = processing/active），混入订单状态
+  会带来一条扣费路径：状态被改写成 `cancelled` 之类自由文本后既不在 `TERMINAL_ISSUE_STATES`
+  （前置过滤拦不住）、又不等于 processing（`_renew_local` 不再走查询分支），下一轮直接落到
+  `_submit_new_csr` 发出 POST，而 POST 会触发服务端 pay **扣费**。保持在途标记不动，该路径
+  恒为「只查询」。`unpaid`/`cancelling` 同理归 waiting——服务端自行推进，客户端绝不主动 POST
+- 终态/链式状态仅在**相对上一轮变化时**告警（`_track_order_status` 返回是否变化），
+  未变化静默；`unknown` 一律不计入失败统计。等待分支也记 `last_order_status`，
+  否则卡在 `unpaid` 的证书与正常等签发无法区分，用户只能等 14 天停更才发现
 - 计数递增时机 = 持久化新逻辑尝试意图：`_submit_new_csr` 提交前递增签发计数；`_begin_deploy_attempt` 部署前递增部署计数并置 `deploy_started`，崩溃恢复重放（`deploy_started` 已置位）不自增
 - 回调所有权收敛：自动续签底层 `deploy_multi(send_callback=False)` 只返回结构化结果，编排层 `_deploy_and_report` 在结果落盘后统一发一次；每次成功/明确失败各尽力一报，第 10 次（最后一次）失败 message 追加「已达重试上限」；签发失败不上报（仅本地日志与计数）。手动 `deploy`/`setup` 默认 `send_callback=True`，语义不变
 - 环境闸门（`_check_deploy_environment`，在 `_begin_deploy_attempt` 之前）：`check_web_config()` 失败时**不递增** `deploy_attempt_count`、不置 `deploy_started`，写 `metadata.last_deploy_block_reason`/`last_deploy_block_at`（经 `_compact_reason` 压平多行并限长 300）供面板展示，**发一次 failure 回调**，`_deploy_and_report` 抛 `RuntimeError` 让本轮记为失败。
@@ -169,6 +232,17 @@ SetSSL 部署：写入前 pre-flight 校验既有配置（`check_web_config()`�
   此前返回 True 造成本地与服务端双口径
 - 证书更替检测（`_track_cert_unchanged`）：仅编排层判定、两端 serial 非空才比、连续
   `CERT_UNCHANGED_ROUNDS=2` 轮才升级 failure。手动重复部署与部分失败重试都会命中同一序列号
+  - **两端序列号一律由调用方传入，本方法不读 metadata**：`deploy_multi` 只
+    `update_metadata` 写盘、**不回写内存 `cert_entry`**，从 metadata 读回的"新值"其实
+    还是部署前的旧值、与 `prev_serial` 恒等 → 每张正常续签的证书在第二次续签时被误判
+    failure，而服务端失败提醒是电平驱动，健康证书就此永久留在失败视图。新序列号由编排层
+    从待部署的 `fullchain` 直接解析
+  - **`unchanged_cert_rounds` 不得进 `DEPLOY_SUCCESS_RESET_KEYS`**（spec §3.8 点名的陷阱）：
+    计数所有权归检测本身，而检测在部署之后执行，随部署成功清零会让计数每轮先归零再递增
+    到 1、永远达不到阈值。保留在 `MANUAL_RESET_KEYS` 无冲突（用户主动清账）
+  - 这两条都只在集成链路才暴露：孤立单测手工传 `prev_serial`，跑不到
+    `_deploy_and_report → deploy_multi → 检测`，故 `TestCertUnchangedIntegration`
+    必须存在（含"部署成功后计数仍留存"这条钉死清零列表的断言）
 - 抢锁窗口按调用方参数化：cron `CRON_LOCK_WAIT=120`，面板按钮 `PANEL_LOCK_WAIT=6`（同步 HTTP）；
   抢锁失败写 `renew_lock_skip.json` 而非读改写 `renew_status.json`（那是无锁路径，会覆盖持锁方结果）
 - 批次选择 `_select_batch`：processing 组限额 `MAX_RENEW_BATCH//2`，组内按 `last_attempt_at`
@@ -180,6 +254,12 @@ SetSSL 部署：写入前 pre-flight 校验既有配置（`check_web_config()`�
   cron 的任意一次 `update_metadata`
 - 新增 metadata 字段必须同步 `config.DEPLOY_SUCCESS_RESET_KEYS` 与 `MANUAL_RESET_KEYS`，
   否则面板会留存已消失的旧原因，而测试不会变红
+- 非关键上报熔断（`CALLBACK_BREAKER_THRESHOLD=3`，spec §11）：部署结果回调与阻断上报
+  **共享**实例级连续失败计数，达阈值即跳过本轮剩余同类上报，成功清零。单次回调最坏
+  ≈183s（3 次重试 × 60s POST 超时 + 退避），批量上限 100 张时逐张干等会线性放大到数小时。
+  熔断只砍网络等待，部署结果判定与本地落盘不受影响；熔断打开时跳过的阻断上报
+  **不消耗** `block_report_count`（未发出的上报不算额度，否则一次通道故障就让证书永久静默）。
+  手动 `deploy`/`setup` 单证书、无线性放大，不接入熔断
 
 ## 已知局限（无需处理，仅记录）
 
@@ -197,7 +277,11 @@ SetSSL 部署：写入前 pre-flight 校验既有配置（`check_web_config()`�
 - `schedule.renew_mode`：全局续签模式（pull/local），证书级优先
 - `release_url` / `upgrade_channel`：升级地址和通道（main/dev）
 - `validation_method`：证书级验证方式（`delegation` 或 `file`），空值默认服务端决定；受域名类型约束（IP 不可 delegation，通配符不可 file）。派生统一走 `derive_or_validate_renew_policy()`（SAN 含 IP 强制 local/file），add_cert/update_cert_config/batch_set_renew_policy/续签提交均调用
-- `metadata`：新增 `deploy_attempt_count`（部署计数，从零起算）；`last_issue_state` 取值扩为 `""`/`processing`/`CAPPED`/`EXPIRED`/`policy_blocked_needs_setup`；触顶阶段记于 `cap_stage`（见 deploy-spec §1.5）
+- `metadata`：`last_issue_state` 取值为 `""`/`processing`/`active`/`CAPPED`/`EXPIRED`/`policy_blocked_needs_setup`；触顶阶段记于 `capped_phase`（见 deploy-spec §1.5）
+- 数据驱动迁移覆盖三层：全局 `_GLOBAL_FIELD_RULES`、证书 `_CERT_FIELD_RULES`、
+  metadata `_METADATA_FIELD_RULES`（后者本轮补齐，此前引擎够不到 `cert['metadata']`）。
+  metadata 规则要在 `_fill_defaults` **之前**执行：`rename` 的判据是「目标键不存在才搬」，
+  先补默认值会让旧值被静默丢弃。现有条目：`cap_stage` → `capped_phase`（v0.3.9 已发布旧名）
 - 站点唯一绑定：一个站点只能绑定一个证书，add_cert / update_cert / update_cert_config 均校验
 - 数据驱动迁移引擎：delete/rename/move/spread 字段迁移 + 计算型语义迁移（`_migrate_cert_semantics`：pending 归一 processing、旧计数 `>=10` 立即 CAPPED(legacy)、旧非法 IP 配置 IP+pull/IP+delegation 进 `policy_blocked_needs_setup` 不自动改配置），仅在 `_ensure_config` 加载时一次性执行并持久化，不补发历史
 - ConfigManager 支持可选 `logger` 参数，JSON 损坏时记录 error 并创建 .bak 备份
@@ -240,7 +324,8 @@ make finish-check  # 自动化完成门禁
 make docker-test   # 容器集成测试（nginx/apache 双环境，安装/部署/续签三段）
 ```
 
-docker-test 说明：mock-api 从同级仓 `../sslctl/docker/test/mock-api` 构建；宝塔容器由官方镜像
+docker-test 说明：mock-api 已收编进本仓 `docker/mock-api/`（不再跨仓引用 sslctl），
+契约要点与新增场景见该目录 README，宿主机跑 `make mock-api-test`；宝塔容器由官方镜像
 `/www.tar.gz` 离线还原面板，entrypoint 注册测试站点并起 loopback 转发（插件经
 `http://127.0.0.1:18080` 访问 mock-api，满足「非 loopback 强制 HTTPS」约束）；
 容器内插件一律用面板 pyenv（Python 3.7）执行，系统 python3 缺面板依赖。
