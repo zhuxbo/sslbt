@@ -256,7 +256,11 @@ def parse_csr_info(csr_pem):
         if pub_der.returncode != 0:
             return None
         subject = verify.stdout or ''
-        cn_match = re.search(r'(?:^|[,/])\s*CN\s*=\s*([^,/]+)', subject)
+        cn_match = re.search(
+            r'(?:^|[,/]|subject\s*=)\s*CN\s*=\s*([^,/]+)',
+            subject,
+            re.IGNORECASE,
+        )
         return {
             'hash': hashlib.sha256(der.stdout).hexdigest(),
             'common_name': cn_match.group(1).strip() if cn_match else '',

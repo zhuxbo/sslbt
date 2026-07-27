@@ -276,6 +276,26 @@ class TestValidateSiteNameComponent:
 
 
 class TestCSROwnership:
+    def test_parses_linux_openssl_subject_prefix(self, monkeypatch):
+        """Linux OpenSSL 3 输出 subject=CN = ... 时仍能解析主域名。"""
+        def fake_run(command, **kwargs):
+            if '-verify' in command:
+                return subprocess.CompletedProcess(
+                    command, 0, stdout='subject=CN = example.com\n', stderr='')
+            if '-outform' in command and 'DER' in command and command[1] == 'req':
+                return subprocess.CompletedProcess(command, 0, stdout=b'csr-der', stderr=b'')
+            if '-pubkey' in command:
+                return subprocess.CompletedProcess(command, 0, stdout=b'PUBLIC KEY', stderr=b'')
+            return subprocess.CompletedProcess(command, 0, stdout=b'public-key-der', stderr=b'')
+
+        monkeypatch.setattr(subprocess, 'run', fake_run)
+
+        info = parse_csr_info(
+            '-----BEGIN CERTIFICATE REQUEST-----\nTEST\n-----END CERTIFICATE REQUEST-----')
+
+        assert info is not None
+        assert info['common_name'] == 'example.com'
+
     def test_generated_hash_uses_der_and_key_matches(self):
         csr, key, csr_hash = generate_csr(['example.com'])
 
