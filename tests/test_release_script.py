@@ -116,7 +116,10 @@ def test_dev_release_stages_then_publishes_identical_assets(tmp_path):
     env, nodes = mock_release_env(tmp_path)
     env['FORCE_CLEAN_GIT'] = '1'
     bundle = tmp_path / 'bundle'
-    run_release(['--dev', '9.8.7-rc.1', '--bundle', str(bundle)], env)
+    result = run_release(['--dev', '9.8.7-rc.1', '--bundle', str(bundle)], env)
+
+    assert '所有节点暂存完成；dev 通道无需 tag 和 GitHub Release，将继续发布' in result.stdout
+    assert 'main 通道可继续创建不可变 tag' not in result.stdout
 
     hashes = []
     for node in nodes:
@@ -129,6 +132,26 @@ def test_dev_release_stages_then_publishes_identical_assets(tmp_path):
         assert not (node / '.publish-lock').exists()
     assert hashes[0] == hashes[1]
     assert not (bundle / '.publish-process.lock').exists()
+
+
+def test_legacy_positional_dev_release_is_compatible(tmp_path):
+    env, nodes = mock_release_env(tmp_path)
+    bundle = tmp_path / 'legacy-bundle'
+
+    result = run_release(['v9.8.8-beta.1', '--bundle', str(bundle)], env)
+
+    assert '所有节点暂存完成；dev 通道无需 tag 和 GitHub Release，将继续发布' in result.stdout
+    for node in nodes:
+        assert (node / 'dev' / 'v9.8.8-beta.1' / 'sslbt.zip').is_file()
+        index = json.loads((node / 'releases.json').read_text())
+        assert index['dev']['latest'] == '9.8.8-beta.1'
+
+
+def test_legacy_positional_stable_release_is_rejected():
+    result = run_release(['9.8.8'], os.environ.copy(), check=False)
+
+    assert result.returncode != 0
+    assert 'dev 发布只接受预发布 SemVer' in result.stderr
 
 
 def test_publish_failure_rolls_back_all_nodes(tmp_path):
@@ -149,7 +172,9 @@ def test_publish_failure_rolls_back_all_nodes(tmp_path):
 
     bundle = tmp_path / 'bundle'
     run_release(['--prepare', '1.0.1', '--bundle', str(bundle)], env)
-    run_release(['--stage', str(bundle)], env)
+    stage_result = run_release(['--stage', str(bundle)], env)
+    assert '所有节点暂存完成；main 通道可继续创建不可变 tag 和 draft GitHub Release' in stage_result.stdout
+    assert 'dev 通道无需 tag 和 GitHub Release' not in stage_result.stdout
     failing_env = dict(env, FAIL_HOST='node2', FAIL_MATCH='releases.json.tmp')
     result = run_release(['--publish', str(bundle)], failing_env, check=False)
     assert result.returncode != 0
@@ -298,7 +323,8 @@ def test_built_plugin_reports_injected_version(tmp_path):
     plugin = tmp_path / 'plugin'
     with zipfile.ZipFile(archive) as package:
         names = set(package.namelist())
-        assert {'sslbt_main.py', 'index.html', 'info.json', 'install.sh'} <= names
+        assert {'sslbt_main.py', 'index.html', 'info.json', 'install.sh',
+                'scripts/renew-cron.sh'} <= names
         assert any(name.startswith('lib/') for name in names)
         package.extractall(plugin)
     assert json.loads((plugin / 'info.json').read_text())['versions'] == '3.2.1-rc.4'
@@ -314,3 +340,36 @@ def test_remote_installer_rejects_missing_checksum():
     assert '版本索引缺少 sslbt.zip 的 SHA256，拒绝安装' in content
     assert '跳过 SHA256 校验' not in content
     assert "cfg['upgrade_channel'] = channel" in content
+
+
+def test_publish_verifies_each_node_exactly_once(tmp_path):
+    """正常发布路径只做一次全节点验收
+
+    publish_nodes 以「失败即回滚」语义验收后，收尾的 finish_forward_transaction
+    不再重复验收：其间无任何远端写、发布锁仍持有，第二遍不可能得出不同结果，
+    只会为每个节点多花 2~3 次 SSH 往返。
+    """
+    env, nodes = mock_release_env(tmp_path)
+    bundle = tmp_path / 'bundle'
+    result = run_release(['--dev', '9.9.1-rc.1', '--bundle', str(bundle)], env)
+
+    for name in ('one', 'two'):
+        assert result.stdout.count('%s 资产与索引一致' % name) == 1, result.stdout
+    for node in nodes:
+        assert (node / 'dev' / 'v9.9.1-rc.1' / 'sslbt.zip').exists()
+
+
+def test_forward_only_path_still_verifies(tmp_path):
+    """索引已是候选的快路径（中断恢复）没有人验收过，收尾必须自行验收"""
+    env, nodes = mock_release_env(tmp_path)
+    bundle = tmp_path / 'bundle'
+    run_release(['--prepare', '9.9.2-rc.1', '--bundle', str(bundle)], env)
+    run_release(['--stage', str(bundle)], env)
+    failing_env = dict(env, FAIL_CLEANUP_HOST='node2')
+    assert run_release(['--publish', str(bundle)], failing_env, check=False).returncode != 0
+
+    result = run_release(['--publish', str(bundle)], env)
+    for name in ('one', 'two'):
+        assert '%s 资产与索引一致' % name in result.stdout, result.stdout
+    for node in nodes:
+        assert json.loads((node / 'releases.json').read_text())['dev']['latest'] == '9.9.2-rc.1'

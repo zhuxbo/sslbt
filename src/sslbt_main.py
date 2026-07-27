@@ -17,21 +17,26 @@ sys.path.insert(0, PLUGIN_DIR)
 
 # 热更新：宝塔面板每次请求调用 reload(sslbt_main)，但不会递归 reload 子模块，
 # 导致升级后 lib/ 下的模块仍是旧版本。检测到 reload 时清除缓存，重新 import 即可。
-# 判断方式：首次 import 时 sslbt_main 类尚未定义，reload 时已存在。
+# 判断方式：reload 会保留当前模块 globals，首次 import 时 sslbt_main 类尚未定义。
+# 不依赖模块注册名，兼容宝塔以自定义模块名加载插件。
 # 注意：reload 会重置类变量；session 已改为磁盘持久化（data/sessions.json），不受影响。
-if hasattr(sys.modules.get('sslbt_main'), 'sslbt_main'):
+if 'sslbt_main' in globals():
     for _mod in [k for k in sys.modules if k == 'lib' or k.startswith('lib.')]:
         del sys.modules[_mod]
 
 from lib.config import (  # noqa: E402
     ConfigManager, derive_or_validate_renew_policy, ISSUE_STATE_POLICY_BLOCKED,
+    MANUAL_RESET_KEYS,
 )
 from lib.logger import Logger  # noqa: E402
-from lib.api_client import APIClient, APIError  # noqa: E402
-from lib.cert_utils import build_fullchain, parse_cert_info, verify_cert_key_match, validate_key_pem  # noqa: E402
+from lib.api_client import APIClient, APIError, ORDER_PARAM_PATTERN  # noqa: E402
+from lib.cert_utils import (  # noqa: E402
+    build_fullchain, parse_cert_info, verify_cert_key_match, verify_csr_key_match,
+    validate_key_pem,
+)
 from lib.site_manager import SiteManager  # noqa: E402
-from lib.deployer import Deployer, DeployError  # noqa: E402
-from lib.renew import RenewEngine  # noqa: E402
+from lib.deployer import Deployer, DeployError, check_web_config  # noqa: E402
+from lib.renew import RenewEngine, CRON_LOCK_WAIT, PANEL_LOCK_WAIT  # noqa: E402
 from lib.file_verifier import FileVerifier  # noqa: E402
 from lib.cron import CronManager  # noqa: E402
 from lib.updater import Updater  # noqa: E402
@@ -56,6 +61,30 @@ def _err(msg='操作失败'):
 
 SESSION_EXPIRE_SECONDS = 600  # 10 分钟
 SESSION_FILE_NAME = 'sessions.json'
+
+# 部署/续签互斥锁的抢锁重试：覆盖面板并发请求的短窗口，不为长时间 cron 续签兜底
+LOCK_RETRIES = 3
+LOCK_RETRY_INTERVAL = 2  # 秒
+
+BUSY_MSG = '另一个部署或续签任务正在执行，请稍后再试'
+
+# 环境阻断原因在面板直接展示，压平多行 nginx -t 输出并限长
+BLOCK_REASON_MAX = 300
+
+
+def _env_block_error():
+    """Web 服务既有配置损坏时返回给前端的错误响应，否则返回 None
+
+    检查天然全局（等价 nginx -t），任一无关站点的坏配置都会命中。手动部署在此
+    快速失败并直接给出原因，而不是让每个站点各失败一次、只留下「0 成功 N 失败」。
+    """
+    env_err = check_web_config()
+    if not env_err:
+        return None
+    compact = ' '.join(str(env_err).split())
+    if len(compact) > BLOCK_REASON_MAX:
+        compact = compact[:BLOCK_REASON_MAX] + '...'
+    return _err('Web 服务配置校验失败（非本次部署导致，请先修复配置）: %s' % compact)
 
 
 class sslbt_main:
@@ -128,11 +157,12 @@ class sslbt_main:
 
     @contextlib.contextmanager
     def _renew_lock(self):
-        """获取续签互斥锁（与 cron 续签共用 data/renew.lock，非阻塞，进程内可重入）
+        """获取部署/续签互斥锁（与 cron 续签共用 data/renew.lock，进程内可重入）
 
         手动部署与 cron 续签共用同一把锁，避免并发交错执行 SetSSL/reload。
         批量部署（deploy_all）持锁后嵌套调用单证书部署（deploy_cert）会重入放行；
-        被其他进程/实例占用时 yield False，调用方应返回 busy 提示。
+        跨进程冲突（面板并发请求、cron 正在跑）先重试 LOCK_RETRIES 次覆盖常见短窗口，
+        仍拿不到才 yield False，调用方返回 busy 提示。
         """
         # 可重入：本实例已持锁则直接放行（deploy_all 内部嵌套 deploy_cert）
         if getattr(self, '_renew_lock_fd', None) is not None:
@@ -140,9 +170,16 @@ class sslbt_main:
             return
         lock_path = os.path.join(self._data_dir, 'renew.lock')
         lock_fd = open(lock_path, 'w')
-        try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
+        acquired = False
+        for attempt in range(LOCK_RETRIES):
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except OSError:
+                if attempt < LOCK_RETRIES - 1:
+                    time.sleep(LOCK_RETRY_INTERVAL)
+        if not acquired:
             lock_fd.close()
             yield False
             return
@@ -192,7 +229,9 @@ class sslbt_main:
             ok, _ = validate_key_pem(key_pem)
             if not ok:
                 continue
-            if verify_cert_key_match(fullchain_pem, key_pem):
+            if verify_cert_key_match(fullchain_pem, key_pem) \
+                    and (not cert_data.get('csr')
+                         or verify_csr_key_match(cert_data.get('csr', ''), key_pem)):
                 self._logger.info("私钥来源: %s", source)
                 return key_pem
 
@@ -231,6 +270,15 @@ class sslbt_main:
     def get_config(self, args=None):
         """获取插件配置"""
         try:
+            # 首次从旧升级器迁移时，浏览器可能仍运行缓存的旧 index.html；旧前端在
+            # 刷新后也会调用 get_config，因此这里是无需依赖新版前端的兼容收尾点。
+            cron_migration = CronManager(self._data_dir, self._logger).ensure_healthy()
+            if not cron_migration.get('status'):
+                self._logger.warning(
+                    "检测旧计划任务失败: %s",
+                    cron_migration.get('message', '未知错误'),
+                )
+
             cfg = self._config.get_config()
             safe_cfg = dict(cfg)
             # 读取插件版本号
@@ -240,6 +288,9 @@ class sslbt_main:
                 safe_cfg['plugin_version'] = info.get('versions', '0.0.0')
             except (OSError, json.JSONDecodeError):
                 safe_cfg['plugin_version'] = '0.0.0'
+
+            # 降级态必须透出：此时证书列表为空且续签已停，面板不能显示成"暂无证书"
+            safe_cfg['config_degraded'] = self._config.is_degraded()
 
             return _ok(safe_cfg)
         except Exception as e:
@@ -312,6 +363,11 @@ class sslbt_main:
             api = APIClient(api_url, api_token, self._logger)
 
             cert_data = api.query_order(order_id)
+            status = cert_data.get('status', '')
+            if status != 'active':
+                self._logger.warning(
+                    "add_cert 早返回: order_id=%s 状态为 %s 非 active", order_id, status)
+                return _err('证书状态为 %s，首次部署仅支持 active 证书' % (status or '未知'))
             domains = self._parse_cert_domains(cert_data)
 
             # 派生续签策略（SAN 含 IP 强制 local/file；DNS 校验兼容性）——唯一权威
@@ -331,25 +387,15 @@ class sslbt_main:
                 api={'url': api_url, 'token': api_token},
                 validation_method=validation_method,
             )
+            # 一键 setup 在下一步 deploy_cert 成功前只是本地暂存，不纳入自动续签。
+            # 缺私钥或部署失败时保持 disabled，避免先开自动重签/建任务再留下半配置。
+            self._config.update_cert(order_id, {'enabled': False})
+            self._config.update_metadata(order_id, {'setup_pending': True})
+            entry = self._config.get_cert(order_id)
 
             self._logger.info("添加证书: order_id=%s, domains=%s", order_id, ','.join(domains))
 
-            # 按派生模式设置 auto_reissue（local 关 / pull 开；不自动开付费 auto_renew）
-            effective_mode = renew_mode or self._config.get_config().get('schedule', {}).get('renew_mode', 'pull')
-            try:
-                api.toggle_auto_reissue(order_id, effective_mode == 'pull')
-            except Exception as e:
-                self._logger.warning("toggle_auto_reissue 失败: order_id=%s, error=%s", order_id, str(e))
-
-            # 自动创建计划任务（如果尚未设置）
-            try:
-                cron_mgr = CronManager(DATA_DIR, self._logger)
-                if not cron_mgr.get_status().get('exists'):
-                    cron_mgr.setup()
-            except Exception as e:
-                self._logger.warning("自动创建计划任务失败: %s", str(e))
-
-            return _ok(entry, msg='证书添加成功')
+            return _ok(entry, msg='证书已暂存，等待首次部署')
         except ValueError as e:
             self._logger.warning("add_cert ValueError: %s", str(e))
             return _err(str(e))
@@ -454,6 +500,29 @@ class sslbt_main:
         except Exception as e:
             return _err('更新失败: %s' % str(e))
 
+    def reset_issue_state(self, args=None):
+        """清除续签终态与本地重试计数，让续签引擎下一轮重新接手（deploy-spec §3.2）
+
+        CAPPED / EXPIRED / policy_blocked / 订单异常均为「静默终止等待人工处理」，
+        自动路径不再启动新动作。签发触顶且订单卡在 pending 的证书无法靠手动部署
+        （要求订单 active）解除，本入口是唯一出路。
+        """
+        try:
+            order_id = _get_param(args, 'order_id', '')
+            if not order_id:
+                return _err('请提供订单 ID')
+            order_id = int(order_id)
+            cert_entry = self._config.get_cert(order_id)
+            if not cert_entry:
+                return _err('订单 %d 不存在' % order_id)
+            old_state = cert_entry.get('metadata', {}).get('last_issue_state', '')
+            self._config.update_metadata(order_id, dict(MANUAL_RESET_KEYS))
+            self._logger.info("手动恢复自动续签: order_id=%s, 原状态=%s", order_id, old_state or '(空)')
+            return _ok(msg='已恢复自动续签，下次检查将重新处理')
+        except Exception as e:
+            self._logger.error("恢复自动续签失败: %s", str(e))
+            return _err('恢复失败: %s' % str(e))
+
     def remove_cert(self, args=None):
         """删除证书"""
         try:
@@ -470,14 +539,21 @@ class sslbt_main:
         """部署指定证书到多个站点（与 cron 续签互斥）"""
         with self._renew_lock() as acquired:
             if not acquired:
-                self._logger.warning("deploy_cert 早返回: 续签任务占用锁")
-                return _err('续签任务正在执行，请稍后再试')
+                self._logger.warning("deploy_cert 早返回: 部署/续签互斥锁被占用")
+                return _err(BUSY_MSG)
             return self._deploy_cert_locked(args)
 
     def _deploy_cert_locked(self, args=None):
         """部署指定证书到多个站点（已持有续签锁）"""
         self._logger.info("deploy_cert 调用: args=%s", args)
         try:
+            # 环境闸门：既有配置损坏时 reload 必然失败，写入证书既不生效又要回滚，
+            # 在查询 API 之前快速失败并给出可执行的原因
+            env_block = _env_block_error()
+            if env_block:
+                self._logger.warning("deploy_cert 早返回: %s", env_block['msg'])
+                return env_block
+
             order_id = _get_param(args, 'order_id', '')
             if not order_id:
                 self._logger.warning("deploy_cert 早返回: 缺少 order_id")
@@ -581,10 +657,28 @@ class sslbt_main:
             # 部署有成功则更新 auto_reissue
             if success_count > 0:
                 effective_mode = self._config.get_renew_mode(cert_entry)
+                confirmed = False
                 try:
-                    api.toggle_auto_reissue(order_id, effective_mode == 'pull')
+                    confirmed = api.toggle_auto_reissue(
+                        order_id, effective_mode == 'pull') is not None
                 except Exception as e:
                     self._logger.warning("toggle_auto_reissue 失败: order_id=%s, error=%s", order_id, str(e))
+                self._config.update_cert(order_id, {'enabled': True})
+                self._config.update_metadata(order_id, {
+                    'setup_pending': False,
+                    'auto_reissue_confirmed': confirmed,
+                })
+                # 首次真正部署成功后才注册自动续签任务。
+                try:
+                    cron_mgr = CronManager(DATA_DIR, self._logger)
+                    cron_status = cron_mgr.get_status()
+                    if cron_status.get('error'):
+                        self._logger.warning(
+                            "计划任务状态查询失败，跳过自动创建: %s", cron_status['error'])
+                    elif not cron_status.get('exists'):
+                        cron_mgr.setup()
+                except Exception as e:
+                    self._logger.warning("自动创建计划任务失败: %s", str(e))
 
             if fail_count == 0:
                 return _ok(results, msg='部署成功（%d 个站点）' % success_count)
@@ -607,12 +701,19 @@ class sslbt_main:
         """部署证书，支持 order_ids 过滤（与 cron 续签互斥）"""
         with self._renew_lock() as acquired:
             if not acquired:
-                return _err('续签任务正在执行，请稍后再试')
+                self._logger.warning("deploy_all 早返回: 部署/续签互斥锁被占用")
+                return _err(BUSY_MSG)
             return self._deploy_all_locked(args)
 
     def _deploy_all_locked(self, args=None):
-        """批量部署（已持有续签锁），复用 _deploy_cert_locked 避免重复获取锁"""
+        """批量部署（已持有互斥锁），逐个调用 deploy_cert，由可重入锁放行嵌套获取"""
         try:
+            # 环境闸门检查全局，坏配置下逐证书重复失败无意义，整批快速失败
+            env_block = _env_block_error()
+            if env_block:
+                self._logger.warning("deploy_all 早返回: %s", env_block['msg'])
+                return env_block
+
             certs = self._config.get_certs()
             # 支持选中部署
             order_ids_str = _get_param(args, 'order_ids', '')
@@ -718,6 +819,13 @@ class sslbt_main:
             if not order_list:
                 return _err('URL 中缺少 order 参数')
             order_value = order_list[0]
+
+            # order 形态本地先判（spec §2.3 起只接受订单 ID）：按域名查询与空参数列全量
+            # 已移除，旧链接会被服务端判 invalid_order。在这里给可执行的提示，
+            # 而不是把服务端原文抛给用户
+            if not ORDER_PARAM_PATTERN.match(str(order_value).strip()):
+                return _err('部署链接中的 order 必须是订单 ID（多个用英文逗号分隔）。'
+                            '按域名生成的旧链接已不再支持，请到管理端重新复制部署链接')
 
             # 构造 api_url，交给项目统一 API 客户端发请求：HTTPS 强制（拒绝 http，仅
             # localhost 例外）+ SSRF/DNS Rebinding 防护 + token 校验，避免绕过统一安全出口。
@@ -841,7 +949,10 @@ class sslbt_main:
             return _err('获取站点匹配失败: %s' % str(e))
 
     def batch_set_renew_policy(self, args=None):
-        """批量设置续签策略（一次原子后端操作，逐证书派生）。
+        """批量设置续签策略（一次后端调用，逐证书原子更新）。
+
+        每个证书各自走一次原子 update_cert，不是整批一个事务：中途异常会留下部分更新，
+        重新执行即可收敛（派生是幂等的）。
 
         对每个证书按其域名派生 (renew_mode, validation_method)：SAN 含 IP 强制 local/file，
         DNS 证书采用请求值并做兼容性校验（不兼容跳过）。DNS 证书不受混合批次中 IP 证书影响。
@@ -925,14 +1036,34 @@ class sslbt_main:
 
     # ==================== 续签 ====================
 
+    @staticmethod
+    def _renew_summary(results):
+        """把逐证书结果压成一句话，避免"续签检查完成"在全失败时也显示为成功语气"""
+        if not results:
+            return '续签检查完成：无需续签'
+        success = sum(1 for r in results if r.get('status') == 'success')
+        pending = sum(1 for r in results if r.get('status') == 'pending')
+        failure = sum(1 for r in results if r.get('status') == 'failure')
+        return '续签检查完成：%d 成功，%d 等待，%d 失败' % (success, pending, failure)
+
+    def _run_renew(self, spread):
+        """执行续签检查。整轮中止（运行环境不可用）与"跑完但无需续签"都返回空列表，
+        必须按 last_abort_reason 分开报，否则用户看到"无需续签"而实际什么都没跑。
+        """
+        deployer = self._get_deployer()
+        file_verifier = FileVerifier(self._site_mgr, self._logger)
+        engine = RenewEngine(self._config, self._get_api_for_cert, deployer, self._logger, file_verifier)
+        # cron 可以等锁（丢掉当天唯一窗口的代价远大于多等两分钟），面板按钮不能
+        lock_wait = CRON_LOCK_WAIT if spread else PANEL_LOCK_WAIT
+        results = engine.check_and_renew_all(spread=spread, lock_wait=lock_wait)
+        if engine.last_abort_reason:
+            return _err('续签未执行: %s' % engine.last_abort_reason)
+        return _ok(results, msg=self._renew_summary(results))
+
     def run_renew(self, args=None):
         """手动执行续签检查"""
         try:
-            deployer = self._get_deployer()
-            file_verifier = FileVerifier(self._site_mgr, self._logger)
-            engine = RenewEngine(self._config, self._get_api_for_cert, deployer, self._logger, file_verifier)
-            results = engine.check_and_renew_all()
-            return _ok(results, msg='续签检查完成')
+            return self._run_renew(spread=False)
         except Exception as e:
             self._logger.error("续签检查失败: %s", str(e))
             return _err('续签检查失败: %s' % str(e))
@@ -940,11 +1071,15 @@ class sslbt_main:
     def run_renew_cron(self, args=None):
         """计划任务调用的续签检查（分散执行）"""
         try:
-            deployer = self._get_deployer()
-            file_verifier = FileVerifier(self._site_mgr, self._logger)
-            engine = RenewEngine(self._config, self._get_api_for_cert, deployer, self._logger, file_verifier)
-            results = engine.check_and_renew_all(spread=True)
-            return _ok(results, msg='续签检查完成')
+            # 每次 cron 都由独立 Python 进程启动。先做幂等健康检查，可让从旧版本
+            # 升级后仍保留的完整任务正文自行收敛为仓库薄入口；失败不阻断本轮续签。
+            health = CronManager(self._data_dir, self._logger).ensure_healthy()
+            if not health.get('status'):
+                self._logger.warning(
+                    "计划任务健康检查失败: %s",
+                    health.get('message', '未知错误'),
+                )
+            return self._run_renew(spread=True)
         except Exception as e:
             self._logger.error("续签检查失败: %s", str(e))
             return _err('续签检查失败: %s' % str(e))
@@ -955,6 +1090,8 @@ class sslbt_main:
             path = os.path.join(self._data_dir, 'renew_status.json')
             if not os.path.exists(path):
                 return _ok(None)
+            if os.path.islink(path):
+                return _err('续签状态文件异常（符号链接）')
             with open(path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             return _ok(data)
@@ -973,6 +1110,17 @@ class sslbt_main:
             return _err(res.get('message', '创建失败'))
         except Exception as e:
             return _err('设置计划任务失败: %s' % str(e))
+
+    def refresh_cron(self, args=None):
+        """刷新计划任务正文并保留原执行时间（升级后幂等收尾）"""
+        try:
+            cron_mgr = CronManager(DATA_DIR, self._logger)
+            res = cron_mgr.refresh()
+            if res.get('status'):
+                return _ok(res, msg=res.get('message', '计划任务已刷新'))
+            return _err(res.get('message', '刷新失败'))
+        except Exception as e:
+            return _err('刷新计划任务失败: %s' % str(e))
 
     def remove_cron(self, args=None):
         """删除计划任务"""
@@ -1033,11 +1181,18 @@ class sslbt_main:
             checksum = _get_param(args, 'checksum', '')
 
             updater = Updater(PLUGIN_DIR, self._config, self._logger)
-            updater.do_update(
+            result = updater.do_update(
                 version=version,
                 checksum=checksum,
             )
-            return _ok(msg='更新完成')
+            cron_refresh = (result or {}).get('cron_refresh', {})
+            if cron_refresh and not cron_refresh.get('status'):
+                return _ok(
+                    result,
+                    msg='更新完成，但计划任务刷新失败: %s'
+                        % cron_refresh.get('message', '未知错误'),
+                )
+            return _ok(result, msg='更新完成')
         except Exception as e:
             self._logger.error("更新失败: %s", str(e))
             return _err('更新失败: %s' % str(e))

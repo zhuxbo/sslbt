@@ -1,7 +1,7 @@
 services:
   mock-api:
     build:
-      context: ../../sslctl/docker/test/mock-api
+      context: ./mock-api
     ports:
       - "18080:8080"
     networks:

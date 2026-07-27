@@ -42,6 +42,7 @@ bash scripts/build.sh 1.2.3 /tmp/sslbt.zip
 - `bash build/release.sh --verify BUNDLE`：逐节点核对公开资产 SHA256、`latest`、版本条目和 checksums。
 - `bash build/release.sh --resume BUNDLE`：仅 main；验证原 manifest、资产、候选索引和 tag 后，从暂存/公开状态继续，禁止调用构建。
 - `bash build/release.sh --dev VERSION [--bundle DIR]`：dev 快捷路径，允许脏工作区和同版本远端覆盖，不提交、不切分支、不操作 tag/GitHub。
+- `bash build/release.sh VERSION [--bundle DIR]`：兼容历史 dev 入口，仅接受带预发布段的 SemVer，行为与 `--dev` 完全相同；稳定版仍拒绝执行。
 - `bash build/release.sh --dry-run VERSION`：只在临时目录验证两次构建字节一致、manifest 和候选索引；必须使用预发布 SemVer，不读取发布配置、不联网。
 
 不提供 `--server` 单节点发布：恢复也必须面向全部节点重新验收，避免单节点 `latest` 长期漂移。`make release` 固定拒绝真实发布，防止绕过 `remote-release` 门禁。

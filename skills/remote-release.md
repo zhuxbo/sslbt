@@ -33,7 +33,9 @@
 bash build/release.sh --dev <version>
 ```
 
-该命令只构建当前快照并发布到全部配置节点。允许脏工作区和同版本覆盖；manifest/index 必须记录实际 `source_commit`、`dirty`。不得 fetch、提交、推送、切换/合并分支、操作 tag 或 GitHub Release。完成声明要求脚本全节点验收成功，并从统一公网入口读取 `releases.json.dev.latest`、下载 `sslbt.zip` 再核对 SHA256。
+该命令只构建当前快照并发布到全部配置节点。允许脏工作区和同版本覆盖；manifest/index 必须记录实际 `source_commit`、`dirty`。不得 fetch、提交、推送、切换/合并分支、操作 tag 或 GitHub Release。完成声明要求脚本全节点验收成功，并从每个发布节点的公网域名读取 `releases.json.dev.latest`、下载 `sslbt.zip` 再核对 SHA256。
+
+兼容历史命令 `bash build/release.sh <version>`，但只有带预发布段的 SemVer 会路由到上述 dev 流程；稳定版直接传入仍必须拒绝，不得绕过 main 正式发布门禁。
 
 ## main 正式版
 
@@ -51,7 +53,7 @@ bash build/release.sh --dev <version>
 
 5. 核对 manifest 的 commit、唯一资产 `sslbt.zip` 和 SHA256；确认所有节点已 stage 且尚未更新公开索引。
 6. 创建并推送不可变 tag `v{version}`，必须指向 manifest commit。创建指向同一 tag/commit 的 draft GitHub Release，只从该 bundle 上传 `assets/sslbt.zip`；验收 draft 的资产名、数量、大小和 SHA256。
-7. 执行 `--publish` 公开全部服务器节点。确认全节点成功后公开 GitHub Release（非 draft、非 prerelease、标记 latest），再对公网统一入口下载 ZIP 验证。
+7. 执行 `--publish` 公开全部服务器节点。确认全节点成功后公开 GitHub Release（非 draft、非 prerelease、标记 latest），再从每个发布节点的公网域名下载 ZIP 验证。
 8. 仅在服务器、GitHub 和公网资产全部对账后，把唯一可移动 tag `latest` 更新到 `v{version}`。
 9. 将 `main` 以 fast-forward 同步回 `dev` 并推送；若 `dev` 已前进立即停止，不得 merge/force-push 绕过。等待精确 dev commit 的 required checks。
 10. 执行 `deploy-spec.md` 8.9 全部验收。完成前保留 bundle；完成后也建议按发布留档策略保存 manifest。

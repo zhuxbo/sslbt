@@ -75,6 +75,18 @@
     font-size: 13px;
   }
 
+  /* 续签健康告警条：cron 停摆是全局故障，需在证书页顶部而非仅设置页可见 */
+  .ssl-health-bar {
+    background: #fef0f0;
+    border: 1px solid #fbc4c4;
+    color: #f56c6c;
+    border-radius: 4px;
+    padding: 9px 12px;
+    margin-top: 16px;
+    font-size: 13px;
+    line-height: 1.5;
+  }
+
   /* 统计栏 */
   .ssl-stats-bar {
     display: flex;
@@ -148,6 +160,8 @@
   .ssl-btn-success:hover { background: #85ce61; border-color: #85ce61; }
   .ssl-btn-danger { color: #fff; background: #f56c6c; border-color: #f56c6c; }
   .ssl-btn-danger:hover { background: #f78989; border-color: #f78989; }
+  .ssl-btn-warning { color: #fff; background: #e6a23c; border-color: #e6a23c; }
+  .ssl-btn-warning:hover { background: #ebb563; border-color: #ebb563; }
   .ssl-btn-sm { padding: 0 10px; font-size: 12px; height: 28px; line-height: 28px; }
 
   /* 下拉框 */
@@ -308,12 +322,15 @@
   }
   .ssl-settings-section table {
     border: none;
+    table-layout: fixed;
+    width: 100%;
   }
   .ssl-settings-section table td {
     padding: 6px 8px;
     border: none;
     vertical-align: middle;
     font-size: 13px;
+    text-align: left;
   }
   .ssl-settings-section table td:first-child {
     text-align: right;
@@ -387,13 +404,17 @@
   var P = {
     _certCache: {},   // order_id → detail data
     _certList: null,  // cached cert list for stats
+    _settingsRendered: false,
+    _settingsLoading: false,
+    _settingsLoaded: false,
+    _postUpdateKey: 'sslbt-post-update-version',
 
-    _call: function (method, data, cb) {
+    _call: function (method, data, cb, errCb) {
       var d = {};
       if (data) {
         for (var k in data) d[k] = data[k];
       }
-      $.post(
+      var req = $.post(
         '/plugin?action=a&s=' + method + '&name=sslbt',
         d,
         function (r) {
@@ -404,6 +425,8 @@
         },
         'json'
       );
+      if (errCb) req.fail(function (xhr) { errCb(xhr); });
+      return req;
     },
 
     _e: function (s) {
@@ -435,16 +458,147 @@
         if (m[t]) self[m[t]]();
       });
       this.loadCerts();
+      this._checkPostUpdate();
+    },
+
+    _rememberPostUpdate: function (version) {
+      try { window.sessionStorage.setItem(P._postUpdateKey, version || ''); } catch (e) {}
+    },
+
+    _checkPostUpdate: function () {
+      var expected = '';
+      try { expected = window.sessionStorage.getItem(P._postUpdateKey) || ''; } catch (e) {}
+      if (!expected) return;
+      var clearMarker = function () {
+        try { window.sessionStorage.removeItem(P._postUpdateKey); } catch (e) {}
+      };
+      var promptRestart = function () {
+        layer.alert('刷新后未能正常加载目标版本，请重启宝塔面板后重新打开插件。', {
+          closeBtn: 2,
+          title: '需要重启面板',
+          icon: 2,
+          offset: 'auto',
+          btn: ['我知道了']
+        });
+      };
+      P._call('get_config', null, function (r) {
+        var actual = r && r.status && r.data ? String(r.data.plugin_version || '') : '';
+        var normalize = function (v) { return String(v || '').replace(/^v/, ''); };
+        if (!actual || normalize(actual) !== normalize(expected)) {
+          promptRestart();
+          return;
+        }
+        // 首次升级到薄 cron 入口时，发起升级的旧进程仍可能使用旧 lib.cron。
+        // 目标版本加载成功后再由新版入口幂等刷新，确保本次升级即可完成迁移。
+        P._call('refresh_cron', {}, function (cronResult) {
+          clearMarker();
+          if (!cronResult || !cronResult.status) {
+            layer.alert(
+              '插件已更新，但计划任务刷新失败：' +
+                P._e((cronResult && cronResult.msg) || '未知错误') +
+                '。请在设置页重新设置计划任务。',
+              {
+                closeBtn: 2,
+                title: '计划任务需要处理',
+                icon: 0,
+                offset: 'auto',
+                btn: ['我知道了']
+              }
+            );
+          }
+        }, function () {
+          clearMarker();
+          layer.alert('插件已更新，但无法检查计划任务。请在设置页重新设置计划任务。', {
+            closeBtn: 2,
+            title: '计划任务需要处理',
+            icon: 0,
+            offset: 'auto',
+            btn: ['我知道了']
+          });
+        });
+      }, promptRestart);
+    },
+
+    // ===== 续签终态识别 =====
+    // CAPPED / EXPIRED / policy 阻断下续签引擎不再启动新动作且不发回调（deploy-spec §3.2），
+    // 面板是用户侧唯一提示入口，不能让这些证书继续显示为「正常」。
+    _CAPPED_PHASE_LABEL: {
+      issue: '签发重试超限',
+      deploy: '部署重试超限',
+      stalled: '长期无进展',
+      legacy: '升级前已超限'
+    },
+
+    _haltInfo: function (cert) {
+      var m = cert.metadata || {};
+      var s = m.last_issue_state || '';
+      if (!s || s === 'processing') return null;
+      if (s === 'CAPPED') {
+        var stage = P._CAPPED_PHASE_LABEL[m.capped_phase || ''] || '重试超限';
+        return { label: '已停更（' + stage + '）', level: 'danger', halted: true };
+      }
+      if (s === 'EXPIRED') {
+        return { label: '已过期停更', level: 'danger', halted: true };
+      }
+      if (s === 'policy_blocked_needs_setup') {
+        return { label: '需重设续签策略', level: 'warning', halted: true };
+      }
+      // 订单终态（cancelled / revoked 等）：续签引擎已停止等待人工处理
+      return { label: '订单异常: ' + s, level: 'warning', halted: true };
+    },
+
+    // 详情页「续签状态」行：终态标签 + 计数 + 环境阻断原因
+    _renewStateHtml: function (cert) {
+      var m = cert.metadata || {};
+      var halt = P._haltInfo(cert);
+      var parts = [];
+      if (halt) {
+        parts.push('<span class="ssl-tag ssl-tag-' + halt.level + '">' + P._e(halt.label) + '</span>');
+        parts.push('<span style="color:#909399">已停止自动续签，需人工处理</span>');
+      } else if ((m.last_issue_state || '') === 'processing') {
+        parts.push('<span class="ssl-tag ssl-tag-primary">等待签发</span>');
+      } else {
+        parts.push('<span class="ssl-tag ssl-tag-success">自动续签中</span>');
+      }
+      var issued = m.issue_retry_count || 0;
+      var deployed = m.deploy_attempt_count || 0;
+      if (issued || deployed) {
+        parts.push('<span style="color:#909399">签发尝试 ' + issued + ' / 部署尝试 ' + deployed + '</span>');
+      }
+      // 服务端订单状态是不可信输入，必须转义
+      if (m.last_order_status) {
+        parts.push('<span style="color:#e6a23c">订单状态: '
+          + P._e(P.ORDER_STATUS_LABEL[m.last_order_status] || m.last_order_status) + '</span>');
+      }
+      if (m.verify_file_place_failed) {
+        parts.push('<span style="color:#f56c6c">验证文件未能放置到全部站点，CA 验证将失败</span>');
+      }
+      if (m.unchanged_cert_rounds) {
+        parts.push('<span style="color:#e6a23c">服务端连续 ' + (m.unchanged_cert_rounds | 0)
+          + ' 轮返回同一张证书</span>');
+      }
+      if (m.auto_reissue_confirmed === false) {
+        parts.push('<span style="color:#e6a23c">自动重签开关未确认设置成功，服务端可能不会自动签发</span>');
+      }
+      if (m.last_deploy_block_reason) {
+        // 中性措辞：该字段现在也承载「未绑定站点」等非环境类阻断
+        parts.push('<span style="color:#e6a23c">部署阻断（' + P._fmtTime(m.last_deploy_block_at || '') + '）: '
+          + P._e(m.last_deploy_block_reason) + '</span>');
+      }
+      return parts.join('<span class="ssl-stat-sep">|</span>');
     },
 
     // ===== 统计计算 =====
     _calcStats: function (certs) {
-      var total = certs.length, enabled = 0, expiring = 0, expired = 0;
+      var total = certs.length, enabled = 0, expiring = 0, expired = 0, halted = 0, noApi = 0;
       var now = new Date();
       var threshold = 14 * 24 * 60 * 60 * 1000;
       for (var i = 0; i < certs.length; i++) {
         var c = certs[i];
         if (c.enabled !== false) enabled++;
+        var halt = P._haltInfo(c);
+        if (halt && halt.halted) halted++;
+        if (P._missingApi(c)) noApi++;
         var exp = (c.metadata || {}).cert_expires_at || '';
         if (!exp) continue;
         try {
@@ -454,7 +608,8 @@
           else if (diff <= threshold) expiring++;
         } catch (e) {}
       }
-      return { total: total, enabled: enabled, expiring: expiring, expired: expired };
+      return { total: total, enabled: enabled, expiring: expiring, expired: expired,
+               halted: halted, noApi: noApi };
     },
 
     _renderStatsBar: function (stats) {
@@ -467,6 +622,12 @@
       h += '即将过期 <span class="ssl-stat-num" style="color:' + (stats.expiring > 0 ? '#e6a23c' : '') + '">' + stats.expiring + '</span>';
       h += '<span class="ssl-stat-sep">|</span>';
       h += '已过期 <span class="ssl-stat-num" style="color:' + (stats.expired > 0 ? '#f56c6c' : '') + '">' + stats.expired + '</span>';
+      h += '<span class="ssl-stat-sep">|</span>';
+      h += '已停更 <span class="ssl-stat-num" style="color:' + (stats.halted > 0 ? '#f56c6c' : '') + '">' + stats.halted + '</span>';
+      if (stats.noApi > 0) {
+        h += '<span class="ssl-stat-sep">|</span>';
+        h += '缺 API 配置 <span class="ssl-stat-num" style="color:#f56c6c">' + stats.noApi + '</span>';
+      }
       h += '</div>';
       h += '<div class="ssl-stats-right">';
       h += '<button class="ssl-btn ssl-btn-success ssl-btn-sm" onclick="sslbt.addCert()">一键部署</button>';
@@ -478,12 +639,56 @@
     },
 
     // ===== 状态标签 =====
+    // 服务端不会再签发的订单状态。renewed/reissued 是证书链延续标记（服务端查询会
+    // 自动跟链到接替订单）、cancelling 是过渡态，都不算停机
+    // order_not_found / cert_not_found / invalid_order 是 deploy-spec §2.2 的订单级
+    // 确定性失败：服务端已明确拒绝，自动路径不会自愈，与订单终态同样按「停更」呈现
+    ORDER_HALT_STATUSES: ['cancelled', 'revoked', 'failed', 'expired',
+      'order_not_found', 'cert_not_found', 'invalid_order'],
+    ORDER_STATUS_LABEL: {
+      cancelled: '已取消', revoked: '已吊销', failed: '签发失败', expired: '已过期',
+      order_not_found: '不存在或无权访问', cert_not_found: '无可用证书',
+      invalid_order: '订单号非法'
+    },
+    // token / 账号级阻断（spec §2.2）：这类失败下回调用的是同一个坏 token、必然也发不出去
+    AUTH_BLOCK_LABEL: {
+      rate_limited: '请求频率超限', token_missing: '未携带 Token',
+      token_invalid: 'Token 无效或已失效', token_disabled: 'Token 已被禁用',
+      account_disabled: '账号已被禁用', ip_not_allowed: '来源 IP 不在白名单'
+    },
+
+    _missingApi: function (cert) {
+      var api = cert.api || {};
+      return !api.url || !api.token_masked;
+    },
+
     _statusTag: function (cert) {
       var m = cert.metadata || {};
       var exp = m.cert_expires_at || '';
       var deployed = m.last_deploy_at || '';
       var sites = cert.site_name || [];
       if (typeof sites === 'string') sites = sites ? [sites] : [];
+      // 终态优先于到期判断：这些证书已停止自动续签，不能显示为「正常」
+      var halt = P._haltInfo(cert);
+      if (halt) return '<span class="ssl-tag ssl-tag-' + halt.level + '">' + P._e(halt.label) + '</span>';
+      // 缺 API 配置的证书永远不会进入续签流程，且续签汇总里完全看不到它
+      // （连 renew_status 的计数都不含），面板是唯一能暴露它的地方。
+      // 判据两者都要：_get_api_for_cert 要求 url 和 token 都非空，
+      // 而 get_cert_list 只在 token 非空时才回传 token_masked
+      if (P._missingApi(cert)) return '<span class="ssl-tag ssl-tag-danger">缺少 API 配置</span>';
+      // 订单进入真正的停机集：服务端不会再签发，且 cancelled 的独立订单在服务端侧
+      // 是零通知（auto-renew 与到期提醒都要求证书 active），面板是唯一提示入口。
+      // renewed/reissued 是证书链延续标记、cancelling 是过渡态，都不在此列
+      var os_ = (m.last_order_status || '');
+      if (P.ORDER_HALT_STATUSES.indexOf(os_) >= 0) {
+        return '<span class="ssl-tag ssl-tag-danger">订单' + P._e(P.ORDER_STATUS_LABEL[os_] || os_) + '</span>';
+      }
+      // 已签发过的证书失去全部绑定（站点被删后解绑等）：证书有效却无处部署，
+      // 必须在到期判断之前拦下——否则 exp 非空会一路落到「正常」，
+      // 而灰色「未绑定」标签只在 exp 为空时可达，恰好漏掉这个更严重的形态
+      if (!sites.length && exp) {
+        return '<span class="ssl-tag ssl-tag-warning">未绑定站点</span>';
+      }
       if (!exp) {
         if (!sites.length) return '<span class="ssl-tag ssl-tag-info">未绑定</span>';
         if (!deployed) return '<span class="ssl-tag ssl-tag-primary">待部署</span>';
@@ -499,6 +704,76 @@
       return '<span class="ssl-tag ssl-tag-info">已禁用</span>';
     },
 
+    // ===== 续签健康 =====
+    // cron 停摆的原因是开放集合（任务被删/被暂停/crond 没跑/脚本失效/插件构造失败），
+    // 逐个检测覆盖不全；last_run 有多旧是唯一的地面真值。
+    STALE_HOURS: 48,
+
+    _renewHealthMsg: function (d) {
+      if (!d || !d.last_run) {
+        return '自动续签尚未运行过。若添加证书已超过一天，请到「设置」检查计划任务。';
+      }
+      // 整轮中止时 last_run 同样是新鲜的，必须先看 aborted_reason，
+      // 否则一台永久跑不动的机器会被判为健康
+      if (d.aborted_reason) {
+        return '最近一次自动续签未执行：' + d.aborted_reason;
+      }
+      // token 被服务端拒绝时回调用的是同一个坏 token、必然也发不出去，
+      // 面板是唯一提示入口（spec §2.2）
+      var blocks = d.auth_blocks || [];
+      if (blocks.length) {
+        var b = blocks[0];
+        var label = P.AUTH_BLOCK_LABEL[b.error_code] || b.error_code || '未知原因';
+        return 'API 拒绝了部署 Token（' + label + (b.api_host ? '，' + b.api_host : '')
+          + '），本轮已跳过使用该 Token 的证书，请到「设置」检查 Token 配置。';
+      }
+      var t = Date.parse(d.last_run);
+      if (isNaN(t)) return '';
+      var hours = (Date.now() - t) / 3600000;
+      if (hours > P.STALE_HOURS) {
+        return '自动续签已 ' + Math.floor(hours / 24) + ' 天未运行，计划任务可能已停止，请到「设置」检查。';
+      }
+      return '';
+    },
+
+    _showHealth: function (msg) {
+      var el = document.getElementById('renew-health');
+      if (el) el.innerHTML = msg ? '<div class="ssl-health-bar">' + P._e(msg) + '</div>' : '';
+    },
+
+    // 仅在有已启用证书时判定：全新安装、以及刚加完第一张证书（cron 最长 24h 后才首跑）
+    // 都还没有 renew_status.json，不该报红。
+    // 配置降级例外——此时证书列表恒为空，正是最需要告警的时刻
+    _loadRenewHealth: function (enabledCount) {
+      P._call('get_config', null, function (cr) {
+        if (cr.status && cr.data && cr.data.config_degraded) {
+          P._showHealth('配置文件损坏，插件已停止一切写入与自动续签以防覆盖。'
+            + '原文件备份为 config.json.bak，请人工修复后重启面板。');
+          return;
+        }
+        if (!enabledCount) return;
+        // 计划任务缺失/暂停是 cron 停摆最直接的原因，优先于 last_run 陈旧判定报出，
+        // 因为它能给出可操作的指引（备份恢复、跨机迁移后都是这个形态）
+        P._call('get_cron_status', null, function (cs) {
+          var d = (cs.status && cs.data) ? cs.data : null;
+          if (d && !d.error) {
+            if (!d.exists) {
+              P._showHealth('已有启用中的证书，但计划任务不存在，自动续签不会运行。'
+                + '请到「设置」点击「设置计划任务」。');
+              return;
+            }
+            if (d.paused) {
+              P._showHealth('计划任务已暂停，自动续签不会运行。请到宝塔「计划任务」页恢复。');
+              return;
+            }
+          }
+          P._call('get_renew_status', null, function (r) {
+            P._showHealth(P._renewHealthMsg((r.status && r.data) ? r.data : null));
+          });
+        });
+      });
+    },
+
     // ===== 证书管理 =====
     loadCerts: function () {
       P._call('get_cert_list', null, function (r) {
@@ -510,11 +785,13 @@
         P._certList = certs;
 
         var stats = P._calcStats(certs);
-        var h = P._renderStatsBar(stats);
+        var h = '<div id="renew-health"></div>' + P._renderStatsBar(stats);
 
         if (!certs.length) {
           h += '<div class="ssl-empty">暂无证书，请点击"添加证书"</div>';
           $('#cert-list').html(h);
+          // 空列表也要检查：配置损坏时列表恒为空，"暂无证书"正是最危险的假象
+          P._loadRenewHealth(0);
           return;
         }
 
@@ -543,6 +820,7 @@
         }
         h += '</div>';
         $('#cert-list').html(h);
+        P._loadRenewHealth(stats.enabled);
 
         // 绑定点击事件
         $('.ssl-cert-summary').on('click', function () {
@@ -604,6 +882,7 @@
       }
       h += '<div class="ssl-detail-item"><span class="ssl-detail-label">API 配置</span><span class="ssl-detail-val">' + apiInfo + '</span></div>';
       h += '<div class="ssl-detail-item"><span class="ssl-detail-label">上次部署</span><span class="ssl-detail-val">' + P._fmtTime(lastDeploy) + '</span></div>';
+      h += '<div class="ssl-detail-item"><span class="ssl-detail-label">续签状态</span><span class="ssl-detail-val">' + P._renewStateHtml(d) + '</span></div>';
       h += '</div>';
 
       // 绑定站点（与证书信息同布局）
@@ -624,7 +903,20 @@
           } else {
             matchTag = '<span class="ssl-tag ssl-tag-info">无匹配</span>';
           }
-          var deployStatus = m.last_deploy_at ? '<span class="ssl-tag ssl-tag-success">已部署</span>' : '<span class="ssl-tag ssl-tag-info">未部署</span>';
+          // 逐站点结果：此前用证书级 last_deploy_at 渲染每一行，
+          // 部分失败时失败的那个站点也显示「已部署」，而它其实还挂着旧证书
+          var siteStat = (m.site_deploy_status || {})[sd.site_name];
+          var deployStatus;
+          if (!siteStat) {
+            deployStatus = m.last_deploy_at
+              ? '<span class="ssl-tag ssl-tag-success">已部署</span>'
+              : '<span class="ssl-tag ssl-tag-info">未部署</span>';
+          } else if (siteStat.status) {
+            deployStatus = '<span class="ssl-tag ssl-tag-success">已部署</span>';
+          } else {
+            deployStatus = '<span class="ssl-tag ssl-tag-danger" title="'
+              + P._e(siteStat.message || '') + '">部署失败</span>';
+          }
           sitesHtml += '<div class="ssl-site-row"><span>' + P._e(sd.site_name) + '</span><span class="ssl-site-tags">' + matchTag + deployStatus + '</span></div>';
           if (sd.match && sd.match.type === 'partial' && sd.match.unmatched && sd.match.unmatched.length) {
             sitesHtml += '<div class="ssl-unmatched">未覆盖: ' + P._e(sd.match.unmatched.join(', ')) + '</div>';
@@ -637,6 +929,9 @@
 
       // 操作按钮
       h += '<div class="ssl-detail-actions">';
+      if (P._haltInfo(d)) {
+        h += '<button class="ssl-btn ssl-btn-warning ssl-btn-sm" onclick="sslbt.resetIssueState(' + oid + ')">恢复自动续签</button>';
+      }
       h += '<button class="ssl-btn ssl-btn-success ssl-btn-sm" onclick="sslbt.deployCert(' + oid + ')">部署</button>';
       h += '<button class="ssl-btn ssl-btn-sm" onclick="sslbt.checkCert(' + oid + ')">检查</button>';
       h += '<button class="ssl-btn ssl-btn-sm" onclick="sslbt.editCert(' + oid + ')">编辑</button>';
@@ -822,11 +1117,9 @@
       var closeLoading = P._loading('正在添加...');
 
       var total = certs.length;
-      var done = 0;
       var results = [];
       var deployResults = [];
 
-      var deployPending = 0;
       var finishAll = function () {
         closeLoading();
         var addOk = 0, addFail = [];
@@ -849,30 +1142,26 @@
         P._certCache = {};
         P.loadCerts();
       };
-      for (var i = 0; i < certs.length; i++) {
-        (function (idx) {
-          var c = certs[idx];
-          var sites = certSites[idx] || [];
-          P._call('add_cert', {
-            order_id: c.order_id,
-            site_names: sites.join(','),
-            renew_mode: '',
-            session_id: c._session_id || ''
-          }, function (r) {
-            results.push({ order_id: c.order_id, status: r.status, msg: r.msg });
-            if (r.status && sites.length) {
-              deployPending++;
-              P._call('deploy_cert', { order_id: c.order_id }, function (dr) {
-                deployResults.push({ order_id: c.order_id, status: dr && dr.status, msg: dr && dr.msg });
-                deployPending--;
-                if (done === total && deployPending === 0) finishAll();
-              });
-            }
-            done++;
-            if (done === total && deployPending === 0) finishAll();
+      // 串行处理：部署持有全局互斥锁（与 cron 续签共用），并发发起会互相抢锁失败
+      var step = function (idx) {
+        if (idx >= total) { finishAll(); return; }
+        var c = certs[idx];
+        var sites = certSites[idx] || [];
+        P._call('add_cert', {
+          order_id: c.order_id,
+          site_names: sites.join(','),
+          renew_mode: '',
+          session_id: c._session_id || ''
+        }, function (r) {
+          results.push({ order_id: c.order_id, status: r.status, msg: r.msg });
+          if (!(r.status && sites.length)) { step(idx + 1); return; }
+          P._call('deploy_cert', { order_id: c.order_id }, function (dr) {
+            deployResults.push({ order_id: c.order_id, status: dr && dr.status, msg: dr && dr.msg });
+            step(idx + 1);
           });
-        })(i);
-      }
+        });
+      };
+      step(0);
     },
 
     // ===== 证书操作 =====
@@ -885,7 +1174,8 @@
           closeLoading();
           if (r.need_key) { sslbt._askPrivateKey(oid); return; }
           layer.msg(r.msg, { icon: r.status ? 1 : 2 });
-          if (r.status) { delete P._certCache[oid]; P.loadCerts(); }
+          // 部分站点成功时后端返回 status=false，状态已变化，同样要刷新
+          delete P._certCache[oid]; P.loadCerts();
         });
       };
       if (extraParams) { doIt(); return; }
@@ -912,6 +1202,19 @@
       });
     },
 
+    // 终态（CAPPED / EXPIRED / policy 阻断 / 订单异常）后清除本地计数与状态，
+    // 让续签引擎下一轮重新接手。签发触顶的证书订单卡在 pending 时，这是唯一出路。
+    resetIssueState: function (oid) {
+      layer.confirm('确定恢复订单 ' + oid + ' 的自动续签？将清除本地重试计数与停更状态。',
+        { offset: 'auto', closeBtn: 2 }, function (idx) {
+          layer.close(idx);
+          P._call('reset_issue_state', { order_id: oid }, function (r) {
+            layer.msg(r.msg, { icon: r.status ? 1 : 2 });
+            if (r.status) { delete P._certCache[oid]; P.loadCerts(); }
+          });
+        });
+    },
+
     _getSelectedOids: function () {
       var oids = [];
       $('.ssl-cert-cb:checked').each(function () { oids.push($(this).data('oid')); });
@@ -928,7 +1231,8 @@
         P._call('deploy_all', params, function (r) {
           closeLoading();
           layer.msg(r.msg, { icon: r.status ? 1 : 2 });
-          if (r.status) { P._certCache = {}; P.loadCerts(); }
+          // 部分失败时后端返回 status=false，但已有站点写入成功，仍需刷新列表
+          P._certCache = {}; P.loadCerts();
         });
       });
     },
@@ -1116,8 +1420,10 @@
         var rs = r.data || [];
         if (!rs.length) { layer.msg('无需续签的证书', { icon: 1 }); return; }
         var h = '<div style="padding:15px 20px"><table class="ssl-table"><thead><tr><th>订单</th><th>状态</th><th>信息</th></tr></thead><tbody>';
+        // message 可能含 nginx 配置诊断等任意文本，必须转义
         for (var i = 0; i < rs.length; i++)
-          h += '<tr><td>' + rs[i].order_id + '</td><td>' + rs[i].status + '</td><td>' + rs[i].message + '</td></tr>';
+          h += '<tr><td>' + P._e(rs[i].order_id) + '</td><td>' + P._e(rs[i].status)
+            + '</td><td>' + P._e(rs[i].message) + '</td></tr>';
         h += '</tbody></table></div>';
         layer.open({ type: 1, closeBtn: 2, title: '续签结果', area: ['560px', '400px'], offset: 'auto', content: h });
         P._certCache = {};
@@ -1127,61 +1433,89 @@
 
     // ===== 设置 =====
     loadSettings: function () {
+      if (!P._settingsRendered) {
+        P._renderSettings();
+      }
+      // 状态按进入设置页刷新，只更新文字，不重建 DOM，也不轮询。
+      sslbt._loadCronStatus();
+      sslbt._loadRenewStatus();
+      if (P._settingsLoaded || P._settingsLoading) return;
+      P._settingsLoading = true;
       P._call('get_config', null, function (r) {
+        P._settingsLoading = false;
         if (!r.status) {
-          $('#settings-form').html('<div class="ssl-loading">' + P._e(r.msg) + '</div>');
+          $('#update-result').html('<span style="color:#f56c6c">加载设置失败: ' + P._e(r.msg) + '</span>');
           return;
         }
         var c = r.data;
-        var h = '';
-
-        // Section 1: 计划任务
-        h += '<div class="ssl-settings-section"><table>';
-        h += '<tr><td>计划任务</td><td>';
-        h += '<button class="ssl-btn ssl-btn-sm" onclick="sslbt.setupCron()">设置计划任务</button> ';
-        h += '<button class="ssl-btn ssl-btn-sm" onclick="sslbt.removeCron()">删除计划任务</button>';
-        h += ' <span id="cron-status" style="color:#909399;font-size:12px;margin-left:8px"></span>';
-        h += '</td></tr>';
-        h += '<tr><td>最近续签</td><td><span id="renew-status" style="color:#909399;font-size:12px">加载中...</span></td></tr>';
-        h += '</table></div>';
-
-        // Section 3: 批量操作
-        h += '<div class="ssl-settings-section"><table>';
-        h += '<tr><td>续签模式</td><td>';
-        h += '<select id="batch-renew-mode" style="width:94px" onchange="sslbt._toggleBatchVm()">';
-        h += '<option value="pull">自动签发</option><option value="local">本机提交</option></select> ';
-        h += '<span id="batch-vm-wrap" style="display:none">';
-        h += '<select id="batch-validation-method" style="width:94px"><option value="delegation">委托验证</option><option value="file">文件验证</option></select> ';
-        h += '</span>';
-        h += '<button class="ssl-btn ssl-btn-sm" onclick="sslbt.batchSetRenewMode()">应用到全部证书</button>';
-        h += '</td></tr>';
-        h += '</table></div>';
-
-        // Section 4: 插件升级
-        h += '<div class="ssl-settings-section"><table>';
-        h += '<tr><td>插件更新</td><td>';
-        h += '<select id="update-channel" style="width:94px" onchange="sslbt.saveUpdateChannel()">';
-        h += '<option value="main"' + ((c.upgrade_channel || 'main') === 'main' ? ' selected' : '') + '>稳定版</option>';
-        h += '<option value="dev"' + (c.upgrade_channel === 'dev' ? ' selected' : '') + '>测试版</option></select> ';
-        h += '<button class="ssl-btn ssl-btn-sm" onclick="sslbt.checkUpdate()">检查更新</button>';
-        h += ' <span style="color:#909399;font-size:12px;margin-left:8px">当前: ' + P._e(c.plugin_version || '0.0.0') + '</span>';
-        h += '<span id="update-result" style="margin-left:10px"></span>';
-        h += '</td></tr>';
-        h += '</table></div>';
-
-        $('#settings-form').html(h);
-        sslbt._loadCronStatus();
-        sslbt._loadRenewStatus();
+        $('#update-channel').val(c.upgrade_channel || 'main').prop('disabled', false);
+        $('#plugin-version').text(c.plugin_version || '0.0.0');
+        $('#update-result').empty();
+        P._settingsLoaded = true;
       });
     },
 
+    _renderSettings: function () {
+      var h = '';
+
+      // Section 1: 计划任务
+      h += '<div class="ssl-settings-section"><table>';
+      h += '<tr><td>计划任务</td><td>';
+      h += '<button class="ssl-btn ssl-btn-sm" onclick="sslbt.setupCron()">设置计划任务</button> ';
+      h += '<button class="ssl-btn ssl-btn-sm" onclick="sslbt.removeCron()">删除计划任务</button>';
+      h += ' <span id="cron-status" style="color:#909399;font-size:12px;margin-left:8px"></span>';
+      h += '</td></tr>';
+      h += '<tr><td>最近续签</td><td><span id="renew-status" style="color:#909399;font-size:12px">加载中...</span></td></tr>';
+      h += '</table></div>';
+
+      // Section 3: 批量操作
+      h += '<div class="ssl-settings-section"><table>';
+      h += '<tr><td>续签模式</td><td>';
+      h += '<select id="batch-renew-mode" style="width:94px" onchange="sslbt._toggleBatchVm()">';
+      h += '<option value="pull">自动签发</option><option value="local">本机提交</option></select> ';
+      h += '<span id="batch-vm-wrap" style="display:none">';
+      h += '<select id="batch-validation-method" style="width:94px"><option value="delegation">委托验证</option><option value="file">文件验证</option></select> ';
+      h += '</span>';
+      h += '<button class="ssl-btn ssl-btn-sm" onclick="sslbt.batchSetRenewMode()">应用到全部证书</button>';
+      h += '</td></tr>';
+      h += '</table></div>';
+
+      // Section 4: 插件升级
+      h += '<div class="ssl-settings-section"><table>';
+      h += '<tr><td>插件更新</td><td>';
+      h += '<select id="update-channel" style="width:94px" onchange="sslbt.saveUpdateChannel()" disabled>';
+      h += '<option value="main">稳定版</option><option value="dev">测试版</option></select> ';
+      h += '<button class="ssl-btn ssl-btn-sm" onclick="sslbt.checkUpdate()">检查更新</button>';
+      h += ' <span style="color:#909399;font-size:12px;margin-left:8px">当前: <span id="plugin-version">加载中...</span></span>';
+      h += '<span id="update-result" style="margin-left:10px"></span>';
+      h += '</td></tr>';
+      h += '</table></div>';
+
+      $('#settings-form').html(h);
+      P._settingsRendered = true;
+    },
+
+    // 三态渲染：后端已区分「运行中」「已暂停」「查询失败」，此前只渲染 cycle，
+    // 用户在宝塔计划任务页暂停后这里照样显示「当前: 每天 14:23」
     _loadCronStatus: function () {
       P._call('get_cron_status', null, function (r) {
-        if (!r.status || !r.data) return;
-        var d = r.data;
         var el = document.getElementById('cron-status');
         if (!el) return;
-        el.textContent = d.exists ? '当前: ' + d.cycle : '未设置';
+        if (!r.status || !r.data) { el.textContent = ''; return; }
+        var d = r.data;
+        if (d.error) {
+          el.textContent = '状态查询失败: ' + d.error;
+          el.style.color = '#e6a23c';
+        } else if (!d.exists) {
+          el.textContent = '未设置（自动续签不会运行）';
+          el.style.color = '#f56c6c';
+        } else if (d.paused) {
+          el.textContent = '已暂停（自动续签不会运行）· ' + d.cycle;
+          el.style.color = '#f56c6c';
+        } else {
+          el.textContent = '运行中 · ' + d.cycle;
+          el.style.color = '#909399';
+        }
       });
     },
 
@@ -1192,8 +1526,22 @@
         if (!r.status || !r.data) { el.textContent = '暂无续签记录'; return; }
         var d = r.data;
         var t = (d.last_run || '').replace('T', ' ').replace('Z', ' UTC');
+        // 整轮中止时计数全为 0，直接显示成"共 0"会与"确实无需续签"混淆
+        if (d.aborted_reason) {
+          el.textContent = t + '：未执行（' + d.aborted_reason + '）';
+          el.style.color = '#f56c6c';
+          return;
+        }
+        el.style.color = '';
         el.textContent = t + '：共 ' + (d.total || 0) + '，成功 ' + (d.success || 0) +
           '，等待 ' + (d.pending || 0) + '，失败 ' + (d.failure || 0);
+        var blocks = d.auth_blocks || [];
+        if (blocks.length) {
+          var b = blocks[0];
+          el.textContent += '（Token 被拒：'
+            + (P.AUTH_BLOCK_LABEL[b.error_code] || b.error_code || '未知原因') + '）';
+          el.style.color = '#f56c6c';
+        }
       });
     },
 
@@ -1308,11 +1656,17 @@
         checksum: P._ui.checksum || ''
       }, function (r) {
         if (r.status) {
-          sp.innerHTML = '<span style="color:#67c23a">更新成功！</span>';
-          layer.alert('插件更新成功。刷新页面即可加载新版本，若遇到异常请重启面板（bt restart）。', {
+          P._rememberPostUpdate(P._ui.latest_version);
+          var cronFailed = r.data && r.data.cron_refresh && !r.data.cron_refresh.status;
+          sp.innerHTML = '<span style="color:' + (cronFailed ? '#e6a23c' : '#67c23a') + '">' +
+            P._e(r.msg || '更新成功！') + '</span>';
+          var updateMessage = cronFailed
+            ? P._e(r.msg) + '。刷新页面后将使用新版代码再次处理。'
+            : '插件更新成功。刷新页面即可加载新版本；若刷新后仍有异常，请重启宝塔面板。';
+          layer.alert(updateMessage, {
             closeBtn: 2,
-            title: '更新完成',
-            icon: 1,
+            title: cronFailed ? '更新完成，计划任务待刷新' : '更新完成',
+            icon: cronFailed ? 0 : 1,
             offset: 'auto',
             btn: ['刷新页面'],
             yes: function () { (window.top || window).location.reload(); }

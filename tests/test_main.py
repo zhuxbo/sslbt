@@ -4,7 +4,11 @@ import os
 import json
 import time
 import fcntl
+import subprocess
+import sys
+import textwrap
 import pytest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from lib.config import ConfigManager
@@ -29,6 +33,41 @@ def plugin(tmp_data_dir):
 TOKEN = 'a' * 32 + '.test-token-abcdefghij1234'
 
 
+def test_reload_with_panel_module_name_refreshes_cached_lib_config():
+    """宝塔用非 sslbt_main 模块名 reload 时，也必须清掉升级前的 lib 缓存。"""
+    root = Path(__file__).resolve().parents[1]
+    script = textwrap.dedent("""
+        import importlib.util
+        import os
+        import sys
+        import types
+
+        root = sys.argv[1]
+        sys.path.insert(0, os.path.join(root, 'src'))
+        sys.path.insert(0, os.path.join(root, 'tests'))
+        sys.modules['panelSite'] = __import__('mock_bt.panelSite', fromlist=['panelSite'])
+        sys.modules['public'] = __import__('mock_bt.public', fromlist=['public'])
+
+        from lib.config import ConfigManager
+        stale_config = types.ModuleType('lib.config')
+        stale_config.__file__ = os.path.join(root, 'src', 'lib', 'config.py')
+        stale_config.ConfigManager = ConfigManager
+        sys.modules['lib.config'] = stale_config
+
+        entry = os.path.join(root, 'src', 'sslbt_main.py')
+        spec = importlib.util.spec_from_file_location('panel_plugin_sslbt', entry)
+        module = importlib.util.module_from_spec(spec)
+        module.sslbt_main = object
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+
+        assert hasattr(module, 'sslbt_main')
+        assert hasattr(sys.modules['lib.config'], 'derive_or_validate_renew_policy')
+    """)
+
+    subprocess.run([sys.executable, '-c', script, str(root)], check=True)
+
+
 class TestGetConfig:
     def test_get_config_no_api_fields(self, plugin):
         """全局配置不包含 api_url/api_token/check_interval_hours"""
@@ -41,6 +80,53 @@ class TestGetConfig:
         assert 'check_interval_hours' not in data
         assert 'schedule' in data
         assert data['upgrade_channel'] == 'main'
+
+    @patch('sslbt_main.CronManager')
+    def test_get_config_migrates_legacy_cron_for_cached_old_frontend(self, mock_cron_cls, plugin):
+        """旧前端升级后只会调用 get_config，新后端必须在该入口完成旧任务迁移。"""
+        mock_cron_cls.return_value.ensure_healthy.return_value = {
+            'status': True,
+            'changed': True,
+        }
+
+        result = plugin.get_config()
+
+        assert result['status'] is True
+        mock_cron_cls.assert_called_once_with(plugin._data_dir, plugin._logger)
+        mock_cron_cls.return_value.ensure_healthy.assert_called_once_with()
+
+
+class TestCronHealthCheck:
+    @patch('sslbt_main.CronManager')
+    def test_cron_run_repairs_task_before_renewing(self, mock_cron_cls, plugin):
+        """每次 cron 新进程先做幂等健康检查，再执行本轮续签。"""
+        mock_cron_cls.return_value.ensure_healthy.return_value = {
+            'status': True,
+            'changed': True,
+        }
+        plugin._run_renew = MagicMock(return_value={'status': True, 'msg': '完成'})
+
+        result = plugin.run_renew_cron()
+
+        assert result['status'] is True
+        mock_cron_cls.assert_called_once_with(plugin._data_dir, plugin._logger)
+        mock_cron_cls.return_value.ensure_healthy.assert_called_once_with()
+        plugin._run_renew.assert_called_once_with(spread=True)
+
+    @patch('sslbt_main.CronManager')
+    def test_cron_health_failure_does_not_skip_current_renewal(self, mock_cron_cls, plugin):
+        """正在执行的任务仍可续签；修复失败只告警，不能丢掉当天续签窗口。"""
+        mock_cron_cls.return_value.ensure_healthy.return_value = {
+            'status': False,
+            'message': '数据库锁定',
+        }
+        plugin._run_renew = MagicMock(return_value={'status': True, 'msg': '完成'})
+
+        result = plugin.run_renew_cron()
+
+        assert result['status'] is True
+        plugin._run_renew.assert_called_once_with(spread=True)
+        assert '计划任务健康检查失败' in plugin._logger.get_logs()
 
 
 class TestSaveConfig:
@@ -104,6 +190,25 @@ class TestAddCert:
         assert cert is not None
         assert cert['api']['url'] == 'https://api.example.com'
         assert cert['api']['token'] == TOKEN
+        assert cert['enabled'] is False
+        assert cert['metadata']['setup_pending'] is True
+
+    @patch('sslbt_main.APIClient')
+    def test_add_cert_rejects_non_active_without_writing_config(self, mock_api_cls, plugin):
+        mock_api_cls.return_value.query_order.return_value = {
+            'status': 'processing',
+            'domains': 'example.com',
+        }
+
+        result = plugin.add_cert({
+            'order_id': '101',
+            'api_url': 'https://api.example.com',
+            'api_token': TOKEN,
+            'site_names': 'example.com',
+        })
+
+        assert result['status'] is False
+        assert plugin._config.get_cert(101) is None
 
 
 class TestParseCertDomains:
@@ -146,8 +251,9 @@ class TestParseCertDomains:
 class TestAutoCreateCron:
     @patch('sslbt_main.CronManager')
     @patch('sslbt_main.APIClient')
-    def test_auto_create_cron_when_not_exists(self, mock_api_cls, mock_cron_cls, plugin):
-        """添加证书时自动创建计划任务"""
+    def test_add_does_not_create_cron_before_first_deploy(
+            self, mock_api_cls, mock_cron_cls, plugin):
+        """首次部署成功前不得创建自动续签任务。"""
         mock_api = MagicMock()
         mock_api.query_order.return_value = {'status': 'active', 'domains': 'a.com'}
         mock_api_cls.return_value = mock_api
@@ -161,7 +267,7 @@ class TestAutoCreateCron:
             'api_url': 'https://api.example.com',
             'api_token': TOKEN,
         })
-        mock_cron.setup.assert_called_once()
+        mock_cron.setup.assert_not_called()
 
     @patch('sslbt_main.CronManager')
     @patch('sslbt_main.APIClient')
@@ -620,6 +726,17 @@ class TestFetchDeployUrl:
         assert result['status'] is False
         assert 'order' in result['msg']
 
+    @pytest.mark.parametrize('order', ['example.com', '100,example.com', 'abc', '1;2'])
+    @patch('sslbt_main.APIClient')
+    def test_domain_form_link_rejected_with_actionable_msg(self, mock_api_cls, plugin, order):
+        """spec §2.3 起 order 只接受订单 ID：域名形态的旧链接给可执行提示，且不发请求"""
+        result = plugin.fetch_deploy_url(
+            {'url': 'https://api.example.com/api/deploy?token=' + TOKEN + '&order=' + order})
+        assert result['status'] is False
+        assert '订单 ID' in result['msg']
+        assert '重新复制部署链接' in result['msg']
+        mock_api_cls.assert_not_called()
+
     @patch('sslbt_main.APIClient')
     def test_success_returns_session_id(self, mock_api_cls, plugin):
         """正常流程返回 session_id 而非明文 token"""
@@ -973,11 +1090,59 @@ class TestLogs:
         assert 'test message' in result['data']['content']
 
 
+class TestCronRefresh:
+    @patch('sslbt_main.CronManager')
+    def test_refresh_cron_preserves_existing_schedule(self, mock_cron_cls, plugin):
+        mock_cron_cls.return_value.refresh.return_value = {
+            'status': True,
+            'message': '计划任务已就绪（每天 14:30）',
+        }
+
+        result = plugin.refresh_cron()
+
+        assert result['status'] is True
+        mock_cron_cls.return_value.refresh.assert_called_once_with()
+
+    @patch('sslbt_main.CronManager')
+    def test_refresh_cron_reports_failure(self, mock_cron_cls, plugin):
+        mock_cron_cls.return_value.refresh.return_value = {
+            'status': False,
+            'message': '数据库锁定',
+        }
+
+        result = plugin.refresh_cron()
+
+        assert result['status'] is False
+        assert '数据库锁定' in result['msg']
+
+
+class TestPluginUpdateResult:
+    @patch('sslbt_main.Updater')
+    def test_do_update_surfaces_cron_refresh_warning(self, mock_updater_cls, plugin):
+        mock_updater_cls.return_value.do_update.return_value = {
+            'cron_refresh': {'status': False, 'message': '数据库锁定'},
+        }
+
+        result = plugin.do_update({'version': '1.2.3', 'checksum': 'sha256:test'})
+
+        assert result['status'] is True
+        assert result['data']['cron_refresh']['status'] is False
+        assert '计划任务刷新失败' in result['msg']
+
+    def test_post_update_page_retries_refresh_with_new_module(self):
+        content = (
+            Path(__file__).resolve().parents[1] / 'src' / 'index.html'
+        ).read_text(encoding='utf-8')
+
+        assert "P._call('refresh_cron'" in content
+
+
 class TestToggleAutoReissue:
     @patch('sslbt_main.CronManager')
     @patch('sslbt_main.APIClient')
-    def test_add_cert_calls_toggle_pull_mode(self, mock_api_cls, mock_cron_cls, plugin):
-        """pull 模式添加证书时调用 toggle_auto_reissue(True)"""
+    def test_add_cert_defers_toggle_pull_until_deployed(
+            self, mock_api_cls, mock_cron_cls, plugin):
+        """pull 模式在首次部署成功前不修改服务端开关。"""
         mock_api = MagicMock()
         mock_api.query_order.return_value = {'status': 'active', 'domains': 'a.com'}
         mock_api_cls.return_value = mock_api
@@ -991,12 +1156,13 @@ class TestToggleAutoReissue:
             'api_token': TOKEN,
             'renew_mode': 'pull',
         })
-        mock_api.toggle_auto_reissue.assert_called_once_with(900, True)
+        mock_api.toggle_auto_reissue.assert_not_called()
 
     @patch('sslbt_main.CronManager')
     @patch('sslbt_main.APIClient')
-    def test_add_cert_calls_toggle_local_mode(self, mock_api_cls, mock_cron_cls, plugin):
-        """local 模式添加证书时调用 toggle_auto_reissue(False)"""
+    def test_add_cert_defers_toggle_local_until_deployed(
+            self, mock_api_cls, mock_cron_cls, plugin):
+        """local 模式在首次部署成功前不修改服务端开关。"""
         mock_api = MagicMock()
         mock_api.query_order.return_value = {'status': 'active', 'domains': 'a.com'}
         mock_api_cls.return_value = mock_api
@@ -1010,12 +1176,12 @@ class TestToggleAutoReissue:
             'api_token': TOKEN,
             'renew_mode': 'local',
         })
-        mock_api.toggle_auto_reissue.assert_called_once_with(901, False)
+        mock_api.toggle_auto_reissue.assert_not_called()
 
     @patch('sslbt_main.CronManager')
     @patch('sslbt_main.APIClient')
-    def test_add_cert_toggle_failure_does_not_block(self, mock_api_cls, mock_cron_cls, plugin):
-        """toggle_auto_reissue 抛异常时添加证书仍然成功"""
+    def test_add_cert_does_not_call_toggle(self, mock_api_cls, mock_cron_cls, plugin):
+        """暂存证书不调用 toggle_auto_reissue。"""
         mock_api = MagicMock()
         mock_api.query_order.return_value = {'status': 'active', 'domains': 'a.com'}
         mock_api.toggle_auto_reissue.side_effect = Exception('network error')
@@ -1030,6 +1196,7 @@ class TestToggleAutoReissue:
             'api_token': TOKEN,
         })
         assert result['status'] is True
+        mock_api.toggle_auto_reissue.assert_not_called()
 
     @patch('sslbt_main.APIClient')
     def test_deploy_cert_calls_toggle_on_success(self, mock_api_cls, plugin):
@@ -1055,6 +1222,8 @@ class TestToggleAutoReissue:
             plugin.deploy_cert({'order_id': '910'})
 
         mock_api.toggle_auto_reissue.assert_called_once_with(910, True)
+        assert plugin._config.get_cert(910)['enabled'] is True
+        assert plugin._config.get_cert(910)['metadata']['setup_pending'] is False
 
 
 class TestResolvePrivateKey:
@@ -1312,12 +1481,13 @@ class TestBatchSetValidationMethod:
 
 
 class TestAddCertPolicyDerive:
-    """add_cert 策略派生（SAN 含 IP 强制 local/file）与 auto_reissue（local 关/pull 开）"""
+    """add_cert 策略派生；auto_reissue 延迟到首次部署成功后设置。"""
 
     @patch('sslbt_main.CronManager')
     @patch('sslbt_main.APIClient')
-    def test_ip_cert_derives_local_file_auto_reissue_off(self, mock_api_cls, mock_cron_cls, plugin):
-        """SAN 含 IP：即使请求 pull 也派生为 local/file，auto_reissue 关闭"""
+    def test_ip_cert_derives_local_file_before_toggle(
+            self, mock_api_cls, mock_cron_cls, plugin):
+        """SAN 含 IP：即使请求 pull 也派生为 local/file，暂不切换开关。"""
         mock_api = MagicMock()
         mock_api.query_order.return_value = {'status': 'active', 'domains': '1.2.3.4'}
         mock_api_cls.return_value = mock_api
@@ -1332,12 +1502,12 @@ class TestAddCertPolicyDerive:
         cert = plugin._config.get_cert(1000)
         assert cert['renew_mode'] == 'local'
         assert cert['validation_method'] == 'file'
-        mock_api.toggle_auto_reissue.assert_called_once_with(1000, False)
+        mock_api.toggle_auto_reissue.assert_not_called()
 
     @patch('sslbt_main.CronManager')
     @patch('sslbt_main.APIClient')
-    def test_dns_pull_auto_reissue_on(self, mock_api_cls, mock_cron_cls, plugin):
-        """DNS + pull：保持 pull，auto_reissue 开启"""
+    def test_dns_pull_is_staged_before_toggle(self, mock_api_cls, mock_cron_cls, plugin):
+        """DNS + pull：保持 pull，首次部署前暂不切换开关。"""
         mock_api = MagicMock()
         mock_api.query_order.return_value = {'status': 'active', 'domains': 'a.example.com'}
         mock_api_cls.return_value = mock_api
@@ -1350,7 +1520,7 @@ class TestAddCertPolicyDerive:
         })
         assert result['status'] is True
         assert plugin._config.get_cert(1001)['renew_mode'] == 'pull'
-        mock_api.toggle_auto_reissue.assert_called_once_with(1001, True)
+        mock_api.toggle_auto_reissue.assert_not_called()
 
 
 class TestBatchSetRenewPolicy:
@@ -1413,3 +1583,184 @@ class TestUpdateClearsPolicyBlocked:
         assert cert['renew_mode'] == 'local'
         assert cert['validation_method'] == 'file'
         assert cert['metadata']['last_issue_state'] == ''
+
+
+class TestResetIssueState:
+    """终态手动恢复入口：清除停更状态与本地计数（deploy-spec §3.2）"""
+
+    def _add(self, plugin, order_id=900):
+        plugin._config.add_cert(order_id=order_id, cert_name='c', domains=['a.example.com'],
+                                api_url='https://api.example.com', api_token=TOKEN)
+        return order_id
+
+    def test_clears_capped_and_counts(self, plugin):
+        oid = self._add(plugin)
+        plugin._config.update_metadata(oid, {
+            'last_issue_state': 'CAPPED',
+            'capped_phase': 'issue',
+            'issue_retry_count': 10,
+            'deploy_attempt_count': 4,
+            'deploy_started': True,
+            'last_deploy_block_reason': 'Web 服务配置校验失败: boom',
+            'last_deploy_block_at': '2026-07-01T00:00:00Z',
+        })
+        result = plugin.reset_issue_state({'order_id': str(oid)})
+        assert result['status'] is True
+        meta = plugin._config.get_cert(oid)['metadata']
+        assert meta['last_issue_state'] == ''
+        assert meta['capped_phase'] == ''
+        assert meta['issue_retry_count'] == 0
+        assert meta['deploy_attempt_count'] == 0
+        assert meta['deploy_started'] is False
+        assert meta['last_deploy_block_reason'] == ''
+        assert meta['last_deploy_block_at'] == ''
+
+    def test_reset_makes_renewal_eligible_again(self, plugin):
+        """恢复后续签引擎重新接手：不再命中终态跳过、也不再命中触顶"""
+        from lib.config import TERMINAL_ISSUE_STATES, MAX_ISSUE_RETRY_COUNT
+
+        oid = self._add(plugin, 901)
+        plugin._config.update_metadata(oid, {
+            'last_issue_state': 'CAPPED', 'capped_phase': 'issue',
+            'issue_retry_count': MAX_ISSUE_RETRY_COUNT,
+        })
+        plugin.reset_issue_state({'order_id': str(oid)})
+        meta = plugin._config.get_cert(oid)['metadata']
+        assert meta['last_issue_state'] not in TERMINAL_ISSUE_STATES
+        assert meta['issue_retry_count'] < MAX_ISSUE_RETRY_COUNT
+
+    def test_missing_order_id(self, plugin):
+        assert plugin.reset_issue_state({})['status'] is False
+
+    def test_unknown_order(self, plugin):
+        assert plugin.reset_issue_state({'order_id': '99999'})['status'] is False
+
+
+class TestRenewStatusSymlinkGuard:
+    def test_rejects_symlink(self, plugin, tmp_data_dir):
+        """状态文件被替换为符号链接时拒绝读取，与其他状态文件读写约定一致"""
+        target = os.path.join(tmp_data_dir, 'outside.json')
+        with open(target, 'w', encoding='utf-8') as f:
+            json.dump({'last_run': 'x'}, f)
+        link = os.path.join(tmp_data_dir, 'renew_status.json')
+        os.symlink(target, link)
+        result = plugin.get_renew_status()
+        assert result['status'] is False
+        assert '符号链接' in result['msg']
+
+
+class TestDeployLockBusyMessage:
+    """部署/续签互斥锁：提示语不再谎称是续签任务，且先重试再放弃"""
+
+    def test_busy_message_mentions_deploy_or_renew(self, plugin, tmp_data_dir, monkeypatch):
+        import sslbt_main as main_mod
+
+        monkeypatch.setattr(main_mod, 'LOCK_RETRIES', 2)
+        monkeypatch.setattr(main_mod, 'LOCK_RETRY_INTERVAL', 0)
+        holder = open(os.path.join(tmp_data_dir, 'renew.lock'), 'w')
+        fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            result = plugin.deploy_cert({'order_id': '1'})
+        finally:
+            fcntl.flock(holder, fcntl.LOCK_UN)
+            holder.close()
+        assert result['status'] is False
+        assert result['msg'] == main_mod.BUSY_MSG
+        assert '部署' in result['msg'] and '续签' in result['msg']
+
+    def test_retries_before_giving_up(self, plugin, tmp_data_dir, monkeypatch):
+        """抢锁失败先重试若干次，覆盖面板并发请求的短窗口"""
+        import sslbt_main as main_mod
+
+        sleeps = []
+        monkeypatch.setattr(main_mod, 'LOCK_RETRIES', 3)
+        monkeypatch.setattr(main_mod, 'LOCK_RETRY_INTERVAL', 0)
+        monkeypatch.setattr(main_mod.time, 'sleep', lambda s: sleeps.append(s))
+        holder = open(os.path.join(tmp_data_dir, 'renew.lock'), 'w')
+        fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            plugin.deploy_all({})
+        finally:
+            fcntl.flock(holder, fcntl.LOCK_UN)
+            holder.close()
+        assert len(sleeps) == 2  # 3 次尝试之间等待 2 次
+
+    def test_nested_deploy_reenters_without_new_lock(self, plugin):
+        """deploy_all 内部嵌套 deploy_cert 走可重入分支，不再抢锁"""
+        with plugin._renew_lock() as outer:
+            assert outer is True
+            with plugin._renew_lock() as inner:
+                assert inner is True
+
+
+class TestManualDeployEnvironmentGate:
+    """手动部署遇到坏配置必须直接给出原因，而不是只报「0 成功 N 失败」"""
+
+    @pytest.fixture(autouse=True)
+    def _broken_config(self, monkeypatch):
+        import public
+        monkeypatch.setattr(
+            public, 'checkWebConfig',
+            lambda: 'nginx: [emerg] unknown directive "-" in /www/.../a.conf:13\n'
+                    'nginx: configuration file test failed')
+
+    def _add(self, plugin, order_id=950):
+        plugin._config.add_cert(order_id=order_id, cert_name='c', domains=['a.example.com'],
+                                site_names=['a.example.com'],
+                                api_url='https://api.example.com', api_token=TOKEN)
+        return order_id
+
+    def test_deploy_cert_reports_reason(self, plugin):
+        oid = self._add(plugin)
+        result = plugin.deploy_cert({'order_id': str(oid)})
+        assert result['status'] is False
+        assert 'Web 服务配置校验失败（非本次部署导致' in result['msg']
+        assert 'unknown directive' in result['msg']
+        assert '成功' not in result['msg']
+
+    def test_deploy_cert_fails_before_api_query(self, plugin):
+        """环境闸门在查询 API 之前，避免无谓的网络往返"""
+        oid = self._add(plugin, 951)
+        api = MagicMock()
+        with patch.object(plugin, '_get_api_for_cert', return_value=api):
+            plugin.deploy_cert({'order_id': str(oid)})
+        api.query_order.assert_not_called()
+
+    def test_deploy_all_fails_whole_batch_once(self, plugin):
+        self._add(plugin, 952)
+        self._add(plugin, 953)
+        result = plugin.deploy_all({})
+        assert result['status'] is False
+        assert 'Web 服务配置校验失败（非本次部署导致' in result['msg']
+
+    def test_reason_is_single_line_and_capped(self, plugin):
+        oid = self._add(plugin, 954)
+        msg = plugin.deploy_cert({'order_id': str(oid)})['msg']
+        assert '\n' not in msg
+
+
+class TestRenewSummaryMessage:
+    """续签汇总口径：全失败时不得显示成功语气"""
+
+    def test_summary_counts(self, plugin):
+        results = [
+            {'order_id': 1, 'status': 'success'},
+            {'order_id': 2, 'status': 'pending'},
+            {'order_id': 3, 'status': 'failure'},
+            {'order_id': 4, 'status': 'failure'},
+        ]
+        msg = plugin._renew_summary(results)
+        assert msg == '续签检查完成：1 成功，1 等待，2 失败'
+
+    def test_summary_empty(self, plugin):
+        assert plugin._renew_summary([]) == '续签检查完成：无需续签'
+
+    def test_run_renew_msg_reflects_failures(self, plugin, monkeypatch):
+        from lib import renew as renew_mod
+
+        monkeypatch.setattr(
+            renew_mod.RenewEngine, 'check_and_renew_all',
+            lambda self, spread=False, lock_wait=0: [{'order_id': 1, 'status': 'failure', 'message': 'boom'}])
+        result = plugin.run_renew()
+        assert result['status'] is True  # 检查本身跑完了，明细在 data 里
+        assert '0 成功' in result['msg'] and '1 失败' in result['msg']

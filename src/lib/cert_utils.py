@@ -3,6 +3,8 @@
 import os
 import re
 import hashlib
+import locale
+import shutil
 import tempfile
 from datetime import datetime, timezone
 
@@ -21,6 +23,7 @@ PEM_CSR_RE = re.compile(
 
 MAX_CERT_SIZE = 65536  # 64KB
 MAX_KEY_SIZE = 16384  # 16KB
+MAX_PARSE_DIAGNOSTIC_SIZE = 256
 
 
 def validate_cert_pem(pem_text):
@@ -59,7 +62,24 @@ def validate_site_name_component(site_name):
     return None
 
 
-def parse_cert_info(pem_text):
+def _log_parse_failure(logger, reason, detail=''):
+    """记录不含证书正文的解析诊断；日志失败不得影响证书处理。"""
+    if not logger:
+        return
+    clean_detail = ' '.join(str(detail).split())
+    if len(clean_detail) > MAX_PARSE_DIAGNOSTIC_SIZE:
+        clean_detail = clean_detail[:MAX_PARSE_DIAGNOSTIC_SIZE] + '...'
+    openssl_path = shutil.which('openssl') or '(PATH 中未找到)'
+    try:
+        logger.error(
+            "证书解析诊断: reason=%s, openssl=%s, detail=%s",
+            reason, openssl_path, clean_detail or '(无)',
+        )
+    except Exception:
+        pass
+
+
+def parse_cert_info(pem_text, logger=None):
     """解析证书信息，返回 dict: common_name, domains, not_before, not_after, serial, issuer"""
     tmp = None
     try:
@@ -69,10 +89,12 @@ def parse_cert_info(pem_text):
 
         result = subprocess.run(
             ['openssl', 'x509', '-in', tmp.name, '-noout',
-             '-subject', '-dates', '-serial', '-issuer', '-ext', 'subjectAltName'],
+             '-subject', '-dates', '-serial', '-issuer', '-text'],
             capture_output=True, text=True, timeout=10
         )
         if result.returncode != 0:
+            _log_parse_failure(
+                logger, 'openssl_exit_%s' % result.returncode, result.stderr)
             return None
 
         output = result.stdout
@@ -88,7 +110,20 @@ def parse_cert_info(pem_text):
         if nb_match:
             info['not_before'] = _parse_openssl_date(nb_match.group(1).strip())
         if na_match:
-            info['not_after'] = _parse_openssl_date(na_match.group(1).strip())
+            not_after_text = na_match.group(1).strip()
+            info['not_after'] = _parse_openssl_date(not_after_text)
+            if info['not_after'] is None:
+                try:
+                    lc_time = locale.setlocale(locale.LC_TIME)
+                except Exception:
+                    lc_time = '(读取失败)'
+                _log_parse_failure(
+                    logger, 'invalid_not_after',
+                    'value=%s, LC_TIME=%s' % (not_after_text, lc_time))
+                return None
+        else:
+            _log_parse_failure(logger, 'missing_not_after', result.stderr)
+            return None
 
         # Serial
         serial_match = re.search(r'serial=([A-Fa-f0-9]+)', output)
@@ -118,7 +153,9 @@ def parse_cert_info(pem_text):
             delta = info['not_after'] - now
             info['days_remaining'] = delta.days
         return info
-    except Exception:
+    except Exception as e:
+        _log_parse_failure(
+            logger, 'exception_%s' % type(e).__name__, str(e))
         return None
     finally:
         if tmp and os.path.exists(tmp.name):
@@ -181,6 +218,83 @@ def verify_cert_key_match(cert_pem, key_pem):
                 os.unlink(f.name)
 
 
+def parse_csr_info(csr_pem):
+    """校验 CSR 签名并返回稳定的归属信息。
+
+    返回 ``{'hash', 'common_name', 'public_key_der'}``；CSR 缺失、格式错误、
+    签名无效或公钥无法导出时返回 None。hash 基于解析后的 DER，不受 PEM
+    换行和包裹格式影响。
+    """
+    if not csr_pem or not PEM_CSR_RE.search(str(csr_pem)):
+        return None
+    csr_tmp = None
+    try:
+        csr_tmp = tempfile.NamedTemporaryFile(suffix='.csr', delete=False, mode='w')
+        csr_tmp.write(csr_pem)
+        csr_tmp.close()
+
+        verify = subprocess.run(
+            ['openssl', 'req', '-in', csr_tmp.name, '-noout', '-verify', '-subject'],
+            capture_output=True, text=True, timeout=10,
+        )
+        if verify.returncode != 0:
+            return None
+        der = subprocess.run(
+            ['openssl', 'req', '-in', csr_tmp.name, '-outform', 'DER'],
+            capture_output=True, timeout=10,
+        )
+        pub = subprocess.run(
+            ['openssl', 'req', '-in', csr_tmp.name, '-noout', '-pubkey'],
+            capture_output=True, timeout=10,
+        )
+        if der.returncode != 0 or pub.returncode != 0:
+            return None
+        pub_der = subprocess.run(
+            ['openssl', 'pkey', '-pubin', '-outform', 'DER'],
+            input=pub.stdout, capture_output=True, timeout=10,
+        )
+        if pub_der.returncode != 0:
+            return None
+        subject = verify.stdout or ''
+        cn_match = re.search(
+            r'(?:^|[,/]|subject\s*=)\s*CN\s*=\s*([^,/]+)',
+            subject,
+            re.IGNORECASE,
+        )
+        return {
+            'hash': hashlib.sha256(der.stdout).hexdigest(),
+            'common_name': cn_match.group(1).strip() if cn_match else '',
+            'public_key_der': pub_der.stdout,
+        }
+    except (OSError, subprocess.SubprocessError):
+        return None
+    finally:
+        if csr_tmp and os.path.exists(csr_tmp.name):
+            os.unlink(csr_tmp.name)
+
+
+def verify_csr_key_match(csr_pem, key_pem):
+    """验证 CSR 公钥与私钥公钥是否一致。"""
+    csr_info = parse_csr_info(csr_pem)
+    if not csr_info:
+        return False
+    key_tmp = None
+    try:
+        key_tmp = tempfile.NamedTemporaryFile(suffix='.key', delete=False, mode='w')
+        key_tmp.write(key_pem)
+        key_tmp.close()
+        key_pub = subprocess.run(
+            ['openssl', 'pkey', '-in', key_tmp.name, '-pubout', '-outform', 'DER'],
+            capture_output=True, timeout=10,
+        )
+        return key_pub.returncode == 0 and key_pub.stdout == csr_info['public_key_der']
+    except (OSError, subprocess.SubprocessError):
+        return False
+    finally:
+        if key_tmp and os.path.exists(key_tmp.name):
+            os.unlink(key_tmp.name)
+
+
 def generate_csr(domains, key_type='rsa', key_size=2048):
     """生成 CSR 和私钥。仅使用 CN，不添加 SAN。
 
@@ -217,7 +331,10 @@ def generate_csr(domains, key_type='rsa', key_size=2048):
         with open(csr_file.name, 'r') as f:
             csr_pem = f.read()
 
-        csr_hash = hashlib.sha256(csr_pem.encode('utf-8')).hexdigest()
+        csr_info = parse_csr_info(csr_pem)
+        if not csr_info:
+            raise RuntimeError("CSR 生成后校验失败")
+        csr_hash = csr_info['hash']
 
         return csr_pem, key_pem, csr_hash
     except subprocess.CalledProcessError as e:

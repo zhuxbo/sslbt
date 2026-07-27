@@ -166,13 +166,51 @@ class TestDeployer:
         )
         assert results[0]['status'] is True
         assert results[1]['status'] is False
-        # metadata 应被更新（部分成功）
         cert = config.get_cert(12345)
-        assert cert['metadata']['last_issue_state'] == ''
-        assert cert['metadata']['issue_retry_count'] == 0
-        assert cert['metadata']['last_deploy_at'] != ''
-        # 到期时间应被回填（避免 cron 因空 expires_at 永不接手）
-        assert cert['metadata']['cert_expires_at'] != ''
+        meta = cert['metadata']
+
+        # 组 2（任一成功）：计数清零。不收紧到「全部成功」——一个永久坏的站点会让
+        # 计数只增不减，10 轮后把整张证书推入 CAPPED，健康站点跟着一起停更
+        assert meta['last_issue_state'] == ''
+        assert meta['issue_retry_count'] == 0
+        assert meta['deploy_attempt_count'] == 0
+
+        # 任一绑定成功即接纳证书，并用独立状态补部署剩余失败绑定。
+        assert meta['cert_expires_at'] == '2035-01-01T00:00:00Z'
+        assert meta['cert_serial'] == 'DEF456'
+        assert meta.get('last_deploy_at', '')
+        assert meta['failed_site_names'] == ['s2.a.com']
+        assert meta['failed_site_retry_count'] == 0
+
+        # 组 1（无条件）：逐站点结果落盘，面板据此渲染而非用证书级 last_deploy_at
+        statuses = meta['site_deploy_status']
+        assert statuses['s1.a.com']['status'] is True
+        assert statuses['s2.a.com']['status'] is False
+
+    @patch('lib.deployer.cert_utils')
+    @patch('lib.deployer.Deployer._set_ssl')
+    def test_deploy_multi_all_success_advances_expiry(self, mock_set_ssl, mock_cert_utils,
+                                                      deployer, tmp_data_dir):
+        """全部成功才前推到期时间与序列号"""
+        mock_cert_utils.validate_cert_pem.return_value = (True, '')
+        mock_cert_utils.validate_key_pem.return_value = (True, '')
+        mock_cert_utils.verify_cert_key_match.return_value = True
+        mock_cert_utils.parse_cert_info.return_value = {
+            'common_name': 'a.com', 'serial': 'DEF456', 'not_after': _FUTURE_EXPIRY,
+        }
+        mock_set_ssl.side_effect = [{'status': True}, {'status': True}]
+
+        config = ConfigManager(tmp_data_dir)
+        config.add_cert(12346, 'test', ['a.com'], site_names=['s1.a.com', 's2.a.com'])
+        deployer._config = config
+        deployer.deploy_multi(
+            site_names=['s1.a.com', 's2.a.com'], fullchain_pem='cert-pem',
+            key_pem='key-pem', order_id=12346, domains=['a.com'],
+        )
+        meta = config.get_cert(12346)['metadata']
+        assert meta['cert_expires_at'] != ''
+        assert meta['cert_serial'] == 'DEF456'
+        assert meta['last_deploy_at'] != ''
 
 
 class TestSetSSLResultWhitelist:
@@ -242,8 +280,8 @@ class TestReloadJudgment:
         with pytest.raises(DeployError, match='配置'):
             deployer._set_ssl('test.example.com', 'cert', 'key')
 
-    def test_web_config_error_phase_is_reload(self, deployer, monkeypatch):
-        """写入后配置校验失败归类为 reload 阶段（pre-flight 通过，写入后才检出）"""
+    def test_post_write_config_error_phase_is_config(self, deployer, monkeypatch):
+        """写入后配置校验失败归类为 config 阶段（pre-flight 通过，因果归于本次写入）"""
         import public
         calls = {'n': 0}
 
@@ -254,20 +292,37 @@ class TestReloadJudgment:
         monkeypatch.setattr(public, 'checkWebConfig', staged_check)
         with pytest.raises(DeployError) as exc_info:
             deployer._set_ssl('test.example.com', 'cert', 'key')
-        assert exc_info.value.phase == 'reload'
+        assert exc_info.value.phase == 'config'
 
     def test_reload_stderr_error_fails(self, deployer, monkeypatch):
         import public
         monkeypatch.setattr(public, 'serviceReload',
                             lambda: ('', 'Job for nginx.service failed'))
-        with pytest.raises(DeployError, match='重载'):
+        with pytest.raises(DeployError, match='重载') as exc_info:
             deployer._set_ssl('test.example.com', 'cert', 'key')
+        assert exc_info.value.phase == 'reload'
 
     def test_reload_warning_passes(self, deployer, monkeypatch):
         # stderr 中的 warn 不应误判为失败
         import public
         monkeypatch.setattr(public, 'serviceReload',
                             lambda: ('', 'nginx: [warn] conflicting server name "a.com"'))
+        result = deployer._set_ssl('test.example.com', 'cert', 'key')
+        assert result['status'] is True
+
+    def test_reload_stderr_error_log_word_passes(self, deployer, monkeypatch):
+        """stderr 出现 error_log / ErrorLog 等配置项名称不得误判为重载失败"""
+        import public
+        monkeypatch.setattr(public, 'serviceReload', lambda: (
+            '', 'nginx: [notice] using error_log /www/wwwlogs/nginx_error.log; ErrorLog set'))
+        result = deployer._set_ssl('test.example.com', 'cert', 'key')
+        assert result['status'] is True
+
+    def test_reload_stderr_plain_failed_word_passes(self, deployer, monkeypatch):
+        """裸词 failed（如站点名/日志正文）不构成失败特征"""
+        import public
+        monkeypatch.setattr(public, 'serviceReload',
+                            lambda: ('', 'reloading site failed-login.example.com'))
         result = deployer._set_ssl('test.example.com', 'cert', 'key')
         assert result['status'] is True
 
@@ -308,38 +363,57 @@ class TestPreflightAndRollback:
         assert exc.value.phase == 'preflight'
         assert calls['setssl'] == 0  # 既有配置损坏，不应写入新证书
 
-    def test_setssl_ok_reload_fail_rolls_back(self, deployer, monkeypatch):
-        """SetSSL 成功但 reload 失败 → 回滚到原证书（用 mock 模拟）"""
+    @staticmethod
+    def _staged_config(monkeypatch, fail_on=(2,)):
+        """按调用序号控制 checkWebConfig 结果
+
+        _set_ssl 中的调用顺序：1=pre-flight，2=写入后校验，3=回滚后复核。
+        默认只让第 2 次失败，模拟坏配置由本次写入引入且回滚后恢复正常。
+        """
+        import public
+        calls = {'n': 0}
+
+        def staged_check():
+            calls['n'] += 1
+            return 'nginx: [emerg] boom' if calls['n'] in fail_on else True
+
+        monkeypatch.setattr(public, 'checkWebConfig', staged_check)
+        return calls
+
+    def test_post_write_config_fail_rolls_back(self, deployer, monkeypatch):
+        """写入后配置校验失败 → 因果归于本次写入，回滚到原证书"""
+        import panelSite
+        panelSite.panelSite._ssl_data['test.example.com'] = {'key': 'OLD-KEY', 'cert': 'OLD-CERT'}
+        self._staged_config(monkeypatch)
+        with pytest.raises(DeployError, match='已回滚'):
+            deployer._set_ssl('test.example.com', 'NEW-CERT', 'NEW-KEY')
+        assert panelSite.panelSite._ssl_data['test.example.com'] == {'key': 'OLD-KEY', 'cert': 'OLD-CERT'}
+
+    def test_reload_fail_does_not_roll_back(self, deployer, monkeypatch):
+        """配置校验通过、仅服务重载失败 → 不回滚：配置有效，回滚证书无助于修复服务层问题"""
         import panelSite
         import public
         panelSite.panelSite._ssl_data['test.example.com'] = {'key': 'OLD-KEY', 'cert': 'OLD-CERT'}
-
-        reload_calls = {'n': 0}
-
-        def staged_reload():
-            reload_calls['n'] += 1
-            # 新证书写入后第一次 reload 失败触发回滚，回滚后恢复正常
-            return ('', 'Job for nginx.service failed') if reload_calls['n'] == 1 else ('', '')
-
-        monkeypatch.setattr(public, 'serviceReload', staged_reload)
-        with pytest.raises(DeployError, match='已回滚'):
+        monkeypatch.setattr(public, 'serviceReload', lambda: ('', 'Job for nginx.service failed'))
+        with pytest.raises(DeployError) as exc_info:
             deployer._set_ssl('test.example.com', 'NEW-CERT', 'NEW-KEY')
-        # 原证书已恢复
-        assert panelSite.panelSite._ssl_data['test.example.com'] == {'key': 'OLD-KEY', 'cert': 'OLD-CERT'}
+        assert exc_info.value.phase == 'reload'
+        assert '人工检查' in str(exc_info.value)
+        # 新证书保留在站点上：下次任意重载即可生效
+        assert panelSite.panelSite._ssl_data['test.example.com'] == {'key': 'NEW-KEY', 'cert': 'NEW-CERT'}
 
     def test_rollback_no_prev_cert(self, deployer, monkeypatch):
-        """SetSSL 成功但 reload 失败且站点无原证书 → 提示无法回滚"""
-        import public
-        monkeypatch.setattr(public, 'serviceReload', lambda: ('', 'Job for nginx.service failed'))
+        """写入后配置校验失败且站点无原证书 → 提示无法回滚"""
+        self._staged_config(monkeypatch)
         with pytest.raises(DeployError, match='无原证书可回滚'):
             deployer._set_ssl('newsite.example.com', 'NEW-CERT', 'NEW-KEY')
 
     def test_rollback_also_fails_needs_manual(self, deployer, monkeypatch):
-        """回滚后 reload 仍失败 → 提示人工检查"""
+        """回滚后配置校验仍失败 → 提示人工检查"""
         import panelSite
-        import public
         panelSite.panelSite._ssl_data['test.example.com'] = {'key': 'OLD-KEY', 'cert': 'OLD-CERT'}
-        monkeypatch.setattr(public, 'serviceReload', lambda: ('', 'Job for nginx.service failed'))
+        # 写入后校验与回滚后复核都失败
+        self._staged_config(monkeypatch, fail_on=(2, 3))
         with pytest.raises(DeployError, match='请人工检查'):
             deployer._set_ssl('test.example.com', 'NEW-CERT', 'NEW-KEY')
 
@@ -539,6 +613,8 @@ class TestMetadataFailure:
         with pytest.raises(DeployError, match='部署未完成'):
             deployer.deploy_multi(['s1'], 'cert', 'key', order_id=12345)
 
+        mock_cert_utils.parse_cert_info.assert_called_once_with(
+            'cert', logger=deployer._logger)
         kwargs = api.callback.call_args.kwargs
         assert kwargs['status'] == 'failure'
         assert '到期时间' in kwargs.get('message', '')
@@ -1073,3 +1149,22 @@ class TestDeployError:
         assert str(err) == 'test error'
         assert err.phase == 'validate'
         assert err.retryable is True
+
+
+class TestDeployMultiEmptyResults:
+    """空站点清单不得因 all([]) == True 发出 success 回调（D3）"""
+
+    @patch('lib.deployer.cert_utils')
+    def test_empty_site_list_raises_and_no_callback(self, mock_cert_utils, tmp_data_dir):
+        mock_cert_utils.validate_cert_pem.return_value = (True, '')
+        mock_cert_utils.validate_key_pem.return_value = (True, '')
+        mock_cert_utils.verify_cert_key_match.return_value = True
+
+        config = ConfigManager(tmp_data_dir)
+        api = MagicMock()
+        deployer = Deployer(config, api, MagicMock())
+        with pytest.raises(DeployError, match='无可部署站点'):
+            deployer.deploy_multi(
+                site_names=[], fullchain_pem='cert-pem', key_pem='key-pem',
+                order_id=123, api_client=api)
+        api.callback.assert_not_called()

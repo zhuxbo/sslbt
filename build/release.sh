@@ -43,6 +43,7 @@ usage() {
   build/release.sh --verify BUNDLE_DIR
   build/release.sh --resume BUNDLE_DIR
   build/release.sh --dev VERSION [--bundle DIR]
+  build/release.sh VERSION [--bundle DIR]    # 兼容旧入口，仅限预发布版
   build/release.sh --dry-run VERSION
   build/release.sh --test-connections
 
@@ -64,7 +65,10 @@ while [ "$#" -gt 0 ]; do
             MODE="test-connections"; shift ;;
         --bundle) BUNDLE_DIR="${2:-}"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
-        *) die "未知参数: $1" ;;
+        -*) die "未知参数: $1" ;;
+        *)
+            [ -z "$MODE" ] || die "只能选择一个模式"
+            MODE="dev"; VERSION="$1"; shift ;;
     esac
 done
 [ -n "$MODE" ] || { usage; exit 1; }
@@ -322,7 +326,11 @@ stage_nodes() {
             info "$SERVER_NAME 暂存并校验完成"
         fi
     done
-    info "所有节点暂存完成；main 此时才可创建不可变 tag 和 draft GitHub Release"
+    if [ "$CHANNEL" = main ]; then
+        info "所有节点暂存完成；main 通道可继续创建不可变 tag 和 draft GitHub Release"
+    else
+        info "所有节点暂存完成；dev 通道无需 tag 和 GitHub Release，将继续发布"
+    fi
 }
 
 require_main_tag() {
@@ -489,7 +497,8 @@ publish_nodes() {
             die "全节点验收失败，已尝试回滚公开索引和资产"
         fi
     done
-    finish_forward_transaction
+    # 刚以「失败即回滚」语义全节点验收过，收尾无需重复验收（其间无任何远端写、锁仍持有）
+    finish_forward_transaction verified
 }
 
 rollback_nodes() {
@@ -517,10 +526,14 @@ rollback_nodes() {
 }
 
 finish_forward_transaction() {
-    local server
-    for server in "${SERVERS[@]}"; do
-        verify_one_node "$server" || die "forward-only 全节点验收失败；保留原事务继续恢复"
-    done
+    # $1 = verified 表示调用方刚完成全节点验收，跳过重复验收；
+    # 从「索引已是候选」快路径（含 --resume 中断恢复）进入时无人验收过，必须自行验收
+    local server verified="${1:-}"
+    if [ "$verified" != verified ]; then
+        for server in "${SERVERS[@]}"; do
+            verify_one_node "$server" || die "forward-only 全节点验收失败；保留原事务继续恢复"
+        done
+    fi
     assert_all_indexes_candidate
     for server in "${SERVERS[@]}"; do
         cleanup_one_node "$server" || die "旧版本清理失败；保留 bundle 后重新验收"
@@ -618,6 +631,6 @@ case "$MODE" in
         require_main_tag; stage_nodes true; publish_nodes ;;
     dev)
         [ -n "$VERSION" ] || die "缺少版本号"
-        normalize_version "$VERSION"; [[ "$VERSION" == *-* ]] || die "--dev 只接受预发布 SemVer"
+        normalize_version "$VERSION"; [[ "$VERSION" == *-* ]] || die "dev 发布只接受预发布 SemVer"
         prepare_bundle "$VERSION"; stage_nodes false; publish_nodes ;;
 esac

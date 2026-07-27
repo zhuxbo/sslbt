@@ -16,18 +16,111 @@ VALIDATION_METHOD_DELEGATION = 'delegation'
 # 签发/部署尝试上限（deploy-spec §11：各自 >= 10 触顶）。renew.py 复用同一常量
 MAX_ISSUE_RETRY_COUNT = 10
 MAX_DEPLOY_ATTEMPT_COUNT = 10
+MAX_FAILED_SITE_RETRY_COUNT = 10
 
-# last_issue_state 取值（deploy-spec §1.5）
+# 无进展停更时限（天，deploy-spec §3.2/§11）。GET 轮询按 §3.2 不计入尝试计数，
+# 唯一的边界曾是证书到期闸门——而它在 cert_expires_at 为空时（新增证书、从未成功
+# 部署过的证书）直接失效，卡在 processing 或终态订单上的证书会每天空查询到永远。
+# 时限与计数正交：不递增任何尝试计数，只给纯查询路径一个绝对截止点。
+MAX_NO_PROGRESS_DAYS = 14
+# 环境阻断上报上限（deploy-spec §2.8/§11）。阻断不是"新的部署尝试意图"、不递增
+# deploy_attempt_count，此前唯一的抑制是原因字符串相等——原因含可变内容（PID、
+# 路径、异常文本）或环境好坏抖动时每轮都算"变化"，回调因此无上限。
+MAX_BLOCK_REPORT_COUNT = 10
+
+# last_issue_state 取值（deploy-spec §1.5）。语义是「有无在途订单」，用于防止重复提交
+# CSR，**不承载服务端订单状态**——后者只进 last_order_status（展示专用）
 ISSUE_STATE_PROCESSING = 'processing'
-ISSUE_STATE_CAPPED = 'CAPPED'            # 触顶静默，记录阶段：issue/deploy/legacy
+ISSUE_STATE_ACTIVE = 'active'            # 秒签已签发、待部署
+ISSUE_STATE_CAPPED = 'CAPPED'            # 触顶静默，记录阶段：issue/deploy/stalled/legacy
 ISSUE_STATE_EXPIRED = 'EXPIRED'          # 已过期静默
 ISSUE_STATE_POLICY_BLOCKED = 'policy_blocked_needs_setup'  # 旧非法 IP 配置，待重新 setup
-# CAPPED 触顶阶段（记录到 metadata.cap_stage）
-CAP_STAGE_ISSUE = 'issue'
-CAP_STAGE_DEPLOY = 'deploy'
-CAP_STAGE_LEGACY = 'legacy'
+# CAPPED 触顶阶段（记录到 metadata.capped_phase）
+CAPPED_PHASE_ISSUE = 'issue'
+CAPPED_PHASE_DEPLOY = 'deploy'
+CAPPED_PHASE_LEGACY = 'legacy'
+CAPPED_PHASE_STALLED = 'stalled'    # 连续多日纯查询无进展，停止拉取
 # 触顶/过期/policy 阻断为终态：不再启动新动作、不发回调、迁移不再改写
 TERMINAL_ISSUE_STATES = (ISSUE_STATE_CAPPED, ISSUE_STATE_EXPIRED, ISSUE_STATE_POLICY_BLOCKED)
+# 「有在途订单」的状态：这些状态下只查询，绝不提交新 CSR
+IN_FLIGHT_ISSUE_STATES = (ISSUE_STATE_PROCESSING, ISSUE_STATE_ACTIVE)
+
+# ==================== 服务端订单状态分类（deploy-spec §2.4） ====================
+# 必须显式分类全部取值，**不得用「其余即终态」兜底**：服务端枚举含 unpaid / cancelling
+# 这类可自愈中间态，误判为终态会让证书停在等人工而实际无人需处理。
+ORDER_CLASS_ACTIVE = 'active'      # 已签发，可部署
+ORDER_CLASS_WAITING = 'waiting'    # 在途等待：只 GET、不计数、不重复提交，计入无进展计时
+ORDER_CLASS_TERMINAL = 'terminal'  # 真终态：记录后停止自动动作，等待人工；后续轮次仍可查询自愈
+ORDER_CLASS_CHAIN = 'chain'        # 链式状态：服务端本应自动跟随续费链，收到即链数据异常
+ORDER_CLASS_UNKNOWN = 'unknown'    # 服务端新增的未知状态：保守当在途等待，由无进展时限兜底
+
+# unpaid / cancelling 归入 waiting 而非终态：服务端会自行推进（unpaid 由 update 自动 pay、
+# 孤儿单会被清理）或转 cancelled。客户端只查询等待，**绝不主动 POST 推进**——
+# POST 会触发服务端 pay 扣费，涉及资金的动作不由客户端自动发起。
+_ORDER_WAITING_STATUSES = ('pending', 'processing', 'approving', 'unpaid', 'cancelling')
+_ORDER_TERMINAL_STATUSES = ('failed', 'cancelled', 'revoked', 'expired')
+_ORDER_CHAIN_STATUSES = ('renewed', 'reissued')
+
+
+def classify_order_status(status):
+    """归类服务端订单状态（deploy-spec §2.4）
+
+    未知取值一律保守归为 UNKNOWN 并按在途等待处置：反向（当终态）会让服务端新增的
+    一个中间态把全量证书打进停机。
+    """
+    status = (status or '').strip()
+    if status == ORDER_CLASS_ACTIVE:
+        return ORDER_CLASS_ACTIVE
+    if status in _ORDER_WAITING_STATUSES:
+        return ORDER_CLASS_WAITING
+    if status in _ORDER_TERMINAL_STATUSES:
+        return ORDER_CLASS_TERMINAL
+    if status in _ORDER_CHAIN_STATUSES:
+        return ORDER_CLASS_CHAIN
+    return ORDER_CLASS_UNKNOWN
+
+
+# 部署成功时要清零/清空的 metadata 键（deploy-spec §3.8）。
+# 集中在此而非散在调用点硬编码：漏同步的表现是「面板显示一个已经消失的旧原因」——
+# 测试不会变红、用户也不会报，只会某天让人对面板失去信任。
+# 值为该键的重置值；调用方在其上叠加本次部署的新值（last_deploy_at 等）。
+DEPLOY_SUCCESS_RESET_KEYS = {
+    'last_issue_state': '',
+    'issue_retry_count': 0,
+    'deploy_attempt_count': 0,
+    'deploy_started': False,
+    'csr_submitted_at': '',
+    'last_csr_hash': '',
+    'last_deploy_block_reason': '',
+    'last_deploy_block_at': '',
+    'block_report_count': 0,
+    'last_order_status': '',
+    'no_progress_since': '',
+    'verify_file_place_failed': False,
+}
+# 注意：**不得**把 unchanged_cert_rounds 加进上面这张表（deploy-spec §3.8）。它的所有权
+# 属于 renew._track_cert_unchanged（序列号变化时清零、相同时递增），而该检测在部署之后
+# 执行——放进来会让计数每轮先归零再递增到 1，永远达不到阈值，整个检测静默失效。
+
+# 用户手动「恢复自动续签」时要清除的键（reset_issue_state）。
+# unchanged_cert_rounds 在这里保留：手动「恢复自动续签」是用户主动清账，
+# 与「部署成功」不同，不会与检测本身的所有权冲突。
+# 与部署成功集的差异：不含 last_csr_hash（在途 CSR 标记由恢复流程自行判断），
+# 额外含 capped_phase（触顶阶段仅在终态下有意义）。
+MANUAL_RESET_KEYS = {
+    'last_issue_state': '',
+    'capped_phase': '',
+    'issue_retry_count': 0,
+    'deploy_attempt_count': 0,
+    'deploy_started': False,
+    'last_deploy_block_reason': '',
+    'last_deploy_block_at': '',
+    'block_report_count': 0,
+    'last_order_status': '',
+    'no_progress_since': '',
+    'unchanged_cert_rounds': 0,
+    'verify_file_place_failed': False,
+}
 
 
 def domains_contain_ip(domains):
@@ -109,6 +202,11 @@ DEFAULT_CERT_ENTRY = {
         'last_issue_state': '',
         'issue_retry_count': 0,
         'deploy_attempt_count': 0,
+        'failed_site_names': [],
+        'failed_site_retry_count': 0,
+        'no_progress_since': '',
+        'block_report_count': 0,
+        'last_deploy_block_reason': '',
     },
 }
 
@@ -138,6 +236,15 @@ _GLOBAL_FIELD_RULES = {
 _CERT_FIELD_RULES = {
     'api_url':   ('move', 'api', 'url'),
     'api_token': ('move', 'api', 'token'),
+}
+
+# metadata 字段迁移。此前引擎只在全局层与证书层执行规则，够不到 cert['metadata']——
+# 补上这一层后 metadata 的字段改名同样只需在此追加一条，不必写命令式迁移代码。
+_METADATA_FIELD_RULES = {
+    # cap_stage → capped_phase：字段名以 deploy-spec §1.5 为准（sslctl 已用该名发布）。
+    # v0.3.9 已发布 cap_stage，线上「有已停更证书」的安装盘上确实有它；不迁移的表现是
+    # 面板丢掉具体触顶阶段、退回泛化文案，且旧键永久滞留成死数据
+    'cap_stage': ('rename', 'capped_phase'),
 }
 
 # 旧文件合并：旧文件名 → 合并到哪个字段
@@ -266,7 +373,7 @@ def _migrate_cert_semantics(cert, global_renew_mode):
             deploy_count = 0
         if issue_count >= MAX_ISSUE_RETRY_COUNT or deploy_count >= MAX_DEPLOY_ATTEMPT_COUNT:
             meta['last_issue_state'] = ISSUE_STATE_CAPPED
-            meta['cap_stage'] = CAP_STAGE_LEGACY
+            meta['capped_phase'] = CAPPED_PHASE_LEGACY
             state = ISSUE_STATE_CAPPED
             changed = True
 
@@ -280,6 +387,10 @@ def _migrate_cert_semantics(cert, global_renew_mode):
     return changed
 
 
+class ConfigDegradedError(Exception):
+    """主配置文件损坏，插件进入只读降级态，拒绝一切写入"""
+
+
 class ConfigManager:
     """配置读写管理，文件锁保护"""
 
@@ -287,29 +398,65 @@ class ConfigManager:
         self._data_dir = data_dir
         self._logger = logger
         self._config_path = os.path.join(data_dir, 'config.json')
+        # 主配置损坏后置位：允许任何局部写入都会把损坏文件"洗"成合法的空配置，
+        # 用户的证书配置就彻底没了。必须在 _ensure_config 之前初始化
+        self._degraded = False
         os.makedirs(data_dir, exist_ok=True)
         self._ensure_config()
+
+    def is_degraded(self):
+        """主配置是否处于只读降级态（供续签引擎在整轮开始前拒跑）"""
+        return self._degraded
+
+    def _assert_writable(self):
+        """降级态拒绝一切写入。报错优于静默覆盖：损坏文件还能人工修，被空配置盖掉就没了"""
+        if self._degraded:
+            name = os.path.basename(self._config_path)
+            raise ConfigDegradedError(
+                '配置文件 %s 解析失败，已停止一切写入以防覆盖；'
+                '原文件备份在 %s.bak，请人工修复后重试' % (name, name))
+
+    def _backup_corrupt(self, path):
+        """备份损坏文件。已有备份时不覆盖——第二次损坏不能毁掉第一份可恢复副本"""
+        bak = path + '.bak'
+        if os.path.exists(bak):
+            if self._logger:
+                self._logger.warning("损坏备份已存在，保留原备份不覆盖: %s", os.path.basename(bak))
+            return
+        try:
+            shutil.copy2(path, bak)
+        except OSError:
+            pass
 
     def _ensure_config(self):
         """启动时校验配置：合并旧文件、执行迁移、持久化"""
         raw = self._read_json(self._config_path, DEFAULT_CONFIG)
+
+        # 主配置损坏：保持现场，不迁移、不合并、不写入、不删除任何文件
+        if self._degraded:
+            if self._logger:
+                self._logger.error("配置文件损坏，插件进入只读降级态，已停止一切写入")
+            return
+
         changed = False
 
-        # 合并旧文件（先记录，写入成功后再删除）
+        # 合并旧文件：仅当内容确实并入 AND 本次写入成功才删除，其余一律改名 .orphan 保留。
+        # 删除不可逆，而"读失败"与"目标已有数据故未合并"都不代表旧文件没有价值——
+        # 此前 merged_files.append 在合并判断之外，这两种情况都会连同数据一起被删掉
         merged_files = []
+        orphan_files = []
         for old_name, field in _OLD_FILE_MERGES.items():
             old_path = os.path.join(self._data_dir, old_name)
             if not os.path.isfile(old_path):
                 continue
-            try:
-                old_data = self._read_json(old_path, {})
-                items = old_data.get(field, [])
-                if items and not raw.get(field):
-                    raw[field] = items
-                    changed = True
+            old_data = self._read_json(old_path, {})
+            items = old_data.get(field, []) if isinstance(old_data, dict) else []
+            if items and not raw.get(field):
+                raw[field] = items
+                changed = True
                 merged_files.append(old_path)
-            except OSError:
-                pass
+            else:
+                orphan_files.append(old_path)
 
         # 全局字段迁移
         changed = _apply_field_rules(raw, _GLOBAL_FIELD_RULES) or changed
@@ -320,19 +467,46 @@ class ConfigManager:
         global_renew_mode = raw.get('schedule', {}).get('renew_mode', RENEW_MODE_PULL)
         for cert in raw.get('certificates', []):
             changed = _apply_field_rules(cert, _CERT_FIELD_RULES) or changed
+            # 放在 _fill_defaults 之前：rename 的判据是「目标键不存在才搬」，一旦哪天
+            # capped_phase 被加进 DEFAULT_CERT_ENTRY，先补默认值就会让旧值被静默丢弃
+            meta = cert.get('metadata')
+            if isinstance(meta, dict):
+                changed = _apply_field_rules(meta, _METADATA_FIELD_RULES) or changed
             changed = _fill_defaults(cert, DEFAULT_CERT_ENTRY) or changed
             changed = _migrate_cert_semantics(cert, global_renew_mode) or changed
 
+        # 捕获 Exception 而非 OSError：json.dump 对不可序列化对象抛 TypeError/ValueError，
+        # 穿透出去会让 ConfigManager 构造失败，插件整体不可用
+        write_ok = True
         if changed:
             try:
                 self._write_json(self._config_path, raw)
-            except OSError:
-                pass
+            except Exception as e:
+                write_ok = False
+                if self._logger:
+                    self._logger.error("配置写入失败，保留旧文件不删除: %s", str(e))
 
-        # 写入成功后再删除旧文件
+        if not write_ok:
+            # 写入失败时已合并的内容并未落盘，删除旧文件会让数据两头皆空
+            orphan_files.extend(merged_files)
+            merged_files = []
+
         for path in merged_files:
             try:
                 os.remove(path)
+            except OSError:
+                pass
+
+        for path in orphan_files:
+            orphan = path + '.orphan'
+            if os.path.exists(orphan):
+                continue  # 已有同名孤儿文件，保留原件不动，避免覆盖上一次的备份
+            try:
+                os.rename(path, orphan)
+                if self._logger:
+                    self._logger.warning(
+                        "旧配置文件未被合并，已改名保留: %s -> %s",
+                        os.path.basename(path), os.path.basename(orphan))
             except OSError:
                 pass
 
@@ -352,15 +526,17 @@ class ConfigManager:
         except json.JSONDecodeError:
             if self._logger:
                 self._logger.error("配置文件 JSON 解析失败: %s", path)
-            try:
-                shutil.copy2(path, path + '.bak')
-            except OSError:
-                pass
+            self._backup_corrupt(path)
+            # 仅主配置损坏才进入降级：遗留文件（certs.json 等）损坏由 _ensure_config 按
+            # .orphan 无损跳过，若也置降级会让插件永久只读，用户连删掉那张证书都做不到
+            if os.path.abspath(path) == os.path.abspath(self._config_path):
+                self._degraded = True
             return copy.deepcopy(default)
         except OSError:
             return copy.deepcopy(default)
 
     def _write_json(self, path, data):
+        self._assert_writable()
         if os.path.islink(path):
             raise OSError("refusing to write to symlink: %s" % os.path.basename(path))
         tmp_path = path + '.tmp'
@@ -376,7 +552,13 @@ class ConfigManager:
         os.replace(tmp_path, path)
 
     def _update_json(self, path, updater_fn, default):
-        """原子读-改-写: 在排他锁保护下执行 updater_fn(data) -> data"""
+        """原子读-改-写: 在排他锁保护下执行 updater_fn(data) -> data
+
+        降级门禁必须在这里也有一份：本函数有独立的"解析失败 → 备份 → 回落默认值 → 照常
+        写回"路径，是主配置被空配置覆盖的真正发生点（_ensure_config 的写入被 changed 门住，
+        损坏时不会触发）。只拦 _ensure_config 挡不住 cron 的任意一次 update_metadata。
+        """
+        self._assert_writable()
         if os.path.islink(path):
             raise OSError("refusing to write to symlink: %s" % os.path.basename(path))
         lock_path = path + '.lock'
@@ -390,10 +572,14 @@ class ConfigManager:
                     except json.JSONDecodeError:
                         if self._logger:
                             self._logger.error("配置文件 JSON 解析失败: %s", path)
-                        try:
-                            shutil.copy2(path, path + '.bak')
-                        except OSError:
-                            pass
+                        self._backup_corrupt(path)
+                        if os.path.abspath(path) == os.path.abspath(self._config_path):
+                            # 本次已持锁，置位后由下一次调用的 _assert_writable 拦截；
+                            # 本次直接抛出，绝不用默认值覆盖损坏的主配置
+                            self._degraded = True
+                            raise ConfigDegradedError(
+                                '配置文件 %s 解析失败，已停止写入以防覆盖'
+                                % os.path.basename(path))
                         data = copy.deepcopy(default)
                     except OSError:
                         data = copy.deepcopy(default)
