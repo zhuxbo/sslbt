@@ -262,8 +262,13 @@ class APIClient:
         # 上次 API 调用返回的 renew_before_days（> 0 时有效）
         self.last_renew_before_days = 0
 
-    def _request(self, method, url, data=None, max_size=MAX_RESPONSE_SIZE):
-        """发送 HTTP 请求，带重试"""
+    def _request(self, method, url, data=None, max_size=MAX_RESPONSE_SIZE,
+                 retry_transport=True):
+        """发送 HTTP 请求。
+
+        GET、回调和开关调用保留传输重试；携带 CSR 的提交 POST 禁止重试，
+        因为首次请求可能已到达服务端，调用方须转入 query-only 恢复。
+        """
         headers = {
             'Authorization': 'Bearer %s' % self._token,
             'Accept': 'application/json',
@@ -274,7 +279,8 @@ class APIClient:
             body = json.dumps(data).encode('utf-8')
 
         last_err = None
-        for attempt in range(MAX_RETRIES):
+        attempts = MAX_RETRIES if retry_transport else 1
+        for attempt in range(attempts):
             if attempt > 0:
                 time.sleep(2 ** (attempt - 1))  # 指数退避: 1s, 2s, 4s
                 if self._logger:
@@ -313,7 +319,9 @@ class APIClient:
                 last_err = e
 
         # 网络失败重试耗尽：结果不确定（请求可能已到达服务端），标记 transport
-        raise APIError("API 请求失败（已重试 %d 次）: %s" % (MAX_RETRIES, str(last_err)),
+        message = ("API 请求失败（已重试 %d 次）: %s" % (MAX_RETRIES, str(last_err))
+                   if retry_transport else "API 请求结果不确定: %s" % str(last_err))
+        raise APIError(message,
                        transport=True)
 
     def _parse_data(self, result):
@@ -362,7 +370,7 @@ class APIClient:
         }
         if validation_method:
             data['validation_method'] = validation_method
-        result = self._request('POST', url, data=data)
+        result = self._request('POST', url, data=data, retry_transport=False)
         cert_data = self._parse_data(result)
         renew_before_days = cert_data.get('renew_before_days', 0)
         if renew_before_days and int(renew_before_days) > 0:

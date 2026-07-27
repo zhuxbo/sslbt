@@ -30,7 +30,10 @@ from lib.config import (  # noqa: E402
 )
 from lib.logger import Logger  # noqa: E402
 from lib.api_client import APIClient, APIError, ORDER_PARAM_PATTERN  # noqa: E402
-from lib.cert_utils import build_fullchain, parse_cert_info, verify_cert_key_match, validate_key_pem  # noqa: E402
+from lib.cert_utils import (  # noqa: E402
+    build_fullchain, parse_cert_info, verify_cert_key_match, verify_csr_key_match,
+    validate_key_pem,
+)
 from lib.site_manager import SiteManager  # noqa: E402
 from lib.deployer import Deployer, DeployError, check_web_config  # noqa: E402
 from lib.renew import RenewEngine, CRON_LOCK_WAIT, PANEL_LOCK_WAIT  # noqa: E402
@@ -226,7 +229,9 @@ class sslbt_main:
             ok, _ = validate_key_pem(key_pem)
             if not ok:
                 continue
-            if verify_cert_key_match(fullchain_pem, key_pem):
+            if verify_cert_key_match(fullchain_pem, key_pem) \
+                    and (not cert_data.get('csr')
+                         or verify_csr_key_match(cert_data.get('csr', ''), key_pem)):
                 self._logger.info("私钥来源: %s", source)
                 return key_pem
 
@@ -265,6 +270,15 @@ class sslbt_main:
     def get_config(self, args=None):
         """获取插件配置"""
         try:
+            # 首次从旧升级器迁移时，浏览器可能仍运行缓存的旧 index.html；旧前端在
+            # 刷新后也会调用 get_config，因此这里是无需依赖新版前端的兼容收尾点。
+            cron_migration = CronManager(self._data_dir, self._logger).ensure_healthy()
+            if not cron_migration.get('status'):
+                self._logger.warning(
+                    "检测旧计划任务失败: %s",
+                    cron_migration.get('message', '未知错误'),
+                )
+
             cfg = self._config.get_config()
             safe_cfg = dict(cfg)
             # 读取插件版本号
@@ -349,6 +363,11 @@ class sslbt_main:
             api = APIClient(api_url, api_token, self._logger)
 
             cert_data = api.query_order(order_id)
+            status = cert_data.get('status', '')
+            if status != 'active':
+                self._logger.warning(
+                    "add_cert 早返回: order_id=%s 状态为 %s 非 active", order_id, status)
+                return _err('证书状态为 %s，首次部署仅支持 active 证书' % (status or '未知'))
             domains = self._parse_cert_domains(cert_data)
 
             # 派生续签策略（SAN 含 IP 强制 local/file；DNS 校验兼容性）——唯一权威
@@ -368,39 +387,15 @@ class sslbt_main:
                 api={'url': api_url, 'token': api_token},
                 validation_method=validation_method,
             )
+            # 一键 setup 在下一步 deploy_cert 成功前只是本地暂存，不纳入自动续签。
+            # 缺私钥或部署失败时保持 disabled，避免先开自动重签/建任务再留下半配置。
+            self._config.update_cert(order_id, {'enabled': False})
+            self._config.update_metadata(order_id, {'setup_pending': True})
+            entry = self._config.get_cert(order_id)
 
             self._logger.info("添加证书: order_id=%s, domains=%s", order_id, ','.join(domains))
 
-            # 按派生模式设置 auto_reissue（local 关 / pull 开；不自动开付费 auto_renew）
-            # 结果必须落盘：pull 模式下它没设成功 = 服务端永不重签 = 客户端每天查到
-            # 非 active 状态、永远显示「等待签发」。api_client 内部已吞掉异常并返回 None，
-            # 这里再吞一次就彻底无迹可寻了
-            effective_mode = renew_mode or self._config.get_config().get('schedule', {}).get('renew_mode', 'pull')
-            confirmed = False
-            try:
-                confirmed = api.toggle_auto_reissue(order_id, effective_mode == 'pull') is not None
-            except Exception as e:
-                self._logger.warning("toggle_auto_reissue 失败: order_id=%s, error=%s", order_id, str(e))
-            if not confirmed:
-                self._logger.warning("auto_reissue 未确认设置成功: order_id=%s", order_id)
-            try:
-                self._config.update_metadata(order_id, {'auto_reissue_confirmed': confirmed})
-            except Exception as e:
-                self._logger.warning("记录 auto_reissue 状态失败: order_id=%s, error=%s", order_id, str(e))
-
-            # 自动创建计划任务（仅在确认不存在时）。查询失败绝不能触发创建：
-            # 那会经 remove+重建把用户正常的任务在一次瞬时 DB 锁定中弄丢
-            try:
-                cron_mgr = CronManager(DATA_DIR, self._logger)
-                st = cron_mgr.get_status()
-                if st.get('error'):
-                    self._logger.warning("计划任务状态查询失败，跳过自动创建: %s", st['error'])
-                elif not st.get('exists'):
-                    cron_mgr.setup()
-            except Exception as e:
-                self._logger.warning("自动创建计划任务失败: %s", str(e))
-
-            return _ok(entry, msg='证书添加成功')
+            return _ok(entry, msg='证书已暂存，等待首次部署')
         except ValueError as e:
             self._logger.warning("add_cert ValueError: %s", str(e))
             return _err(str(e))
@@ -662,10 +657,28 @@ class sslbt_main:
             # 部署有成功则更新 auto_reissue
             if success_count > 0:
                 effective_mode = self._config.get_renew_mode(cert_entry)
+                confirmed = False
                 try:
-                    api.toggle_auto_reissue(order_id, effective_mode == 'pull')
+                    confirmed = api.toggle_auto_reissue(
+                        order_id, effective_mode == 'pull') is not None
                 except Exception as e:
                     self._logger.warning("toggle_auto_reissue 失败: order_id=%s, error=%s", order_id, str(e))
+                self._config.update_cert(order_id, {'enabled': True})
+                self._config.update_metadata(order_id, {
+                    'setup_pending': False,
+                    'auto_reissue_confirmed': confirmed,
+                })
+                # 首次真正部署成功后才注册自动续签任务。
+                try:
+                    cron_mgr = CronManager(DATA_DIR, self._logger)
+                    cron_status = cron_mgr.get_status()
+                    if cron_status.get('error'):
+                        self._logger.warning(
+                            "计划任务状态查询失败，跳过自动创建: %s", cron_status['error'])
+                    elif not cron_status.get('exists'):
+                        cron_mgr.setup()
+                except Exception as e:
+                    self._logger.warning("自动创建计划任务失败: %s", str(e))
 
             if fail_count == 0:
                 return _ok(results, msg='部署成功（%d 个站点）' % success_count)
@@ -1058,6 +1071,14 @@ class sslbt_main:
     def run_renew_cron(self, args=None):
         """计划任务调用的续签检查（分散执行）"""
         try:
+            # 每次 cron 都由独立 Python 进程启动。先做幂等健康检查，可让从旧版本
+            # 升级后仍保留的完整任务正文自行收敛为仓库薄入口；失败不阻断本轮续签。
+            health = CronManager(self._data_dir, self._logger).ensure_healthy()
+            if not health.get('status'):
+                self._logger.warning(
+                    "计划任务健康检查失败: %s",
+                    health.get('message', '未知错误'),
+                )
             return self._run_renew(spread=True)
         except Exception as e:
             self._logger.error("续签检查失败: %s", str(e))
@@ -1089,6 +1110,17 @@ class sslbt_main:
             return _err(res.get('message', '创建失败'))
         except Exception as e:
             return _err('设置计划任务失败: %s' % str(e))
+
+    def refresh_cron(self, args=None):
+        """刷新计划任务正文并保留原执行时间（升级后幂等收尾）"""
+        try:
+            cron_mgr = CronManager(DATA_DIR, self._logger)
+            res = cron_mgr.refresh()
+            if res.get('status'):
+                return _ok(res, msg=res.get('message', '计划任务已刷新'))
+            return _err(res.get('message', '刷新失败'))
+        except Exception as e:
+            return _err('刷新计划任务失败: %s' % str(e))
 
     def remove_cron(self, args=None):
         """删除计划任务"""
@@ -1149,11 +1181,18 @@ class sslbt_main:
             checksum = _get_param(args, 'checksum', '')
 
             updater = Updater(PLUGIN_DIR, self._config, self._logger)
-            updater.do_update(
+            result = updater.do_update(
                 version=version,
                 checksum=checksum,
             )
-            return _ok(msg='更新完成')
+            cron_refresh = (result or {}).get('cron_refresh', {})
+            if cron_refresh and not cron_refresh.get('status'):
+                return _ok(
+                    result,
+                    msg='更新完成，但计划任务刷新失败: %s'
+                        % cron_refresh.get('message', '未知错误'),
+                )
+            return _ok(result, msg='更新完成')
         except Exception as e:
             self._logger.error("更新失败: %s", str(e))
             return _err('更新失败: %s' % str(e))

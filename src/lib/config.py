@@ -16,6 +16,7 @@ VALIDATION_METHOD_DELEGATION = 'delegation'
 # 签发/部署尝试上限（deploy-spec §11：各自 >= 10 触顶）。renew.py 复用同一常量
 MAX_ISSUE_RETRY_COUNT = 10
 MAX_DEPLOY_ATTEMPT_COUNT = 10
+MAX_FAILED_SITE_RETRY_COUNT = 10
 
 # 无进展停更时限（天，deploy-spec §3.2/§11）。GET 轮询按 §3.2 不计入尝试计数，
 # 唯一的边界曾是证书到期闸门——而它在 cert_expires_at 为空时（新增证书、从未成功
@@ -201,8 +202,11 @@ DEFAULT_CERT_ENTRY = {
         'last_issue_state': '',
         'issue_retry_count': 0,
         'deploy_attempt_count': 0,
+        'failed_site_names': [],
+        'failed_site_retry_count': 0,
         'no_progress_since': '',
         'block_report_count': 0,
+        'last_deploy_block_reason': '',
     },
 }
 

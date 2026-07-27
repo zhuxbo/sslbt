@@ -12,10 +12,10 @@ sslbt_main.py  ← 插件入口（控制器），宝塔面板调用
   ├─ renew.py           ← 续签引擎（Pull/Local 两种模式 + 文件验证集成）
   ├─ file_verifier.py   ← 文件验证（ACME 验证文件放置/清理）
   ├─ config.py          ← 配置读写（文件锁 + 数据驱动迁移引擎）
-  ├─ cert_utils.py      ← 证书验证 + CSR 生成（支持 DNS/IP SAN）
+  ├─ cert_utils.py      ← 证书验证（支持 DNS/IP SAN）+ CSR 生成（仅 CN）
   ├─ site_manager.py    ← 宝塔站点管理 + 域名匹配（兼容新旧数据库分片）
   ├─ updater.py         ← 在线升级（releases.json 解析 + 安全下载 + 校验）
-  ├─ cron.py            ← 宝塔计划任务（setup 首建随机时间 / refresh 保留原时间只重写脚本；
+  ├─ cron.py            ← 宝塔计划任务（setup 首建 / refresh 强制刷新 / ensure_healthy 幂等自检修正；
   │                         resolve_python() 经 subprocess 验证解释器能 import public，绝不回落
   │                         系统 python3；先建后删；get_status 三态；AddCrontab 结果双重校验）
   └─ logger.py          ← 日志（对格式化后完整消息脱敏，覆盖 dict/list 参数，MAX_LOG_FILES=90 自动清理）
@@ -74,12 +74,9 @@ Bearer Token 认证，部署链接格式：`https://domain/api/deploy?token=xxx&
 pull 模式续签根本不 POST）：
 
 - `order_in_progress` —— **唯一的过渡态**，归一 `processing`：服务端已在签发，完成后自行消失。
-  按业务拒绝停止会每轮重生并重提 CSR、每轮烧一次签发额度，10 轮后把一张正在正常签发的证书
-  误判触顶，正是 spec「不做永久停止或退避升级」所禁止的。
-  与 sslctl 的**刻意差异**：归一时**清掉本轮 pending key/CSR**。能走到 `_submit_new_csr` 说明
-  本地认为无在途单而服务端说有 → 服务端签的是更早那个 CSR，本轮私钥必然不配对，留着只会让
-  `deployer` 的配对校验抛 `DeployError`，把坑从签发侧挪到部署侧（转烧部署额度 → `CAPPED(deploy)`）。
-  清掉后订单真签出时走 `_handle_processing` 的「pending key 不存在」分支清空状态，下轮重新提交
+  清理本轮未被服务端接受的 pending key/CSR，但不撤销已计入的本次逻辑尝试；后续只 GET 跟随
+  服务端当前动作。订单变为 active 后按 deploy-spec §3.5 的统一私钥选择与 CSR 门禁处理，
+  不因本错误码立即重放 POST，也不额外递增计数。
 - `validation_method_unsupported` / `auto_renew_disabled` / `insufficient_balance` ——
   **刻意不分档**，沿用既有业务拒绝路径（清 pending、计数保留、10 轮触顶静默）。「有界」由计数
   上限提供、「可见」由 `error_code` 进错误文本提供。**不要为它们另造终态**：立即终态会杀死自动
@@ -110,6 +107,7 @@ pull 模式续签根本不 POST）：
   "order_id": 123,
   "domains": "example.com,www.example.com",
   "status": "active|processing|pending|unpaid",
+  "csr": "...",               // 当前签发动作的 CSR；历史订单可为空
   "certificate": "...",       // 仅 active
   "private_key": "...",       // 仅 active
   "ca_certificate": "...",    // 仅 active
@@ -124,7 +122,10 @@ pull 模式续签根本不 POST）：
 ```json
 {"order_id": 123, "csr": "...", "domains": "a.com,b.com", "validation_method": "delegation|file"}
 ```
-服务端自动处理状态流转：unpaid→pay, pending→commit, active→reissue/renew。
+客户端每次提交前先 GET 同一订单，只有明确返回 `active` 才允许提交；服务端也拒绝对其他状态
+接收新 CSR。同一签发动作的 CSR 在任何状态下都不可原地修改；active 提交会创建后继签发动作。
+携带非空 `csr` 的 POST 一旦可能送达，遇超时、断连、HTTP 5xx、响应读取或解析失败
+均不做传输层重试，保留 pending 与 CSR metadata，下轮只 GET 并比较服务端 CSR 公钥。
 响应为单对象（非分页）。
 
 ### POST /api/deploy/callback — 部署回调
@@ -137,7 +138,9 @@ pull 模式续签根本不 POST）：
 
 ```
 添加证书（用户粘贴部署链接）
-  fetch_deploy_url → 提取 token/order → 经统一 APIClient(HTTPS 强制+SSRF+DNS Rebinding)query_batch → 解析 domains（DNS+IP SAN） → 匹配站点 → add_cert
+  fetch_deploy_url → 提取 token/order → 经统一 APIClient(HTTPS 强制+SSRF+DNS Rebinding)query_batch
+  → 仅 active 可继续；其他状态在写配置、部署、回调、开关及建任务前停止
+  → 解析 domains（DNS+IP SAN） → 匹配站点 → 验证私钥并部署 → add_cert
 
 部署证书
   query_order → 检查 order_id 变更 → active: 取 cert/key/ca → 校验匹配 → pre-flight 配置检查 → 捕获原证书 → panelSite.SetSSL() → 写入后校验 → callback
@@ -164,7 +167,7 @@ SetSSL 部署：写入前 pre-flight 校验既有配置（`check_web_config()`�
 - 触发场景：Local 模式续签（`_submit_new_csr`/`_handle_processing`）和手动部署（`deploy_cert`）
 - metadata 存储：`pending_file_verify`（文件信息）、`pending_verify_paths`（已放置路径列表）、
   `verify_file_place_failed`（未覆盖全部站点，面板告警）
-- 清理时机：证书签发成功、状态异常（**无 CSR 超时机制**，三仓均无）
+- 清理时机：证书签发成功、状态异常；长期纯查询由公共 `no_progress_since` 边界终止
 - 重放判据是「上次是否真的放上去了」而非「file_info 变没变」：`_verify_files_intact` 要求
   列表非空 + 覆盖全部绑定站点 + 文件仍在盘上，三者缺一即重放。首轮放置失败时
   `pending_file_verify` 照样落盘，只比对它会让文件一次都写不进去而订单永远卡在 processing
@@ -174,14 +177,14 @@ SetSSL 部署：写入前 pre-flight 校验既有配置（`check_web_config()`�
 - 行为契约以 `deploy-spec.md`（§1.5/§2.6/§2.8/§3.2/§3.5/§5.1/§5.2）为准，本节仅记实现要点
 - Pull 模式：查询订单，active 且证书完整则直接部署
 - Local 模式：派生策略 → 生成 CSR → 提交 → processing 状态轮询 → active 后部署
-- 计数分离与终止（`config` 常量）：签发 `issue_retry_count`（CSR 提交）与部署 `deploy_attempt_count` 分别计数、各自 `>= 10` 触顶；触顶置 `last_issue_state=CAPPED` 并记 `metadata.capped_phase`（issue/deploy/stalled/legacy）静默；已过期置 `EXPIRED` 静默；剩余有效期 < `SAFETY_MARGIN_HOURS=24` 不启动新动作。触顶/过期/policy 阻断均不发回调。前置过滤对 `processing` 证书豁免签发触顶（CSR 已被接受，继续轮询）
+- 计数分离与终止（`config` 常量）：签发 `issue_retry_count`（CSR 提交）与部署 `deploy_attempt_count` 分别计数；`>= 10` 只阻止建立下一次新尝试，已持久化或已被服务端接受的第 10 次尝试仍可查询、部署和崩溃恢复；真正触顶时置 `last_issue_state=CAPPED` 并记 `metadata.capped_phase`（issue/deploy/stalled/legacy）静默。已过期置 `EXPIRED` 静默；剩余有效期 < `SAFETY_MARGIN_HOURS=24` 不启动新动作。触顶/过期/policy 阻断均不发回调
 - 订单状态分类（`config.classify_order_status`，spec §2.4）：**禁止「其余即终态」兜底**。
   五类——`active` 部署 / `waiting`（`pending`/`processing`/`approving`/`unpaid`/`cancelling`）
   归一 processing 只查询 / `terminal`（`failed`/`cancelled`/`revoked`/`expired`）停止等人工 /
   `chain`（`renewed`/`reissued`）链数据异常按终态并告警 / `unknown` **保守当在途等待**，
   由无进展时限兜底。未知当终态会让服务端新增一个中间态就误伤全量证书
 - **订单状态只写 `last_order_status`（展示专用），绝不写 `last_issue_state`**（spec §2.4）。
-  后者语义是「有无在途订单」（`IN_FLIGHT_ISSUE_STATES` = processing/active），混入订单状态
+  后者是客户端自动签发/生命周期门禁状态，其中 `IN_FLIGHT_ISSUE_STATES` = processing/active；混入订单状态
   会带来一条扣费路径：状态被改写成 `cancelled` 之类自由文本后既不在 `TERMINAL_ISSUE_STATES`
   （前置过滤拦不住）、又不等于 processing（`_renew_local` 不再走查询分支），下一轮直接落到
   `_submit_new_csr` 发出 POST，而 POST 会触发服务端 pay **扣费**。保持在途标记不动，该路径
@@ -198,16 +201,16 @@ SetSSL 部署：写入前 pre-flight 校验既有配置（`check_web_config()`�
   - 阻断标记清除：环境恢复时 `_clear_deploy_block` 清、部署成功时 `deploy_multi` 的 metadata 重置一并清，避免面板留存已消失的旧原因
   - 手动路径同样有闸门：`_deploy_cert_locked`/`_deploy_all_locked` 开头调用 `_env_block_error()`，在查询 API 之前直接返回原因，而不是让每个站点各失败一次只留下「0 成功 N 失败」
 - 终态恢复入口 `reset_issue_state`：清 `last_issue_state`/`cap_stage`/两个计数/`deploy_started`/阻断原因。签发触顶且订单卡在 pending 的证书，自动路径被终态跳过、手动部署又要求订单 active，本入口是唯一出路
-- 恢复纪律（response-loss）：CSR 提交前原子持久化 pending key + `pending-csr.pem` 作为在途标记；`submit_csr` 传输不确定（`APIError.transport=True`：超时/断连/解析失败）保留 pending，明确业务拒绝（含服务端未接收提交，以错误信息而非状态表达）才清理；下轮 `_has_pending_csr` → `_recover_pending_submit` 只查询订单、绝不重复 POST：`pending`/`processing`/`approving`/`active` 归一 `processing`（不增计数、不重生 CSR），其他状态为订单终态，持久化后停止等待人工处理
-- 查询状态归一：服务端提交响应只会是 `pending`/`processing`；查询在 `processing → active` 之间可能出现短暂中间态 `approving`，三者统一归一 `processing` 继续等待；`active` 之后的状态为订单终态。终态持久化到 `last_issue_state` 后每轮仍查询一次（可自愈），但状态未变化时不重复记 error、不重复落盘
+- 恢复纪律（response-loss）：CSR 提交前原子持久化 pending key + `pending-csr.pem` 及 CSR metadata；`submit_csr` 传输不确定（`APIError.transport=True`：超时/断连/HTTP 5xx/响应读取或解析失败）保留 pending 与本次计数，不做传输层重试；下轮 `_recover_pending_submit` 只查询订单、绝不重复 POST，并验证服务端 CSR：与 pending 私钥配对表示本机提交已收敛；active 且不配对时清理旧状态，先尝试 API/正式本地私钥部署当前证书，全部不可用时才按门禁建立新的逻辑尝试并重新计数；在途状态且不配对时清理本机状态、只 GET 跟随服务端当前动作；CSR 缺失或非法时保留 pending 并停止本轮
+- 查询状态归一：服务端提交响应只会是 `pending`/`processing`；查询在 `processing → active` 之间可能出现短暂中间态 `approving`，三者统一归一 `processing` 继续等待；已知终态按终态处理，未知新增值保守归一为等待。服务端状态只持久化到展示字段 `last_order_status`，不写带门禁语义的 `last_issue_state`；终态后续每轮仍查询一次以便自愈，但状态未变化时不重复记 error、不重复落盘
 - 策略派生 `derive_or_validate_renew_policy`（`config`，唯一权威）：SAN 含 IP 强制 `renew_mode=local` + `validation_method=file`；DNS 校验兼容性。add_cert/update_cert_config/batch_set_renew_policy/续签提交统一调用
-- 私钥回退（deploy-spec §5.3）：deploy_cert 中按 API → 参数路径 → 站点已有私钥(GetSSL) → 弹窗粘贴 四级回退，所有来源均需 verify_cert_key_match 校验
-- 文件验证：CSR 提交返回 file 字段时自动放置，签发成功/状态异常时清理（无超时机制）
+- 私钥回退（deploy-spec §5.3）：deploy_cert 中按 API → 参数路径 → 站点已有私钥(GetSSL) → 弹窗粘贴 四级回退，所有来源均需 verify_cert_key_match 校验；服务端 CSR 非空时还须校验 CSR 公钥，历史 active 订单 CSR 为空时首次 setup 可仅凭证书—私钥配对，结果不确定的本机提交恢复不得使用该降级
+- 文件验证：CSR 提交返回 file 字段时自动放置，签发成功或明确终态时清理；长期纯查询由公共 `no_progress_since` 边界终止并清理
 - `_check_deploy_results()`：全部失败抛异常；**部分失败同样抛异常**——回调本就报 failure，此前返回 True 造成本地与服务端双口径
 - callback message：仅 failure 携带各站点失败原因摘要（含回滚状态、可能的「已达重试上限」标注）；上限 `CALLBACK_MESSAGE_MAX=256`，**先脱敏后截断**（`sanitize()` 过滤 Bearer/私钥/token 后再截断）；success 不带 message
 - 分散续签：`check_and_renew_all(spread=True)` 在证书间加动态延迟，根据需续签数量自动缩短间隔（总延迟上限 600s），仅 cron 调用启用
 - 汇总日志：续签完成后记录成功/等待/失败数量
-- cron 注册：`_build_script()` 烧入 `resolve_python()` 自检通过的解释器；`install.sh` 与 `updater.do_update()` 均调 `refresh()`（脚本正文存在宝塔 crontab 库、不在 PLUGIN_DIR 内，不在这两处刷新则修正永远到不了存量安装）；`add_cert` 仅在**确认不存在**时创建，查询失败不动现有任务
+- cron 注册：宝塔任务正文只引用 `scripts/renew-cron.sh` 并传入 `resolve_python()` 自检通过的解释器，续签执行与日志轮转随插件文件升级；`ensure_healthy()` 校验任务唯一性、名称、每天周期、执行时间、暂停态和完整正文，健康时只读，偏差时以最新任务为基准先建后删并保留时间/暂停态；每次 `run_renew_cron` 先执行该检查，失败只告警、不丢掉本轮续签，因此旧任务下一次运行即可由新 Python 进程自行收敛；`get_config` 也执行同一检查以补建缺失任务；`install.sh` 调 `refresh()`，在线升级解压后用新 Python 子进程加载磁盘上的新版 `lib.cron` 再刷新；`add_cert` 仅在**确认不存在**时创建，查询失败不动现有任务
 - 续签状态：每次运行结束写 `data/renew_status.json`（last_run/total/success/pending/failure，原子写 0600），面板经 `get_renew_status` 展示「最近续签」
 - 站点删除自愈（两轮确认）：`deploy_multi` 部署前查一次 `SiteManager.get_sites()` 复用清单检测站点存在；`get_sites` 查询失败（DB 缺失/锁定/表结构漂移）抛 `SiteQueryError` 与「确认零站点」严格区分，失败或清单为空时放弃本轮删除判定（保守视为全部存在，不计数、不解绑）；仅当清单查询成功且非空时才对不在清单中的站点计数——首轮仅记「疑似删除」（`site_missing`，按 failure 上报但不解绑），连续第二轮（计数达 `SITE_MISSING_CONFIRM_THRESHOLD=2`，且两轮间隔 ≥ `SITE_MISSING_MIN_INTERVAL_HOURS=12` 小时）确认后才解除绑定并持久化，缩小迁移/重装中途不完整快照误清绑定的破坏半径；缺失计数存于证书 `metadata.site_missing_counts`，站点恢复/解绑后自动清零；`site_missing`/`site_removed` 均按 failure 上报（与部署回调 failure 语义一致），其余站点继续部署，解绑后不再重复失败
 - 常量：RENEW_DEFAULT_DAYS=14, MAX_ISSUE_RETRY_COUNT=10, MAX_DEPLOY_ATTEMPT_COUNT=10, SAFETY_MARGIN_HOURS=24, RENEW_SLEEP_MIN=5, RENEW_SLEEP_MAX=120, SPREAD_TOTAL_MAX=600（计数与状态常量集中在 `config`，`renew` 复用）
@@ -224,10 +227,9 @@ SetSSL 部署：写入前 pre-flight 校验既有配置（`check_web_config()`�
   通用 except，回调发不出、原因不落盘、计数停在 0 而永不触顶
 - 阻断类回调一律**变化触发**（reason 变化才发一次）：服务端 reminder 是电平驱动，一行即可让
   订单永久留在失败视图，逐日重发零信息增量却会淹没管理端列表且不被 PurgeCommand 清理
-- 部署结果三组落盘（`deploy_multi`）：`site_deploy_status` 无条件写；计数清零在「任一成功」
-  （与编排层 `counts_cleared=any` 镜像，不收紧到全成功——一个永久坏的站点会让整张证书十轮后
-  CAPPED，健康站点跟着停更）；`cert_expires_at`/`cert_serial`/`last_deploy_at` 仅全成功才写
-  （部分失败不前推 → 次日重试失败站点，而非等 76 天）
+- 部署结果三组落盘（`deploy_multi`）：`site_deploy_status` 无条件写；任一成功即接纳新证书和私钥，
+  清零证书级签发/部署状态并写 `cert_expires_at`/`cert_serial`/`last_deploy_at`。失败站点集合另行
+  持久化并使用最多 10 轮的独立重试，不把整张证书打进 CAPPED；订单级结果仍为 failure
 - 部分站点失败改判为失败：`_deploy_callback_decision` 本就报 failure，`_check_deploy_results`
   此前返回 True 造成本地与服务端双口径
 - 证书更替检测（`_track_cert_unchanged`）：仅编排层判定、两端 serial 非空才比、连续
@@ -312,8 +314,8 @@ SetSSL 部署：写入前 pre-flight 校验既有配置（`check_web_config()`�
 - 统计条含「已停更」计数；详情页「续签状态」行展示终态、签发/部署计数与环境阻断原因，终态时显示「恢复自动续签」按钮调用 `reset_issue_state`
 - 部署互斥：`deploy_cert`/`deploy_all` 与 cron 续签共用 `data/renew.lock`（实例内可重入，跨进程先重试 `LOCK_RETRIES` 次再放弃，提示语 `BUSY_MSG`）。前端「添加并部署」必须**串行**发起，并发会互相抢锁失败
 - 部分站点失败时 `deploy_cert`/`deploy_all` 返回 `status: False`，但站点状态已变化，前端一律刷新列表并清缓存（`need_key` 分支除外）
-- 添加证书后自动创建计划任务（如果尚未设置），失败不阻塞添加流程
-- 在线升级成功后由用户点击按钮刷新页面加载新版本，不自动重启面板；前端以 sessionStorage 记录目标版本，刷新后仅执行一次 `get_config` 健康/版本校验，失败或版本不符时提示用户重启宝塔面板，正常则静默清除标记，不轮询。`sslbt_main.py` 顶部热更新机制负责清除旧 `lib` 子模块缓存
+- active 证书验证私钥并部署成功、配置落盘后才创建计划任务（如果尚未设置）；创建失败不回滚已成功部署
+- 在线升级成功后由用户点击按钮刷新页面加载新版本，不自动重启面板；前端以 sessionStorage 记录目标版本，刷新后执行一次 `get_config` 健康/版本校验，新前端还会幂等调用 `refresh_cron` 并展示失败，失败或版本不符时提示用户重启宝塔面板，不轮询。首次升级可能仍运行缓存的旧前端，所以迁移正确性由新版后端 `get_config → ensure_healthy` 和旧任务下次执行时的同一自检共同保证，不能只靠前端收尾。`sslbt_main.py` 顶部热更新机制负责清除旧 `lib` 子模块缓存
 
 ## 命令
 

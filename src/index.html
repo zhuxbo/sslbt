@@ -473,7 +473,6 @@
         try { window.sessionStorage.removeItem(P._postUpdateKey); } catch (e) {}
       };
       var promptRestart = function () {
-        clearMarker();
         layer.alert('刷新后未能正常加载目标版本，请重启宝塔面板后重新打开插件。', {
           closeBtn: 2,
           title: '需要重启面板',
@@ -489,7 +488,34 @@
           promptRestart();
           return;
         }
-        clearMarker();
+        // 首次升级到薄 cron 入口时，发起升级的旧进程仍可能使用旧 lib.cron。
+        // 目标版本加载成功后再由新版入口幂等刷新，确保本次升级即可完成迁移。
+        P._call('refresh_cron', {}, function (cronResult) {
+          clearMarker();
+          if (!cronResult || !cronResult.status) {
+            layer.alert(
+              '插件已更新，但计划任务刷新失败：' +
+                P._e((cronResult && cronResult.msg) || '未知错误') +
+                '。请在设置页重新设置计划任务。',
+              {
+                closeBtn: 2,
+                title: '计划任务需要处理',
+                icon: 0,
+                offset: 'auto',
+                btn: ['我知道了']
+              }
+            );
+          }
+        }, function () {
+          clearMarker();
+          layer.alert('插件已更新，但无法检查计划任务。请在设置页重新设置计划任务。', {
+            closeBtn: 2,
+            title: '计划任务需要处理',
+            icon: 0,
+            offset: 'auto',
+            btn: ['我知道了']
+          });
+        });
       }, promptRestart);
     },
 
@@ -1631,11 +1657,16 @@
       }, function (r) {
         if (r.status) {
           P._rememberPostUpdate(P._ui.latest_version);
-          sp.innerHTML = '<span style="color:#67c23a">更新成功！</span>';
-          layer.alert('插件更新成功。刷新页面即可加载新版本；若刷新后仍有异常，请重启宝塔面板。', {
+          var cronFailed = r.data && r.data.cron_refresh && !r.data.cron_refresh.status;
+          sp.innerHTML = '<span style="color:' + (cronFailed ? '#e6a23c' : '#67c23a') + '">' +
+            P._e(r.msg || '更新成功！') + '</span>';
+          var updateMessage = cronFailed
+            ? P._e(r.msg) + '。刷新页面后将使用新版代码再次处理。'
+            : '插件更新成功。刷新页面即可加载新版本；若刷新后仍有异常，请重启宝塔面板。';
+          layer.alert(updateMessage, {
             closeBtn: 2,
-            title: '更新完成',
-            icon: 1,
+            title: cronFailed ? '更新完成，计划任务待刷新' : '更新完成',
+            icon: cronFailed ? 0 : 1,
             offset: 'auto',
             btn: ['刷新页面'],
             yes: function () { (window.top || window).location.reload(); }

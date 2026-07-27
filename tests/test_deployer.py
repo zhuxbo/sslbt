@@ -175,10 +175,12 @@ class TestDeployer:
         assert meta['issue_retry_count'] == 0
         assert meta['deploy_attempt_count'] == 0
 
-        # 组 3（全部成功）：部分失败时不前推到期时间，否则失败站点要等到新证书临期
-        # （90 天证书约 76 天）才会被再试一次，那之前它一直挂着旧证书
-        assert meta.get('cert_expires_at', '') == ''
-        assert meta.get('last_deploy_at', '') == ''
+        # 任一绑定成功即接纳证书，并用独立状态补部署剩余失败绑定。
+        assert meta['cert_expires_at'] == '2035-01-01T00:00:00Z'
+        assert meta['cert_serial'] == 'DEF456'
+        assert meta.get('last_deploy_at', '')
+        assert meta['failed_site_names'] == ['s2.a.com']
+        assert meta['failed_site_retry_count'] == 0
 
         # 组 1（无条件）：逐站点结果落盘，面板据此渲染而非用证书级 last_deploy_at
         statuses = meta['site_deploy_status']

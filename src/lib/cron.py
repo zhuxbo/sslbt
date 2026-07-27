@@ -3,6 +3,7 @@
 import os
 import sys
 import random
+import shlex
 import sqlite3
 import subprocess
 
@@ -10,6 +11,7 @@ CRON_NAME = 'SSL 证书自动续签'
 PLUGIN_DIR = '/www/server/panel/plugin/sslbt'
 PANEL_CLASS_DIR = '/www/server/panel/class'
 PANEL_PYTHON = '/www/server/panel/pyenv/bin/python3'
+CRON_RUNNER = PLUGIN_DIR + '/scripts/renew-cron.sh'
 
 # 宝塔计划任务数据库路径
 _CRON_DB_NEW = '/www/server/panel/data/db/crontab.db'
@@ -41,7 +43,7 @@ def _cron_db_path():
 
 
 def _find_cron_ids():
-    """通过脚本内容匹配插件路径，找到所有本插件的计划任务 ID"""
+    """通过任务名或脚本路径找到所有本插件的计划任务 ID。"""
     db_path = _cron_db_path()
     if not os.path.exists(db_path):
         return []
@@ -49,8 +51,8 @@ def _find_cron_ids():
         conn = sqlite3.connect(db_path)
         try:
             rows = conn.execute(
-                "SELECT id FROM crontab WHERE sBody LIKE ?",
-                ('%' + PLUGIN_DIR + '%',),
+                "SELECT id FROM crontab WHERE name = ? OR sBody LIKE ?",
+                (CRON_NAME, '%' + PLUGIN_DIR + '%'),
             ).fetchall()
             return [r[0] for r in rows]
         finally:
@@ -127,14 +129,126 @@ class CronManager:
             return {'status': False, 'message': '状态查询失败: %s' % cur['error']}
         if not cur.get('exists'):
             return self.setup()
-        return self._install(cur.get('hour'), cur.get('minute'))
+        return self._install(
+            cur.get('hour'),
+            cur.get('minute'),
+            paused=bool(cur.get('paused')),
+        )
 
-    def _install(self, run_hour, run_minute):
+    def ensure_healthy(self):
+        """检查并修正计划任务；健康时只读，发现偏差时才原子替换。
+
+        校验任务唯一性、名称、每天周期、执行时间、暂停状态和完整脚本正文。修复时
+        以 ID 最大的任务为时间与暂停态基准，先创建并确认新任务（包括暂停态），再
+        删除全部旧任务。任何查询、解释器验证或暂停确认失败都保持旧任务不动。
+        """
+        db_path = _cron_db_path()
+        if not os.path.exists(db_path):
+            result = dict(self.setup())
+            result['changed'] = bool(result.get('status'))
+            return result
+
+        try:
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    'SELECT id, name, status, type, where1, where_hour, where_minute, sBody'
+                    ' FROM crontab WHERE name = ? OR sBody LIKE ? ORDER BY id DESC',
+                    (CRON_NAME, '%' + PLUGIN_DIR + '%'),
+                ).fetchall()
+            finally:
+                conn.close()
+        except Exception as e:
+            return {'status': False, 'changed': False,
+                    'message': '状态查询失败: %s' % str(e)}
+
+        if not rows:
+            result = dict(self.setup())
+            result['changed'] = bool(result.get('status'))
+            return result
+
+        # 当前进程已经成功加载插件和宝塔运行时，健康路径可直接用其解释器做精确
+        # 比对，避免每次打开设置页/每天 cron 都额外拉起验证子进程。只有发现偏差
+        # 需要重建时，才调用 resolve_python() 做完整的独立进程自检。
+        current_python = (
+            sys.executable
+            if sys.executable and os.path.isfile(sys.executable)
+            else None
+        )
+        expected = self._build_script(current_python) if current_python else ''
+        reference = rows[0]
+        try:
+            hour = int(reference['where_hour'])
+            minute = int(reference['where_minute'])
+        except (TypeError, ValueError):
+            hour, minute = None, None
+        valid_time = (
+            hour is not None and minute is not None
+            and 0 <= hour <= 23 and 0 <= minute <= 59
+        )
+        healthy = (
+            len(rows) == 1
+            and reference['name'] == CRON_NAME
+            and reference['status'] in (0, 1)
+            and reference['type'] == 'day'
+            and (reference['where1'] or '') == ''
+            and valid_time
+            and (reference['sBody'] or '') == expected
+        )
+        if healthy:
+            return {'status': True, 'changed': False, 'message': '计划任务正常'}
+
+        py_bin = resolve_python()
+        if not py_bin:
+            return {
+                'status': False,
+                'changed': False,
+                'message': '未找到可加载宝塔运行时的 Python 解释器',
+            }
+        # 完整自检可能选出与当前解释器不同、但同样有效的面板解释器。重建统一使用
+        # 自检结果，不复用上方只服务于健康快路径的 expected。
+        result = dict(self._install(
+            hour if valid_time else None,
+            minute if valid_time else None,
+            paused=reference['status'] == 0,
+            python_bin=py_bin,
+        ))
+        result['changed'] = bool(result.get('status'))
+        return result
+
+    def refresh_if_legacy(self):
+        """仅当现有任务仍是旧完整正文时迁移为薄入口。
+
+        首次升级到薄入口版本时，执行升级的父进程和浏览器都可能仍运行旧代码。
+        旧前端刷新后至少会调用新版 get_config，因此由该入口做一次形态检测；已经
+        迁移的任务直接返回，避免每次读取配置都重建计划任务。
+        """
+        db_path = _cron_db_path()
+        if not os.path.exists(db_path):
+            return {'status': True, 'changed': False}
+        try:
+            conn = sqlite3.connect(db_path)
+            try:
+                rows = conn.execute(
+                    'SELECT sBody FROM crontab WHERE sBody LIKE ?',
+                    ('%' + PLUGIN_DIR + '%',),
+                ).fetchall()
+            finally:
+                conn.close()
+        except Exception as e:
+            return {'status': False, 'changed': False, 'message': str(e)}
+
+        if not rows or all(CRON_RUNNER in (row[0] or '') for row in rows):
+            return {'status': True, 'changed': False}
+        return self.ensure_healthy()
+
+    def _install(self, run_hour, run_minute, paused=False, python_bin=None):
         """注册计划任务：先建后删，绝不留下"旧的删了新的没建成"的空窗
 
         run_hour/run_minute 为 None 时回落随机值（历史条目缺字段的兜底）。
         """
-        py_bin = resolve_python()
+        py_bin = python_bin or resolve_python()
         if not py_bin:
             msg = ('未找到可加载宝塔运行时的 Python 解释器（已试 %s、%s）；'
                    '注册一个跑不通的任务比不注册更糟，已放弃'
@@ -194,6 +308,25 @@ class CronManager:
                 return {'status': False,
                         'message': '创建失败: AddCrontab 返回 %r 且任务未入库' % (result,)}
 
+            new_id = max(new_ids)
+            if paused:
+                try:
+                    pause_result = cron_obj.set_cron_status(_BtParams(id=new_id))
+                    if isinstance(pause_result, dict) and pause_result.get('status') is False:
+                        raise RuntimeError(str(pause_result.get('msg') or pause_result))
+                    if not self._task_has_status(new_id, 0):
+                        raise RuntimeError('数据库未确认暂停状态')
+                except Exception as e:
+                    # 不能把用户主动暂停的任务在“修复”后悄悄启用。
+                    try:
+                        cron_obj.DelCrontab(_BtParams(id=new_id))
+                    except Exception:
+                        pass
+                    msg = '无法保留暂停状态: %s' % str(e)
+                    if self._logger:
+                        self._logger.error("创建计划任务失败（旧任务保持不动）: %s", msg)
+                    return {'status': False, 'message': msg}
+
             # 新任务确认入库后才删旧的
             for cron_id in old_ids:
                 try:
@@ -211,6 +344,22 @@ class CronManager:
             if self._logger:
                 self._logger.error("创建计划任务失败: %s", str(e))
             return {'status': False, 'message': '创建失败: %s' % str(e)}
+
+    @staticmethod
+    def _task_has_status(cron_id, expected):
+        """从数据库确认状态，避免只相信不同宝塔版本的 API 返回形态。"""
+        try:
+            conn = sqlite3.connect(_cron_db_path())
+            try:
+                row = conn.execute(
+                    'SELECT status FROM crontab WHERE id = ?',
+                    (cron_id,),
+                ).fetchone()
+            finally:
+                conn.close()
+            return bool(row) and row[0] == expected
+        except Exception:
+            return False
 
     def remove(self):
         """移除所有同名计划任务"""
@@ -287,33 +436,13 @@ class CronManager:
                     pass
 
     def _build_script(self, python_bin):
-        """构建续签检查脚本
+        """构建只引用仓库入口的薄任务脚本
 
         python_bin 由 resolve_python() 选出并已通过 import public 自检，绝不会是系统
-        python3。脚本内仍保留存在性检查与 PATH 回退：面板 Python 升级/迁移后绝对路径
-        会失效（脚本只在 setup/refresh 时重建），此时回退虽多半也跑不通，但会被续签
-        引擎开头的 probe_panel_runtime 捕获为整轮中止并在面板告警，而不是静默不运行。
+        python3。入口脚本随插件包升级，任务数据库无需再复制完整执行逻辑；解释器路径
+        作为参数保留，路径失效时由入口脚本回退 PATH 中的 python3。
         """
-        log_file = '%s/logs/cron.log' % self._data_dir
-        return '''#!/bin/bash
-# cron.log 轮转：超过 1000 行保留最后 500 行
-LOG_FILE="%s"
-if [ -f "$LOG_FILE" ] && [ "$(wc -l < "$LOG_FILE")" -gt 1000 ]; then
-    tail -500 "$LOG_FILE" > "$LOG_FILE.tmp" && mv "$LOG_FILE.tmp" "$LOG_FILE"
-fi
-cd "%s"
-# 注册时的面板解释器；路径失效（面板 Python 升级/迁移）时回退 PATH 中的 python3
-PY_BIN="%s"
-[ -x "$PY_BIN" ] || PY_BIN="$(command -v python3)"
-"$PY_BIN" -c "
-import sys, time
-sys.path.insert(0, '/www/server/panel/class/')
-sys.path.insert(0, '%s')
-from sslbt_main import sslbt_main
-plugin = sslbt_main()
-r = plugin.run_renew_cron(None)
-# 打印结果：run_renew_cron 吞掉所有异常并返回 _err，返回值被丢弃时 cron.log 恒为空，
-# 宝塔计划任务日志也永远显示成功
-print('[%%s] %%s' %% (time.strftime('%%Y-%%m-%%d %%H:%%M:%%S'), (r or {}).get('msg', '无返回')))
-" >> "$LOG_FILE" 2>&1
-''' % (log_file, PLUGIN_DIR, python_bin, PLUGIN_DIR)
+        return '#!/bin/bash\n/bin/bash %s %s\n' % (
+            shlex.quote(CRON_RUNNER),
+            shlex.quote(python_bin),
+        )

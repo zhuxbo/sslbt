@@ -81,6 +81,53 @@ class TestGetConfig:
         assert 'schedule' in data
         assert data['upgrade_channel'] == 'main'
 
+    @patch('sslbt_main.CronManager')
+    def test_get_config_migrates_legacy_cron_for_cached_old_frontend(self, mock_cron_cls, plugin):
+        """旧前端升级后只会调用 get_config，新后端必须在该入口完成旧任务迁移。"""
+        mock_cron_cls.return_value.ensure_healthy.return_value = {
+            'status': True,
+            'changed': True,
+        }
+
+        result = plugin.get_config()
+
+        assert result['status'] is True
+        mock_cron_cls.assert_called_once_with(plugin._data_dir, plugin._logger)
+        mock_cron_cls.return_value.ensure_healthy.assert_called_once_with()
+
+
+class TestCronHealthCheck:
+    @patch('sslbt_main.CronManager')
+    def test_cron_run_repairs_task_before_renewing(self, mock_cron_cls, plugin):
+        """每次 cron 新进程先做幂等健康检查，再执行本轮续签。"""
+        mock_cron_cls.return_value.ensure_healthy.return_value = {
+            'status': True,
+            'changed': True,
+        }
+        plugin._run_renew = MagicMock(return_value={'status': True, 'msg': '完成'})
+
+        result = plugin.run_renew_cron()
+
+        assert result['status'] is True
+        mock_cron_cls.assert_called_once_with(plugin._data_dir, plugin._logger)
+        mock_cron_cls.return_value.ensure_healthy.assert_called_once_with()
+        plugin._run_renew.assert_called_once_with(spread=True)
+
+    @patch('sslbt_main.CronManager')
+    def test_cron_health_failure_does_not_skip_current_renewal(self, mock_cron_cls, plugin):
+        """正在执行的任务仍可续签；修复失败只告警，不能丢掉当天续签窗口。"""
+        mock_cron_cls.return_value.ensure_healthy.return_value = {
+            'status': False,
+            'message': '数据库锁定',
+        }
+        plugin._run_renew = MagicMock(return_value={'status': True, 'msg': '完成'})
+
+        result = plugin.run_renew_cron()
+
+        assert result['status'] is True
+        plugin._run_renew.assert_called_once_with(spread=True)
+        assert '计划任务健康检查失败' in plugin._logger.get_logs()
+
 
 class TestSaveConfig:
     def test_save_config_ignores_renew_days(self, plugin):
@@ -143,6 +190,25 @@ class TestAddCert:
         assert cert is not None
         assert cert['api']['url'] == 'https://api.example.com'
         assert cert['api']['token'] == TOKEN
+        assert cert['enabled'] is False
+        assert cert['metadata']['setup_pending'] is True
+
+    @patch('sslbt_main.APIClient')
+    def test_add_cert_rejects_non_active_without_writing_config(self, mock_api_cls, plugin):
+        mock_api_cls.return_value.query_order.return_value = {
+            'status': 'processing',
+            'domains': 'example.com',
+        }
+
+        result = plugin.add_cert({
+            'order_id': '101',
+            'api_url': 'https://api.example.com',
+            'api_token': TOKEN,
+            'site_names': 'example.com',
+        })
+
+        assert result['status'] is False
+        assert plugin._config.get_cert(101) is None
 
 
 class TestParseCertDomains:
@@ -185,8 +251,9 @@ class TestParseCertDomains:
 class TestAutoCreateCron:
     @patch('sslbt_main.CronManager')
     @patch('sslbt_main.APIClient')
-    def test_auto_create_cron_when_not_exists(self, mock_api_cls, mock_cron_cls, plugin):
-        """添加证书时自动创建计划任务"""
+    def test_add_does_not_create_cron_before_first_deploy(
+            self, mock_api_cls, mock_cron_cls, plugin):
+        """首次部署成功前不得创建自动续签任务。"""
         mock_api = MagicMock()
         mock_api.query_order.return_value = {'status': 'active', 'domains': 'a.com'}
         mock_api_cls.return_value = mock_api
@@ -200,7 +267,7 @@ class TestAutoCreateCron:
             'api_url': 'https://api.example.com',
             'api_token': TOKEN,
         })
-        mock_cron.setup.assert_called_once()
+        mock_cron.setup.assert_not_called()
 
     @patch('sslbt_main.CronManager')
     @patch('sslbt_main.APIClient')
@@ -1023,11 +1090,59 @@ class TestLogs:
         assert 'test message' in result['data']['content']
 
 
+class TestCronRefresh:
+    @patch('sslbt_main.CronManager')
+    def test_refresh_cron_preserves_existing_schedule(self, mock_cron_cls, plugin):
+        mock_cron_cls.return_value.refresh.return_value = {
+            'status': True,
+            'message': '计划任务已就绪（每天 14:30）',
+        }
+
+        result = plugin.refresh_cron()
+
+        assert result['status'] is True
+        mock_cron_cls.return_value.refresh.assert_called_once_with()
+
+    @patch('sslbt_main.CronManager')
+    def test_refresh_cron_reports_failure(self, mock_cron_cls, plugin):
+        mock_cron_cls.return_value.refresh.return_value = {
+            'status': False,
+            'message': '数据库锁定',
+        }
+
+        result = plugin.refresh_cron()
+
+        assert result['status'] is False
+        assert '数据库锁定' in result['msg']
+
+
+class TestPluginUpdateResult:
+    @patch('sslbt_main.Updater')
+    def test_do_update_surfaces_cron_refresh_warning(self, mock_updater_cls, plugin):
+        mock_updater_cls.return_value.do_update.return_value = {
+            'cron_refresh': {'status': False, 'message': '数据库锁定'},
+        }
+
+        result = plugin.do_update({'version': '1.2.3', 'checksum': 'sha256:test'})
+
+        assert result['status'] is True
+        assert result['data']['cron_refresh']['status'] is False
+        assert '计划任务刷新失败' in result['msg']
+
+    def test_post_update_page_retries_refresh_with_new_module(self):
+        content = (
+            Path(__file__).resolve().parents[1] / 'src' / 'index.html'
+        ).read_text(encoding='utf-8')
+
+        assert "P._call('refresh_cron'" in content
+
+
 class TestToggleAutoReissue:
     @patch('sslbt_main.CronManager')
     @patch('sslbt_main.APIClient')
-    def test_add_cert_calls_toggle_pull_mode(self, mock_api_cls, mock_cron_cls, plugin):
-        """pull 模式添加证书时调用 toggle_auto_reissue(True)"""
+    def test_add_cert_defers_toggle_pull_until_deployed(
+            self, mock_api_cls, mock_cron_cls, plugin):
+        """pull 模式在首次部署成功前不修改服务端开关。"""
         mock_api = MagicMock()
         mock_api.query_order.return_value = {'status': 'active', 'domains': 'a.com'}
         mock_api_cls.return_value = mock_api
@@ -1041,12 +1156,13 @@ class TestToggleAutoReissue:
             'api_token': TOKEN,
             'renew_mode': 'pull',
         })
-        mock_api.toggle_auto_reissue.assert_called_once_with(900, True)
+        mock_api.toggle_auto_reissue.assert_not_called()
 
     @patch('sslbt_main.CronManager')
     @patch('sslbt_main.APIClient')
-    def test_add_cert_calls_toggle_local_mode(self, mock_api_cls, mock_cron_cls, plugin):
-        """local 模式添加证书时调用 toggle_auto_reissue(False)"""
+    def test_add_cert_defers_toggle_local_until_deployed(
+            self, mock_api_cls, mock_cron_cls, plugin):
+        """local 模式在首次部署成功前不修改服务端开关。"""
         mock_api = MagicMock()
         mock_api.query_order.return_value = {'status': 'active', 'domains': 'a.com'}
         mock_api_cls.return_value = mock_api
@@ -1060,12 +1176,12 @@ class TestToggleAutoReissue:
             'api_token': TOKEN,
             'renew_mode': 'local',
         })
-        mock_api.toggle_auto_reissue.assert_called_once_with(901, False)
+        mock_api.toggle_auto_reissue.assert_not_called()
 
     @patch('sslbt_main.CronManager')
     @patch('sslbt_main.APIClient')
-    def test_add_cert_toggle_failure_does_not_block(self, mock_api_cls, mock_cron_cls, plugin):
-        """toggle_auto_reissue 抛异常时添加证书仍然成功"""
+    def test_add_cert_does_not_call_toggle(self, mock_api_cls, mock_cron_cls, plugin):
+        """暂存证书不调用 toggle_auto_reissue。"""
         mock_api = MagicMock()
         mock_api.query_order.return_value = {'status': 'active', 'domains': 'a.com'}
         mock_api.toggle_auto_reissue.side_effect = Exception('network error')
@@ -1080,6 +1196,7 @@ class TestToggleAutoReissue:
             'api_token': TOKEN,
         })
         assert result['status'] is True
+        mock_api.toggle_auto_reissue.assert_not_called()
 
     @patch('sslbt_main.APIClient')
     def test_deploy_cert_calls_toggle_on_success(self, mock_api_cls, plugin):
@@ -1105,6 +1222,8 @@ class TestToggleAutoReissue:
             plugin.deploy_cert({'order_id': '910'})
 
         mock_api.toggle_auto_reissue.assert_called_once_with(910, True)
+        assert plugin._config.get_cert(910)['enabled'] is True
+        assert plugin._config.get_cert(910)['metadata']['setup_pending'] is False
 
 
 class TestResolvePrivateKey:
@@ -1362,12 +1481,13 @@ class TestBatchSetValidationMethod:
 
 
 class TestAddCertPolicyDerive:
-    """add_cert 策略派生（SAN 含 IP 强制 local/file）与 auto_reissue（local 关/pull 开）"""
+    """add_cert 策略派生；auto_reissue 延迟到首次部署成功后设置。"""
 
     @patch('sslbt_main.CronManager')
     @patch('sslbt_main.APIClient')
-    def test_ip_cert_derives_local_file_auto_reissue_off(self, mock_api_cls, mock_cron_cls, plugin):
-        """SAN 含 IP：即使请求 pull 也派生为 local/file，auto_reissue 关闭"""
+    def test_ip_cert_derives_local_file_before_toggle(
+            self, mock_api_cls, mock_cron_cls, plugin):
+        """SAN 含 IP：即使请求 pull 也派生为 local/file，暂不切换开关。"""
         mock_api = MagicMock()
         mock_api.query_order.return_value = {'status': 'active', 'domains': '1.2.3.4'}
         mock_api_cls.return_value = mock_api
@@ -1382,12 +1502,12 @@ class TestAddCertPolicyDerive:
         cert = plugin._config.get_cert(1000)
         assert cert['renew_mode'] == 'local'
         assert cert['validation_method'] == 'file'
-        mock_api.toggle_auto_reissue.assert_called_once_with(1000, False)
+        mock_api.toggle_auto_reissue.assert_not_called()
 
     @patch('sslbt_main.CronManager')
     @patch('sslbt_main.APIClient')
-    def test_dns_pull_auto_reissue_on(self, mock_api_cls, mock_cron_cls, plugin):
-        """DNS + pull：保持 pull，auto_reissue 开启"""
+    def test_dns_pull_is_staged_before_toggle(self, mock_api_cls, mock_cron_cls, plugin):
+        """DNS + pull：保持 pull，首次部署前暂不切换开关。"""
         mock_api = MagicMock()
         mock_api.query_order.return_value = {'status': 'active', 'domains': 'a.example.com'}
         mock_api_cls.return_value = mock_api
@@ -1400,7 +1520,7 @@ class TestAddCertPolicyDerive:
         })
         assert result['status'] is True
         assert plugin._config.get_cert(1001)['renew_mode'] == 'pull'
-        mock_api.toggle_auto_reissue.assert_called_once_with(1001, True)
+        mock_api.toggle_auto_reissue.assert_not_called()
 
 
 class TestBatchSetRenewPolicy:

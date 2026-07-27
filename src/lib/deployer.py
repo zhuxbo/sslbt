@@ -14,7 +14,7 @@ _BT_CERT_DIRS = (
     '/www/server/panel/vhost/ssl/%s',
 )
 
-# 宝塔面板自带解释器；cron 脚本注册时会把它烧进脚本，回退系统 python3 时续签会整体失效
+# 宝塔面板自带解释器；cron 注册时会把它作为入口脚本参数写入任务，回退系统 python3 时续签会整体失效
 PANEL_PYTHON = '/www/server/panel/pyenv/bin/python3'
 
 # 部署链路必需的宝塔运行时模块
@@ -82,7 +82,7 @@ def _runtime_hint():
 def probe_panel_runtime():
     """探测宝塔运行时模块能否导入，返回错误信息字符串或 None（可用）
 
-    cron 脚本在注册时的面板解释器失效时会回退 PATH 中的 python3（cron.py 的 PY_BIN）。
+    cron 入口在注册时的面板解释器失效时会回退 PATH 中的 python3（renew-cron.sh 的 PY_BIN）。
     lib/ 全是标准库，插件因此能照常启动、API 能照常查询，直到需要 public/panelSite 才失败——
     而那时异常发生在部署闸门内部，failure 回调发不出去、部署计数不递增，服务端与面板两侧
     都看不见。故整轮开始前一次性探测：不可用即整轮中止，且不产生任何 per-order 回调
@@ -223,16 +223,10 @@ class Deployer:
                 for r in results
             }
 
-            # 组 2（任一成功）：计数清零。与编排层 counts_cleared=any(...) 镜像。
-            # 不收紧到「全部成功」——一张证书绑 3 个站点、其中 1 个永久坏时，
-            # 计数只增不减会在 10 轮后把整张证书推入 CAPPED，两个健康站点跟着一起停更
+            # 组 2（任一成功）：证书已经被至少一个真实绑定接纳，立即前推证书级
+            # metadata、清零证书级计数，并单独保存仍需补部署的绑定。
             if success_count > 0:
                 meta.update(DEPLOY_SUCCESS_RESET_KEYS)
-
-            # 组 3（全部成功）：到期时间与序列号。部分失败时保留旧值，
-            # needs_renewal 因此继续为 True，明天重试失败的站点；
-            # 此前无条件前推会让失败站点等到新证书临期（90 天证书约 76 天）才再试一次
-            if all_success:
                 cert_info = cert_utils.parse_cert_info(fullchain_pem, logger=self._logger)
                 if not cert_info or not cert_info.get('not_after'):
                     meta_error = '证书解析失败，无法记录到期时间'
@@ -240,6 +234,12 @@ class Deployer:
                     meta['last_deploy_at'] = now
                     meta['cert_expires_at'] = cert_info['not_after'].strftime('%Y-%m-%dT%H:%M:%SZ')
                     meta['cert_serial'] = cert_info.get('serial', '')
+                    meta['failed_site_names'] = [
+                        r['site_name'] for r in results
+                        if not r.get('status') and not r.get('site_removed')
+                    ]
+                    if not meta['failed_site_names']:
+                        meta['failed_site_retry_count'] = 0
 
             if not meta_error:
                 try:

@@ -91,6 +91,8 @@ class TestRenewEngine:
     def engine(self, tmp_data_dir):
         config = ConfigManager(tmp_data_dir)
         mock_api = MagicMock()
+        # local CSR 提交按规范先查询并且仅 active 可继续；各测试可覆盖此默认值。
+        mock_api.query_order.return_value = {'status': 'active'}
         api_factory = MagicMock(return_value=mock_api)
         deployer = MagicMock()
         deployer.deploy_multi.return_value = [{'site_name': 'example.com', 'status': True, 'message': '部署成功'}]
@@ -409,9 +411,11 @@ class TestRenewEngine:
 
         engine._mock_api.query_order.return_value = {
             'status': 'active',
+            'csr': '---CSR---',
             'certificate': '---CERT---',
             'ca_certificate': '---CA---',
         }
+        engine._server_csr_ownership = MagicMock(return_value=True)
         result = engine._handle_processing(cert, engine._mock_api)
         assert result is True
         engine._deployer.deploy_multi.assert_called_once()
@@ -454,6 +458,7 @@ class TestRenewEngine:
         """前置过滤：local 签发计数 >= 10 → 进入 CAPPED(issue) 静默跳过，不建 API、不发回调（spec §3.2）"""
         config = ConfigManager(tmp_data_dir)
         mock_api = MagicMock()
+        mock_api.query_order.return_value = {'status': 'active'}
         api_factory = MagicMock(return_value=mock_api)
         deployer = MagicMock()
         logger = MagicMock()
@@ -731,6 +736,7 @@ class TestOrderUpdate:
     def engine(self, tmp_data_dir):
         config = ConfigManager(tmp_data_dir)
         mock_api = MagicMock()
+        mock_api.query_order.return_value = {'status': 'active'}
         api_factory = MagicMock(return_value=mock_api)
         deployer = MagicMock()
         deployer.deploy_multi.return_value = [{'site_name': 'example.com', 'status': True, 'message': '部署成功'}]
@@ -797,9 +803,11 @@ class TestOrderUpdate:
         engine._mock_api.query_order.return_value = {
             'order_id': 99999,
             'status': 'active',
+            'csr': '---CSR---',
             'certificate': '---CERT---',
             'ca_certificate': '---CA---',
         }
+        engine._server_csr_ownership = MagicMock(return_value=True)
         result = engine._handle_processing(cert, engine._mock_api)
         assert result is True
         assert engine._config.get_cert(12345) is None
@@ -894,6 +902,7 @@ class TestFileVerifyIntegration:
     def engine_with_verifier(self, tmp_data_dir):
         config = ConfigManager(tmp_data_dir)
         mock_api = MagicMock()
+        mock_api.query_order.return_value = {'status': 'active'}
         api_factory = MagicMock(return_value=mock_api)
         deployer = MagicMock()
         deployer.deploy_multi.return_value = [{'site_name': 'example.com', 'status': True, 'message': '部署成功'}]
@@ -961,9 +970,11 @@ class TestFileVerifyIntegration:
 
         engine._mock_api.query_order.return_value = {
             'status': 'active',
+            'csr': '---CSR---',
             'certificate': '---CERT---',
             'ca_certificate': '---CA---',
         }
+        engine._server_csr_ownership = MagicMock(return_value=True)
         result = engine._handle_processing(cert, engine._mock_api)
         assert result is True
         engine._file_verifier.cleanup_files.assert_called_once()
@@ -1042,6 +1053,7 @@ class TestLocalUnknownExpiryRefill:
     def engine(self, tmp_data_dir):
         config = ConfigManager(tmp_data_dir)
         mock_api = MagicMock()
+        mock_api.query_order.return_value = {'status': 'active'}
         # 与真实 APIClient 一致：未返回新阈值时为 0（避免 MagicMock.__int__ 默认返回 1
         # 污染全局 renew_before_days）
         mock_api.last_renew_before_days = 0
@@ -1138,8 +1150,8 @@ class TestLocalUnknownExpiryRefill:
         engine._mock_api.submit_csr.assert_not_called()
 
     @patch('lib.renew.cert_utils.generate_csr')
-    def test_known_near_expiry_skips_refill_query(self, mock_csr, engine):
-        """到期时间已知且临期 → 直接提交，不做回填查询"""
+    def test_known_near_expiry_queries_active_before_submit(self, mock_csr, engine):
+        """到期时间已知且临期 → 提交前仍须预查询 active。"""
         mock_csr.return_value = ('CSR-PEM', 'KEY-PEM', 'hash123')
         engine._mock_api.submit_csr.return_value = {'status': 'processing'}
         engine._config.add_cert(
@@ -1149,7 +1161,7 @@ class TestLocalUnknownExpiryRefill:
         cert['cert_name'] = 'order-7007'
         engine._config.update_metadata(7007, cert['metadata'])
         engine._renew_local(engine._config.get_cert(7007), engine._mock_api)
-        engine._mock_api.query_order.assert_not_called()
+        engine._mock_api.query_order.assert_called_once_with(7007)
         engine._mock_api.submit_csr.assert_called_once()
 
 
@@ -1165,6 +1177,7 @@ class TestDeployFailureRetainsPendingKey:
         logger = MagicMock()
         eng = RenewEngine(config, MagicMock(return_value=mock_api), deployer, logger)
         eng._mock_api = mock_api
+        eng._server_csr_ownership = MagicMock(return_value=True)
         return eng
 
     def _setup_processing_cert(self, engine, order_id=8101, site_names=None):
@@ -1204,11 +1217,7 @@ class TestDeployFailureRetainsPendingKey:
         assert not os.path.exists(key_path)  # 成功后清理
 
     def test_handle_processing_partial_success_cleans_pending_key(self, engine):
-        """部分成功：本轮按失败上报（与回调口径一致），但私钥已被消费必须清理
-
-        清理判据是「私钥是否已写入站点」，与 _check_deploy_results 是否抛错解耦——
-        任一站点成功即已消费，不清理就是泄漏。
-        """
+        """部分成功后由正式站点保管私钥，清理 pending 副本。"""
         cert, key_path = self._setup_processing_cert(
             engine, 8103, site_names=['example.com', 's2.example.com'])
         engine._mock_api.query_order.return_value = {
@@ -1221,7 +1230,7 @@ class TestDeployFailureRetainsPendingKey:
         assert not os.path.exists(key_path)
 
     def test_handle_processing_partial_success_with_missing_cleans_pending_key(self, engine):
-        """部分成功+另一站点疑似缺失：仍抛错上报，但私钥已被消费必须清理（不泄漏）"""
+        """部分成功+疑似缺失：仍抛错上报，并清理已转正的 pending 副本。"""
         cert, key_path = self._setup_processing_cert(
             engine, 8106, site_names=['example.com', 'gone.example.com'])
         engine._mock_api.query_order.return_value = {
@@ -1232,7 +1241,7 @@ class TestDeployFailureRetainsPendingKey:
              'message': '站点疑似已删除，待下一轮确认（本轮暂不解绑）', 'site_missing': True}]
         with pytest.raises(RuntimeError, match='疑似'):
             engine._handle_processing(cert, engine._mock_api)
-        assert not os.path.exists(key_path)  # 私钥已写入成功站点：抛错上报不影响清理
+        assert not os.path.exists(key_path)
 
 
 def _backdate_site_missing(config, order_id, hours=13):
@@ -1259,7 +1268,8 @@ class TestProcessingOrphanConvergence:
         api.last_renew_before_days = 0
         api.callback.return_value = {'code': 1}
         api.query_order.return_value = {
-            'status': 'active', 'certificate': '---CERT---', 'ca_certificate': '---CA---'}
+            'status': 'active', 'csr': '---CSR---',
+            'certificate': '---CERT---', 'ca_certificate': '---CA---'}
         site_mgr = MagicMock()
         site_mgr.get_sites.return_value = [{'name': 'other.com', 'path': '/w'}]
         mock_cert_utils.validate_cert_pem.return_value = (True, '')
@@ -1268,6 +1278,7 @@ class TestProcessingOrphanConvergence:
         mock_set_ssl.return_value = {'status': True}
         deployer = Deployer(config, api, MagicMock(), site_mgr)
         engine = RenewEngine(config, MagicMock(return_value=api), deployer, MagicMock())
+        engine._server_csr_ownership = MagicMock(return_value=True)
 
         config.add_cert(order_id=9301, cert_name='order-9301', domains=['example.com'],
                         site_names=['gone.com'], renew_mode='local')
@@ -1557,6 +1568,7 @@ class TestIssueDeployCountSeparation:
     def engine(self, tmp_data_dir):
         config = ConfigManager(tmp_data_dir)
         mock_api = MagicMock()
+        mock_api.query_order.return_value = {'status': 'active'}
         mock_api.last_renew_before_days = 0
         deployer = MagicMock()
         eng = RenewEngine(config, MagicMock(return_value=mock_api), deployer, MagicMock())
@@ -1583,6 +1595,7 @@ class TestResponseLossRecovery:
     def engine(self, tmp_data_dir):
         config = ConfigManager(tmp_data_dir)
         mock_api = MagicMock()
+        mock_api.query_order.return_value = {'status': 'active'}
         mock_api.last_renew_before_days = 0
         deployer = MagicMock()
         deployer.deploy_multi.return_value = [
@@ -1704,7 +1717,9 @@ class TestResponseLossRecovery:
             'last_issue_state': 'processing',
             'pending_verify_paths': ['/tmp/v.txt'],
         })
-        engine._mock_api.query_order.return_value = {'status': 'approving'}
+        engine._mock_api.query_order.return_value = {
+            'status': 'approving', 'csr': 'CSR'}
+        engine._server_csr_ownership = MagicMock(return_value=True)
 
         result = engine._renew_local(engine._config.get_cert(7107), engine._mock_api)
 
@@ -1827,6 +1842,7 @@ class TestDeployEnvironmentGate:
             {'site_name': 'example.com', 'status': True, 'message': '部署成功'}]
         eng = RenewEngine(config, api_factory, deployer, MagicMock())
         eng._mock_api = mock_api
+        eng._server_csr_ownership = MagicMock(return_value=True)
         return eng
 
     def _seed(self, engine, order_id=7100):
@@ -1998,6 +2014,7 @@ class TestPanelRuntimeGate:
         deployer = MagicMock()
         eng = RenewEngine(config, MagicMock(return_value=mock_api), deployer, MagicMock())
         eng._mock_api = mock_api
+        eng._server_csr_ownership = MagicMock(return_value=True)
         return eng
 
     @staticmethod
@@ -2847,6 +2864,7 @@ class TestErrorCodeClassification:
         """对照组：服务端确实处理并拒绝了这次提交，计数必须保留"""
         api = MagicMock()
         api.last_renew_before_days = 0
+        api.query_order.return_value = {'order_id': 9622, 'status': 'active'}
         api.submit_csr.side_effect = APIError('该产品不支持文件验证', code=0)
         engine = self._engine(tmp_data_dir, api)
         self._add(engine, 9622, renew_mode='local', validation_method='file')
@@ -3213,7 +3231,7 @@ class TestPostErrorCodePolicy:
     恢复：用户充值/开开关后还得回面板点「恢复自动续签」）。
     """
 
-    def _engine(self, tmp_data_dir, submit_error, order_status='processing'):
+    def _engine(self, tmp_data_dir, submit_error, order_status='active'):
         cfg = ConfigManager(tmp_data_dir)
         cfg.add_cert(order_id=1, cert_name='o1', domains=['a.com'], site_names=['s1'],
                      renew_mode='local', validation_method='file',
@@ -3222,8 +3240,11 @@ class TestPostErrorCodePolicy:
         cfg.update_metadata(1, {'cert_expires_at': soon})   # 临期 + 到期时间已知 → 走提交路径
         api = MagicMock()
         api.last_renew_before_days = 0
-        api.query_order.return_value = {'order_id': 1, 'status': order_status}
         api.submit_csr.side_effect = submit_error
+        api.query_order.side_effect = lambda _order_id: {
+            'order_id': 1,
+            'status': order_status if api.submit_csr.called else 'active',
+        }
         engine = RenewEngine(cfg, MagicMock(return_value=api), MagicMock(), MagicMock())
         return engine, cfg, api
 
@@ -3239,7 +3260,7 @@ class TestPostErrorCodePolicy:
         """过渡态：归一 processing，只提交一次，之后零 POST、计数不再增长"""
         err = APIError('订单处于 pending 状态 [order_in_progress]', code=0,
                        error_code='order_in_progress')
-        engine, cfg, api = self._engine(tmp_data_dir, err)
+        engine, cfg, api = self._engine(tmp_data_dir, err, order_status='processing')
 
         self._rounds(engine, 5)
 
@@ -3257,7 +3278,7 @@ class TestPostErrorCodePolicy:
         """
         err = APIError('order in progress [order_in_progress]', code=0,
                        error_code='order_in_progress')
-        engine, cfg, api = self._engine(tmp_data_dir, err)
+        engine, cfg, api = self._engine(tmp_data_dir, err, order_status='processing')
 
         self._rounds(engine, 1)
 
@@ -3305,6 +3326,81 @@ class TestPostErrorCodePolicy:
         meta = cfg.get_cert(1)['metadata']
         assert meta['last_issue_state'] == 'processing', '修好后应自动继续，无需人工解除'
         assert meta['last_issue_state'] != ISSUE_STATE_CAPPED
+
+
+class TestSpecQueryFirstAndOwnership:
+    @staticmethod
+    def _engine(tmp_data_dir, order_id=9801):
+        config = ConfigManager(tmp_data_dir)
+        config.add_cert(
+            order_id=order_id, cert_name='order-%d' % order_id,
+            domains=['a.com'], site_names=['s1', 's2'], renew_mode='local')
+        api = MagicMock()
+        api.last_renew_before_days = 0
+        deployer = MagicMock()
+        deployer.deploy_multi.return_value = [
+            {'site_name': 's1', 'status': True, 'message': 'ok'}]
+        engine = RenewEngine(config, MagicMock(return_value=api), deployer, MagicMock())
+        return engine, config, api
+
+    def test_non_active_prequery_stops_before_key_generation(self, tmp_data_dir):
+        engine, config, api = self._engine(tmp_data_dir)
+        api.query_order.return_value = {'order_id': 9801, 'status': 'processing'}
+
+        with patch('lib.renew.cert_utils.generate_csr') as generate:
+            assert engine._submit_new_csr(config.get_cert(9801), api) is False
+
+        generate.assert_not_called()
+        api.submit_csr.assert_not_called()
+        assert config.get_cert(9801)['metadata']['issue_retry_count'] == 0
+
+    def test_active_foreign_csr_uses_existing_key_before_new_submit(self, tmp_data_dir):
+        engine, config, api = self._engine(tmp_data_dir, order_id=9802)
+        cert = config.get_cert(9802)
+        engine._save_pending_key(cert, 'PENDING')
+        engine._save_pending_csr(cert, 'LOCAL-CSR')
+        config.update_metadata(9802, {
+            'last_issue_state': 'processing',
+            'last_csr_hash': 'local-hash',
+        })
+        api.query_order.return_value = {
+            'order_id': 9802,
+            'status': 'active',
+            'csr': 'FOREIGN-CSR',
+            'certificate': 'CERT',
+            'ca_certificate': 'CA',
+        }
+        engine._server_csr_ownership = MagicMock(return_value=False)
+        engine._find_active_private_key = MagicMock(return_value='EXISTING-KEY')
+        engine._deploy_and_report = MagicMock(return_value=[
+            {'site_name': 's1', 'status': True, 'message': 'ok'},
+            {'site_name': 's2', 'status': True, 'message': 'ok'},
+        ])
+
+        assert engine._handle_processing(config.get_cert(9802), api) is True
+
+        api.submit_csr.assert_not_called()
+        engine._deploy_and_report.assert_called_once()
+
+    def test_failed_binding_retry_targets_only_failed_sites(self, tmp_data_dir):
+        engine, config, api = self._engine(tmp_data_dir, order_id=9803)
+        config.update_metadata(9803, {
+            'failed_site_names': ['s2'],
+            'cert_expires_at': '2035-01-01T00:00:00Z',
+        })
+        api.query_order.return_value = {
+            'order_id': 9803,
+            'status': 'active',
+            'certificate': 'CERT',
+            'ca_certificate': 'CA',
+            'private_key': 'KEY',
+        }
+        engine._deploy_and_report = MagicMock(return_value=[
+            {'site_name': 's2', 'status': True, 'message': 'ok'}])
+
+        assert engine._renew_pull(config.get_cert(9803), api) is True
+
+        assert engine._deploy_and_report.call_args.args[4] == ['s2']
 
 
 class TestAuthBlockRoundSummary:

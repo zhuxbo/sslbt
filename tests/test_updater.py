@@ -363,3 +363,39 @@ class TestSafeExtractSecurity:
         dpath = os.path.join(updater_env['plugin_dir'], 'subdir')
         mode = stat.S_IMODE(os.stat(dpath).st_mode)
         assert mode == 0o700
+
+
+class TestPostUpdateCronRefresh:
+    def _write_fresh_cron_module(self, plugin_dir, result):
+        lib_dir = os.path.join(plugin_dir, 'lib')
+        os.makedirs(lib_dir, exist_ok=True)
+        with open(os.path.join(lib_dir, '__init__.py'), 'w') as f:
+            f.write('')
+        with open(os.path.join(lib_dir, 'cron.py'), 'w') as f:
+            f.write(
+                'class CronManager:\n'
+                '    def __init__(self, data_dir):\n'
+                '        self.data_dir = data_dir\n'
+                '    def refresh(self):\n'
+                '        return %r\n' % result
+            )
+
+    def test_refresh_cron_loads_extracted_code_in_fresh_process(self, updater_env):
+        """升级收尾必须读取磁盘上的新版 lib.cron，不得复用父进程旧缓存。"""
+        from lib.updater import Updater
+
+        expected = {'status': True, 'message': 'fresh-module'}
+        self._write_fresh_cron_module(updater_env['plugin_dir'], expected)
+        updater = Updater(updater_env['plugin_dir'], updater_env['config'], updater_env['logger'])
+
+        assert updater._refresh_cron() == expected
+
+    def test_refresh_cron_returns_failure_without_hiding_update_result(self, updater_env):
+        from lib.updater import Updater
+
+        expected = {'status': False, 'message': 'crontab db locked'}
+        self._write_fresh_cron_module(updater_env['plugin_dir'], expected)
+        updater = Updater(updater_env['plugin_dir'], updater_env['config'], updater_env['logger'])
+
+        assert updater._refresh_cron() == expected
+        assert '刷新计划任务失败' in updater_env['logger'].get_logs()

@@ -4,6 +4,8 @@ import os
 import json
 import hashlib
 import shutil
+import subprocess
+import sys
 import tempfile
 import zipfile
 from urllib.parse import urlparse
@@ -15,6 +17,7 @@ from .net_guard import check_ssrf
 MAX_RELEASES_SIZE = 256 * 1024
 MAX_ZIP_SIZE = 10 * 1024 * 1024
 CONNECT_TIMEOUT = 15
+POST_UPDATE_TIMEOUT = 30
 
 _ALLOWED_CHANNELS = ('main', 'dev')
 _ALLOWED_HTTP_HOSTS = ('localhost', '127.0.0.1', '::1')
@@ -263,25 +266,52 @@ class Updater:
 
             self._safe_extract(tmp_path, self._plugin_dir)
             self._logger.info("更新完成: %s", version)
-            self._refresh_cron()
+            cron_refresh = self._refresh_cron()
+            return {'cron_refresh': cron_refresh}
         finally:
             if os.path.exists(tmp_path):
                 os.unlink(tmp_path)
 
     def _refresh_cron(self):
-        """升级后刷新计划任务脚本正文（deploy-spec §7.3 步骤 8）
+        """在新进程中用刚解压的代码刷新计划任务（deploy-spec §7.3 步骤 8）
 
-        cron 脚本正文存在宝塔 crontab 库里、不在 PLUGIN_DIR 内，升级解压碰不到它——
-        不在这里刷新，_build_script 的任何修正都永远到不了存量安装。保留现有执行时间，
-        失败仅记日志：升级本身已经成功，不该因刷新失败而回滚。
+        当前升级请求已经导入旧版 lib.cron；在父进程中再次 import 只会命中
+        sys.modules 缓存。子进程从插件目录加载新版模块，才能在本次升级完成迁移。
+        失败仅记日志并返回状态：插件文件已经升级成功，不应因此回滚。
         """
+        code = '''
+import json
+import sys
+sys.path.insert(0, '/www/server/panel/class/')
+sys.path.insert(0, %r)
+from lib.cron import CronManager
+result = CronManager(%r).refresh()
+print(json.dumps(result, ensure_ascii=False))
+sys.exit(0 if result.get('status') else 1)
+''' % (self._plugin_dir, os.path.join(self._plugin_dir, 'data'))
         try:
-            from .cron import CronManager
-            data_dir = os.path.join(self._plugin_dir, 'data')
-            res = CronManager(data_dir, self._logger).refresh()
+            proc = subprocess.run(
+                [sys.executable, '-c', code],
+                cwd=self._plugin_dir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=POST_UPDATE_TIMEOUT,
+            )
+            output = [line for line in proc.stdout.splitlines() if line.strip()]
+            if not output:
+                detail = proc.stderr.strip() or '子进程无返回'
+                res = {'status': False, 'message': detail}
+            else:
+                try:
+                    res = json.loads(output[-1])
+                except (TypeError, ValueError):
+                    res = {'status': False, 'message': '无法解析子进程返回: %s' % output[-1]}
             if res.get('status'):
                 self._logger.info("计划任务已随升级刷新: %s", res.get('message', ''))
             else:
                 self._logger.warning("升级后刷新计划任务失败: %s", res.get('message', ''))
+            return res
         except Exception as e:
             self._logger.warning("升级后刷新计划任务异常: %s", str(e))
+            return {'status': False, 'message': str(e)}

@@ -323,7 +323,8 @@ def test_built_plugin_reports_injected_version(tmp_path):
     plugin = tmp_path / 'plugin'
     with zipfile.ZipFile(archive) as package:
         names = set(package.namelist())
-        assert {'sslbt_main.py', 'index.html', 'info.json', 'install.sh'} <= names
+        assert {'sslbt_main.py', 'index.html', 'info.json', 'install.sh',
+                'scripts/renew-cron.sh'} <= names
         assert any(name.startswith('lib/') for name in names)
         package.extractall(plugin)
     assert json.loads((plugin / 'info.json').read_text())['versions'] == '3.2.1-rc.4'

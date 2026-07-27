@@ -3,7 +3,7 @@
 import json
 import pytest
 from unittest.mock import MagicMock, patch
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from io import BytesIO
 
 from lib.api_client import APIClient, APIError, validate_token, _build_api_url
@@ -330,6 +330,16 @@ class TestAPIClient:
         call_args = client._opener.open.call_args
         body = json.loads(call_args[0][0].data.decode('utf-8'))
         assert body['validation_method'] == 'file'
+
+    def test_submit_csr_transport_failure_is_not_retried(self, client):
+        """携带 CSR 的 POST 可能已送达，传输失败只能交给 query-only 恢复。"""
+        client._opener.open.side_effect = URLError('connection reset')
+
+        with pytest.raises(APIError) as exc:
+            client.submit_csr(123, 'csr-pem', ['a.com'])
+
+        assert exc.value.transport is True
+        assert client._opener.open.call_count == 1
 
     def test_query_order_caches_renew_before_days(self, client):
         """query_order 响应中 renew_before_days 被缓存到 last_renew_before_days"""

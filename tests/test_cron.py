@@ -3,11 +3,13 @@
 import sys
 import builtins
 import sqlite3
+import subprocess
 import types
 import pytest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from lib.cron import CronManager, CRON_NAME, PLUGIN_DIR
+from lib.cron import CronManager, CRON_NAME, CRON_RUNNER, PLUGIN_DIR
 
 
 class TestCronManager:
@@ -16,11 +18,12 @@ class TestCronManager:
         return CronManager(tmp_data_dir)
 
     def test_build_script(self, cron_mgr):
-        """生成的脚本包含正确路径"""
+        """任务正文只引用仓库内的稳定入口脚本"""
         script = cron_mgr._build_script(sys.executable)
-        assert PLUGIN_DIR in script
-        assert 'sslbt_main' in script
-        assert 'run_renew_cron' in script
+        assert CRON_RUNNER in script
+        assert sys.executable in script
+        assert 'sslbt_main' not in script
+        assert 'run_renew_cron' not in script
 
     def test_build_script_uses_verified_interpreter(self, cron_mgr):
         """脚本烧入自检通过的解释器而非裸 python3（BT-06）"""
@@ -233,11 +236,14 @@ class TestCronManager:
         assert result['status'] is False
 
     def test_build_script_has_log_rotation(self, cron_mgr):
-        """脚本包含 cron.log 轮转逻辑"""
+        """日志轮转随仓库入口脚本更新，不再固化进宝塔任务正文"""
         script = cron_mgr._build_script(sys.executable)
-        assert 'LOG_FILE=' in script
-        assert 'tail -500' in script
-        assert 'cron.log' in script
+        runner = Path(__file__).resolve().parents[1] / 'src' / 'scripts' / 'renew-cron.sh'
+        content = runner.read_text(encoding='utf-8')
+        assert 'tail -500' not in script
+        assert 'LOG_FILE=' in content
+        assert 'tail -500' in content
+        assert 'cron.log' in content
 
 
 class TestCronInterpreterFallback:
@@ -247,15 +253,18 @@ class TestCronInterpreterFallback:
         from lib.cron import CronManager
 
         script = CronManager(tmp_data_dir)._build_script(sys.executable)
-        assert 'PY_BIN=' in script
-        assert '[ -x "$PY_BIN" ] || PY_BIN="$(command -v python3)"' in script
-        assert '"$PY_BIN" -c' in script
+        runner = Path(__file__).resolve().parents[1] / 'src' / 'scripts' / 'renew-cron.sh'
+        content = runner.read_text(encoding='utf-8')
+        assert sys.executable in script
+        assert 'PY_BIN=' in content
+        assert '[ -x "$PY_BIN" ] || PY_BIN="$(command -v python3)"' in content
+        assert '"$PY_BIN" -' in content
 
     def test_script_burns_in_given_interpreter(self, tmp_data_dir):
         from lib.cron import CronManager
 
         script = CronManager(tmp_data_dir)._build_script('/www/server/panel/pyenv/bin/python')
-        assert 'PY_BIN="/www/server/panel/pyenv/bin/python"' in script
+        assert script.endswith(' /www/server/panel/pyenv/bin/python\n')
 
     def test_script_still_matched_by_plugin_dir_lookup(self, tmp_data_dir):
         """脚本仍需包含插件路径，否则 _find_cron_ids 的 LIKE 匹配失效"""
@@ -414,9 +423,224 @@ class TestCronNonDestructive:
         assert res['status'] is True
         params = obj.AddCrontab.call_args[0][0]
         assert params['hour'] == '14' and params['minute'] == '30'
+        assert CRON_RUNNER in params['sBody']
+        assert 'run_renew_cron' not in params['sBody']
         # 旧任务在新任务确认入库之后才删
         assert self._ids(db_path) != [7]
         obj.DelCrontab.assert_called_once_with({'id': 7})
+
+    def test_refresh_if_legacy_migrates_old_body(self, tmp_data_dir, tmp_path, monkeypatch):
+        """新版后端被旧前端调用时，也必须把旧完整正文迁移为薄入口。"""
+        from lib import cron as cron_mod
+
+        db_path = self._db_with_task(tmp_path)
+        monkeypatch.setattr(cron_mod, 'resolve_python', lambda: sys.executable)
+        module = types.ModuleType('crontab')
+        obj = MagicMock()
+
+        def _add(params):
+            conn = sqlite3.connect(db_path)
+            conn.execute(
+                'INSERT INTO crontab (name, status, sBody, where_hour, where_minute)'
+                ' VALUES (?, 1, ?, ?, ?)',
+                (params['name'], params['sBody'], params['hour'], params['minute']))
+            conn.commit()
+            conn.close()
+            return {'status': True}
+
+        def _del(params):
+            conn = sqlite3.connect(db_path)
+            conn.execute('DELETE FROM crontab WHERE id = ?', (params['id'],))
+            conn.commit()
+            conn.close()
+
+        obj.AddCrontab.side_effect = _add
+        obj.DelCrontab.side_effect = _del
+        module.crontab = MagicMock(return_value=obj)
+
+        with patch('lib.cron._cron_db_path', return_value=db_path), \
+             patch.dict(sys.modules, {'crontab': module}):
+            result = CronManager(tmp_data_dir).refresh_if_legacy()
+
+        assert result['status'] is True
+        assert result['changed'] is True
+        conn = sqlite3.connect(db_path)
+        row = conn.execute('SELECT sBody, where_hour, where_minute FROM crontab').fetchone()
+        conn.close()
+        assert CRON_RUNNER in row[0]
+        assert row[1:] == ('14', '30')
+
+    def test_refresh_if_legacy_is_noop_for_thin_body(self, tmp_data_dir, tmp_path):
+        """迁移完成后，读取配置不得每天重建计划任务。"""
+        db_path = self._db_with_task(tmp_path)
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            'UPDATE crontab SET sBody=? WHERE id=7',
+            (CronManager(tmp_data_dir)._build_script(sys.executable),),
+        )
+        conn.commit()
+        conn.close()
+
+        with patch('lib.cron._cron_db_path', return_value=db_path):
+            result = CronManager(tmp_data_dir).refresh_if_legacy()
+
+        assert result == {'status': True, 'changed': False}
+
+    def test_ensure_healthy_is_noop_for_exact_single_task(
+            self, tmp_data_dir, tmp_path, monkeypatch):
+        """健康任务只查询不重建，避免每天运行都扰动任务 ID 和执行时间。"""
+        from lib import cron as cron_mod
+
+        db_path = self._db_with_task(tmp_path)
+        monkeypatch.setattr(cron_mod, 'resolve_python', lambda: sys.executable)
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            'UPDATE crontab SET type="day", sBody=? WHERE id=7',
+            (CronManager(tmp_data_dir)._build_script(sys.executable),),
+        )
+        conn.commit()
+        conn.close()
+
+        module = types.ModuleType('crontab')
+        module.crontab = MagicMock()
+        with patch('lib.cron._cron_db_path', return_value=db_path), \
+             patch.dict(sys.modules, {'crontab': module}):
+            result = CronManager(tmp_data_dir).ensure_healthy()
+
+        assert result == {'status': True, 'changed': False, 'message': '计划任务正常'}
+        module.crontab.assert_not_called()
+
+    def test_ensure_healthy_repairs_wrong_body_and_preserves_paused_schedule(
+            self, tmp_data_dir, tmp_path, monkeypatch):
+        """修正文、去重时保留最新任务的时间和暂停态，且仍遵守先建后删。"""
+        from lib import cron as cron_mod
+
+        db_path = self._db_with_task(tmp_path)
+        conn = sqlite3.connect(db_path)
+        conn.execute('UPDATE crontab SET status=0, type="day" WHERE id=7')
+        conn.execute(
+            'INSERT INTO crontab '
+            '(id, name, status, sBody, where_hour, where_minute, type) '
+            'VALUES (8, ?, 0, ?, "16", "12", "day")',
+            (CRON_NAME, 'echo damaged'),
+        )
+        conn.commit()
+        conn.close()
+        monkeypatch.setattr(cron_mod, 'resolve_python', lambda: sys.executable)
+
+        module = types.ModuleType('crontab')
+        obj = MagicMock()
+
+        def _add(params):
+            conn = sqlite3.connect(db_path)
+            conn.execute(
+                'INSERT INTO crontab '
+                '(name, status, sBody, where_hour, where_minute, type) '
+                'VALUES (?, 1, ?, ?, ?, ?)',
+                (params['name'], params['sBody'], params['hour'], params['minute'], params['type']),
+            )
+            conn.commit()
+            conn.close()
+            return {'status': True}
+
+        def _toggle(params):
+            conn = sqlite3.connect(db_path)
+            conn.execute('UPDATE crontab SET status=0 WHERE id=?', (params['id'],))
+            conn.commit()
+            conn.close()
+            return {'status': True}
+
+        def _delete(params):
+            conn = sqlite3.connect(db_path)
+            conn.execute('DELETE FROM crontab WHERE id=?', (params['id'],))
+            conn.commit()
+            conn.close()
+
+        obj.AddCrontab.side_effect = _add
+        obj.set_cron_status.side_effect = _toggle
+        obj.DelCrontab.side_effect = _delete
+        module.crontab = MagicMock(return_value=obj)
+
+        with patch('lib.cron._cron_db_path', return_value=db_path), \
+             patch.dict(sys.modules, {'crontab': module}):
+            result = CronManager(tmp_data_dir).ensure_healthy()
+
+        assert result['status'] is True
+        assert result['changed'] is True
+        conn = sqlite3.connect(db_path)
+        rows = conn.execute(
+            'SELECT status, sBody, where_hour, where_minute, type FROM crontab'
+        ).fetchall()
+        conn.close()
+        assert rows == [(0, CronManager(tmp_data_dir)._build_script(sys.executable),
+                         '16', '12', 'day')]
+        obj.set_cron_status.assert_called_once()
+
+    def test_ensure_healthy_does_not_replace_when_interpreter_is_unavailable(
+            self, tmp_data_dir, tmp_path, monkeypatch):
+        """无法确认有效解释器时宁可保留旧任务，不得破坏性“修正”。"""
+        from lib import cron as cron_mod
+
+        db_path = self._db_with_task(tmp_path)
+        monkeypatch.setattr(cron_mod, 'resolve_python', lambda: None)
+        module = types.ModuleType('crontab')
+        module.crontab = MagicMock()
+
+        with patch('lib.cron._cron_db_path', return_value=db_path), \
+             patch.dict(sys.modules, {'crontab': module}):
+            result = CronManager(tmp_data_dir).ensure_healthy()
+
+        assert result['status'] is False
+        assert self._ids(db_path) == [7]
+        module.crontab.assert_not_called()
+
+    def test_ensure_healthy_keeps_paused_old_task_when_pause_confirmation_fails(
+            self, tmp_data_dir, tmp_path, monkeypatch):
+        """新任务暂停失败时不能删除用户原本暂停的任务。"""
+        from lib import cron as cron_mod
+
+        db_path = self._db_with_task(tmp_path)
+        conn = sqlite3.connect(db_path)
+        conn.execute('UPDATE crontab SET status=0, type="day" WHERE id=7')
+        conn.commit()
+        conn.close()
+        monkeypatch.setattr(cron_mod, 'resolve_python', lambda: sys.executable)
+
+        module = types.ModuleType('crontab')
+        obj = MagicMock()
+
+        def _add(params):
+            conn = sqlite3.connect(db_path)
+            conn.execute(
+                'INSERT INTO crontab '
+                '(name, status, sBody, where_hour, where_minute, type) '
+                'VALUES (?, 1, ?, ?, ?, "day")',
+                (params['name'], params['sBody'], params['hour'], params['minute']),
+            )
+            conn.commit()
+            conn.close()
+            return {'status': True}
+
+        def _delete_new(params):
+            conn = sqlite3.connect(db_path)
+            conn.execute('DELETE FROM crontab WHERE id=? AND id<>7', (params['id'],))
+            conn.commit()
+            conn.close()
+
+        obj.AddCrontab.side_effect = _add
+        obj.set_cron_status.return_value = {'status': False, 'msg': '暂停失败'}
+        obj.DelCrontab.side_effect = _delete_new
+        module.crontab = MagicMock(return_value=obj)
+
+        with patch('lib.cron._cron_db_path', return_value=db_path), \
+             patch.dict(sys.modules, {'crontab': module}):
+            result = CronManager(tmp_data_dir).ensure_healthy()
+
+        assert result['status'] is False
+        conn = sqlite3.connect(db_path)
+        rows = conn.execute('SELECT id, status FROM crontab').fetchall()
+        conn.close()
+        assert rows == [(7, 0)]
 
     def test_refresh_creates_when_absent(self, tmp_data_dir, tmp_path, monkeypatch):
         from lib import cron as cron_mod
@@ -512,10 +736,37 @@ class TestCronStatusTriState:
 
 
 class TestCronScriptReportsResult:
-    """cron 脚本必须打印结果（F5）：run_renew_cron 吞掉所有异常并返回 _err，
+    """cron 入口必须打印结果（F5）：run_renew_cron 吞掉所有异常并返回 _err，
     返回值被丢弃时 cron.log 恒为空，宝塔计划任务日志也永远显示成功"""
 
     def test_script_prints_result_message(self, tmp_data_dir):
-        script = CronManager(tmp_data_dir)._build_script(sys.executable)
-        assert 'print(' in script
-        assert "get('msg'" in script
+        runner = Path(__file__).resolve().parents[1] / 'src' / 'scripts' / 'renew-cron.sh'
+        content = runner.read_text(encoding='utf-8')
+        assert 'print(' in content
+        assert "get('msg'" in content
+
+    def test_runner_executes_with_registered_interpreter(self, tmp_path):
+        """入口优先使用任务注册时传入的解释器，并把运行结果写入 cron.log。"""
+        plugin_dir = tmp_path / 'plugin'
+        runner_dir = plugin_dir / 'scripts'
+        data_dir = plugin_dir / 'data' / 'logs'
+        runner_dir.mkdir(parents=True)
+        data_dir.mkdir(parents=True)
+        runner = Path(__file__).resolve().parents[1] / 'src' / 'scripts' / 'renew-cron.sh'
+        target = runner_dir / 'renew-cron.sh'
+        target.write_text(runner.read_text(encoding='utf-8'), encoding='utf-8')
+        main = plugin_dir / 'sslbt_main.py'
+        main.write_text(
+            'class sslbt_main:\n'
+            '    def run_renew_cron(self, args):\n'
+            '        return {"msg": "入口执行成功"}\n',
+            encoding='utf-8',
+        )
+
+        result = subprocess.run(
+            ['bash', str(target), sys.executable],
+            check=False, capture_output=True, text=True,
+        )
+
+        assert result.returncode == 0
+        assert '入口执行成功' in (data_dir / 'cron.log').read_text(encoding='utf-8')

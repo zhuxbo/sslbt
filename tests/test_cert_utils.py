@@ -7,7 +7,8 @@ import pytest
 
 from lib.cert_utils import (
     validate_cert_pem, validate_key_pem, build_fullchain, parse_cert_info,
-    validate_site_name_component,
+    validate_site_name_component, generate_csr, parse_csr_info,
+    verify_csr_key_match,
     PEM_CERT_RE, PEM_KEY_RE,
 )
 
@@ -272,3 +273,19 @@ class TestValidateSiteNameComponent:
         assert validate_site_name_component('') is not None
         assert validate_site_name_component(None) is not None
         assert validate_site_name_component(123) is not None
+
+
+class TestCSROwnership:
+    def test_generated_hash_uses_der_and_key_matches(self):
+        csr, key, csr_hash = generate_csr(['example.com'])
+
+        info = parse_csr_info(csr)
+
+        assert info is not None
+        assert info['common_name'] == 'example.com'
+        assert info['hash'] == csr_hash
+        assert verify_csr_key_match(csr, key) is True
+
+    def test_invalid_csr_cannot_establish_ownership(self):
+        assert parse_csr_info('not-a-csr') is None
+        assert verify_csr_key_match('not-a-csr', 'not-a-key') is False

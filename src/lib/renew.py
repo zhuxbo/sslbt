@@ -13,7 +13,7 @@ from . import cert_utils
 from .api_client import APIError, ERR_ORDER_IN_PROGRESS
 from .deployer import DeployError, check_web_config, probe_panel_runtime
 from .config import (
-    MAX_ISSUE_RETRY_COUNT, MAX_DEPLOY_ATTEMPT_COUNT,
+    MAX_ISSUE_RETRY_COUNT, MAX_DEPLOY_ATTEMPT_COUNT, MAX_FAILED_SITE_RETRY_COUNT,
     MAX_NO_PROGRESS_DAYS, MAX_BLOCK_REPORT_COUNT,
     ISSUE_STATE_PROCESSING, ISSUE_STATE_ACTIVE, ISSUE_STATE_CAPPED, ISSUE_STATE_EXPIRED,
     TERMINAL_ISSUE_STATES, IN_FLIGHT_ISSUE_STATES,
@@ -148,6 +148,8 @@ def needs_renewal(cert_entry, renew_before_days):
     - 到期时间已知且未到期：仅当剩余天数 ≤ renew_before_days 才续签
     """
     meta = cert_entry.get('metadata', {})
+    if meta.get('failed_site_names'):
+        return True
     expires_at = meta.get('cert_expires_at', '')
 
     days_remaining = None
@@ -357,12 +359,22 @@ class RenewEngine:
         # 触顶检查（计数分离）：签发（仅 local）与部署各自 >= 10 → 进入 CAPPED，不发回调
         # 签发触顶只拦截"新的 CSR 提交"；已进入 processing（CSR 已被接受）的证书继续轮询签发，
         # 不因签发计数被误判触顶而停止部署
-        if renew_mode == RENEW_MODE_LOCAL and state != ISSUE_STATE_PROCESSING \
+        has_in_flight = state in IN_FLIGHT_ISSUE_STATES or self._has_pending_csr(cert)
+        has_failed_sites = bool(meta.get('failed_site_names'))
+        if has_failed_sites and meta.get('failed_site_retry_count', 0) >= MAX_FAILED_SITE_RETRY_COUNT:
+            if self._logger:
+                self._logger.error(
+                    "失败绑定重试已达上限，等待人工处理: order_id=%s, sites=%s",
+                    order_id, ','.join(meta.get('failed_site_names', [])))
+            _skip('failed_sites_capped')
+            return
+        if renew_mode == RENEW_MODE_LOCAL and not has_in_flight and not has_failed_sites \
                 and meta.get('issue_retry_count', 0) >= MAX_ISSUE_RETRY_COUNT:
             self._enter_capped(cert, CAPPED_PHASE_ISSUE)
             _skip('capped:%s' % CAPPED_PHASE_ISSUE)
             return
-        if meta.get('deploy_attempt_count', 0) >= MAX_DEPLOY_ATTEMPT_COUNT:
+        if not has_failed_sites and not has_in_flight \
+                and meta.get('deploy_attempt_count', 0) >= MAX_DEPLOY_ATTEMPT_COUNT:
             self._enter_capped(cert, CAPPED_PHASE_DEPLOY)
             _skip('capped:%s' % CAPPED_PHASE_DEPLOY)
             return
@@ -374,7 +386,7 @@ class RenewEngine:
                 self._enter_expired(cert)
                 _skip('expired')
                 return
-            if hours < SAFETY_MARGIN_HOURS:
+            if hours < SAFETY_MARGIN_HOURS and not has_in_flight and not has_failed_sites:
                 if self._logger:
                     self._logger.info(
                         "剩余有效期不足安全余量（%.1fh < %dh），本轮不启动新动作: order_id=%s",
@@ -817,6 +829,37 @@ class RenewEngine:
 
     # ==================== 部署编排（计数 + 回调收敛到编排层） ====================
 
+    @staticmethod
+    def _deployment_sites(cert_entry):
+        """部分接纳后仅返回仍失败的绑定，否则返回全部绑定。"""
+        meta = cert_entry.get('metadata', {})
+        failed = meta.get('failed_site_names') or []
+        if failed:
+            return list(dict.fromkeys(failed))
+        sites = cert_entry.get('site_name', [])
+        if isinstance(sites, str):
+            sites = [sites] if sites else []
+        return list(sites)
+
+    def _begin_failed_site_retry(self, cert_entry):
+        """失败绑定补部署轮次在查询前独立计数。"""
+        meta = cert_entry.setdefault('metadata', {})
+        if not meta.get('failed_site_names'):
+            return False
+        count = int(meta.get('failed_site_retry_count', 0) or 0) + 1
+        self._config.update_metadata(
+            cert_entry['order_id'], {'failed_site_retry_count': count})
+        meta['failed_site_retry_count'] = count
+        return True
+
+    def _rollback_failed_site_retry(self, cert_entry):
+        """订单仍在签发、尚无可部署证书时不消耗失败绑定配额。"""
+        meta = cert_entry.setdefault('metadata', {})
+        count = max(0, int(meta.get('failed_site_retry_count', 0) or 0) - 1)
+        self._config.update_metadata(
+            cert_entry['order_id'], {'failed_site_retry_count': count})
+        meta['failed_site_retry_count'] = count
+
     def _begin_deploy_attempt(self, order_id, cert_entry):
         """递增部署计数并标记 started（持久化一个新的部署意图）。
 
@@ -975,6 +1018,7 @@ class RenewEngine:
             raise RuntimeError(block_reason)
         # 部署前的序列号：deploy_multi 仅在全部站点成功时才覆写它，
         # 因此部分失败轮次不会污染更替判定
+        was_failed_retry = bool(cert_entry.get('metadata', {}).get('failed_site_names'))
         prev_serial = cert_entry.get('metadata', {}).get('cert_serial', '')
         count = self._begin_deploy_attempt(order_id, cert_entry)
         at_cap = count >= MAX_DEPLOY_ATTEMPT_COUNT
@@ -994,7 +1038,7 @@ class RenewEngine:
 
         # 证书更替检测：服务端反复返回同一张旧证书时，此前每轮都报 success，
         # 服务端最新一行永远是成功、面板一路「正常」→「即将过期」→「已过期」
-        if status == 'success':
+        if status == 'success' and not was_failed_retry:
             # 本轮服务端交付的序列号直接从待部署的 fullchain 解析，**不从 metadata 读回**：
             # deploy_multi 只 update_metadata 写盘、不回写内存 cert_entry，从 metadata
             # 读出来的永远还是部署前的旧值，与 prev_serial 恒等 —— 那会让每张正常续签的
@@ -1007,6 +1051,16 @@ class RenewEngine:
             stale = self._track_cert_unchanged(cert_entry, order_id, prev_serial, new_serial)
             if stale:
                 status, message = 'failure', stale
+                # deploy_multi 的正常成功路径已清零证书级计数；改判失败必须恢复
+                # 本次尝试并保留无进展边界，否则相同旧证书会无限改写。
+                self._config.update_metadata(order_id, {
+                    'deploy_attempt_count': count,
+                    'deploy_started': False,
+                })
+                meta = cert_entry.setdefault('metadata', {})
+                meta['deploy_attempt_count'] = count
+                meta['deploy_started'] = False
+                self._mark_no_progress(cert_entry, order_id)
 
         self._send_deploy_callback(api, order_id, status, now, message, at_cap)
         return results
@@ -1104,6 +1158,7 @@ class RenewEngine:
     def _renew_pull(self, cert_entry, api):
         """Pull 模式续签：查询订单 → 证书就绪则部署"""
         order_id = cert_entry['order_id']
+        failed_retry = self._begin_failed_site_retry(cert_entry)
         if self._logger:
             self._logger.info("Pull 模式续签: order_id=%s", order_id)
 
@@ -1117,6 +1172,8 @@ class RenewEngine:
         private_key = cert_data.get('private_key', '')
 
         if status != 'active' or not certificate:
+            if failed_retry and classify_order_status(status) == ORDER_CLASS_WAITING:
+                self._rollback_failed_site_retry(cert_entry)
             # 记录服务端订单状态供面板展示。不写 last_issue_state——那是 spec 定义的
             # 带门禁语义的字段，把 cancelled 之类写进去会让证书被前置过滤永久跳过，
             # 违反「后续轮次仍可查询自愈」；renewed/reissued 更是链延续标记而非故障
@@ -1149,9 +1206,7 @@ class RenewEngine:
 
         # 构建完整证书链并部署
         fullchain = cert_utils.build_fullchain(certificate, ca_certificate)
-        site_names = cert_entry.get('site_name', [])
-        if isinstance(site_names, str):
-            site_names = [site_names] if site_names else []
+        site_names = self._deployment_sites(cert_entry)
         domains = cert_entry.get('domains', [])
 
         if not site_names:
@@ -1178,6 +1233,32 @@ class RenewEngine:
 
         last_state = meta.get('last_issue_state', '')
 
+        # 部分绑定已接纳证书后，不再创建新 CSR；查询当前 active 证书并只补失败绑定。
+        if meta.get('failed_site_names') and not self._has_pending_csr(cert_entry):
+            self._begin_failed_site_retry(cert_entry)
+            cert_data = self._query_order(cert_entry, api, order_id)
+            self._update_renew_before_days(api)
+            order_id = self._check_order_update(cert_entry, cert_data)
+            status = cert_data.get('status', '')
+            if status != ISSUE_STATE_ACTIVE:
+                if classify_order_status(status) == ORDER_CLASS_WAITING:
+                    self._rollback_failed_site_retry(cert_entry)
+                self._track_order_status(cert_entry, order_id, status)
+                self._mark_no_progress(cert_entry, order_id)
+                return False
+            key_pem = self._find_active_private_key(cert_entry, cert_data)
+            if not key_pem:
+                raise RuntimeError("已接纳证书的配对私钥不可用，无法补部署失败绑定")
+            certificate = cert_data.get('certificate', '')
+            ca_certificate = cert_data.get('ca_certificate', '')
+            if not certificate or not ca_certificate:
+                raise RuntimeError("证书内容不完整，无法补部署失败绑定")
+            results = self._deploy_and_report(
+                cert_entry, api, cert_utils.build_fullchain(certificate, ca_certificate),
+                key_pem, self._deployment_sites(cert_entry),
+                cert_entry.get('domains', []), order_id)
+            return self._check_deploy_results(results, order_id)
+
         # 有在途订单（processing / active 秒签待部署，spec §1.5）：只查询、绝不提交新 CSR
         if last_state in IN_FLIGHT_ISSUE_STATES:
             return self._handle_processing(cert_entry, api)
@@ -1199,15 +1280,7 @@ class RenewEngine:
         return self._submit_new_csr(cert_entry, api)
 
     def _recover_pending_submit(self, cert_entry, api):
-        """上轮 CSR 提交结果不确定：查询订单，据服务端实际状态恢复，绝不重复 POST。
-
-        服务端状态机保证：提交成功响应只会是 pending/processing（均表示 CSR 已收到）；
-        服务端未接收提交时返回错误信息（走明确业务拒绝路径清理 pending），不会以状态表达。
-        因此恢复只需查询：
-        - pending/processing/approving/active → 归一 processing 走查询路径
-          （只 GET、不增计数、不重生 CSR）；active 则读 pending key 部署
-        - 其他状态为 active 之后的订单终态 → 持久化后停止，等待人工处理
-        """
+        """上轮 CSR 提交结果不确定：只查询，并用服务端 CSR 判断归属。"""
         order_id = cert_entry['order_id']
         cert_data = self._query_order(cert_entry, api, order_id)
         self._update_renew_before_days(api)
@@ -1215,13 +1288,11 @@ class RenewEngine:
         status = _normalize_issue_status(cert_data.get('status', ''))
 
         if status in IN_FLIGHT_ISSUE_STATES:
-            # 在途等待/未知新增状态已归一 processing，active 为秒签待部署：
-            # 两者都交由 processing 路径查询/部署，绝不重复 POST
             self._config.update_metadata(order_id, {'last_issue_state': ISSUE_STATE_PROCESSING})
             cert_entry.setdefault('metadata', {})['last_issue_state'] = ISSUE_STATE_PROCESSING
             if self._logger:
-                self._logger.info("在途 CSR 恢复：服务端已在处理，归一 processing: order_id=%s", order_id)
-            return self._handle_processing(cert_entry, api)
+                self._logger.info("在途 CSR 恢复：进入 CSR 归属校验: order_id=%s", order_id)
+            return self._handle_processing(cert_entry, api, cert_data=cert_data)
 
         # 真终态 / 链式异常：只写展示字段 last_order_status，**不写 last_issue_state**
         # （spec §2.4）。在途标记保持不动，本条路径恒为「只查询」，绝不落到新的 POST；
@@ -1293,7 +1364,7 @@ class RenewEngine:
                 self._logger.info("回填后剩余期限充足，本轮不续签: order_id=%s", order_id)
             return False
 
-        return self._submit_new_csr(cert_entry, api)
+        return self._submit_new_csr(cert_entry, api, prequery=cert_data)
 
     def _check_order_update(self, cert_entry, cert_data):
         """检查 API 返回的 order_id 是否变化（续费），变化则更新配置和 pending key 路径"""
@@ -1326,19 +1397,108 @@ class RenewEngine:
         cert_entry['cert_name'] = new_name
         return new_id
 
-    def _handle_processing(self, cert_entry, api):
+    def _server_csr_ownership(self, cert_entry, server_csr, pending_key):
+        """返回服务端 CSR 是否属于本机；无法可靠判断时返回 None。"""
+        info = cert_utils.parse_csr_info(server_csr)
+        meta = cert_entry.get('metadata', {})
+        expected_hash = meta.get('last_csr_hash', '')
+        domains = cert_entry.get('domains', [])
+        expected_cn = domains[0] if domains else ''
+        if not info or not expected_hash or not expected_cn:
+            return None
+        if info.get('hash') != expected_hash:
+            return False
+        if info.get('common_name', '').rstrip('.').lower() != str(expected_cn).rstrip('.').lower():
+            return False
+        return cert_utils.verify_csr_key_match(server_csr, pending_key)
+
+    def _clear_csr_metadata(self, cert_entry, order_id):
+        updates = {'last_csr_hash': '', 'csr_submitted_at': ''}
+        self._config.update_metadata(order_id, updates)
+        cert_entry.setdefault('metadata', {}).update(updates)
+
+    def _find_active_private_key(self, cert_entry, cert_data):
+        """按 API 私钥、已成功绑定站点私钥的顺序寻找 active 证书配对私钥。"""
+        certificate = cert_data.get('certificate', '')
+        if not certificate:
+            return None
+        candidates = [cert_data.get('private_key', '')]
+        failed = set(cert_entry.get('metadata', {}).get('failed_site_names') or [])
+        sites = cert_entry.get('site_name', [])
+        if isinstance(sites, str):
+            sites = [sites] if sites else []
+        for site_name in sites:
+            if site_name in failed:
+                continue
+            try:
+                import panelSite
+                previous = self._deployer._capture_current_ssl(
+                    panelSite.panelSite(), site_name)
+            except Exception:
+                previous = None
+            if previous:
+                candidates.append(previous.get('key', ''))
+        for key_pem in candidates:
+            if key_pem and cert_utils.verify_cert_key_match(certificate, key_pem):
+                return key_pem
+        return None
+
+    def _handle_processing(self, cert_entry, api, cert_data=None):
         """处理已提交 CSR 的 processing 状态"""
         order_id = cert_entry['order_id']
         meta = cert_entry.get('metadata', {})
+        failed_retry = self._begin_failed_site_retry(cert_entry)
 
         # 查询订单状态（只 GET，不重复 POST，不增计数）
-        cert_data = self._query_order(cert_entry, api, order_id)
+        if cert_data is None:
+            cert_data = self._query_order(cert_entry, api, order_id)
         self._update_renew_before_days(api)
         order_id = self._check_order_update(cert_entry, cert_data)
         # pending / 已在处理 统一归一为 processing 继续等待（spec §2.6/§3.5）
         status = _normalize_issue_status(cert_data.get('status', ''))
 
+        pending_key = self._read_pending_key(cert_entry)
+        if pending_key:
+            ownership = self._server_csr_ownership(cert_entry, cert_data.get('csr', ''), pending_key)
+            if ownership is None:
+                if failed_retry:
+                    self._rollback_failed_site_retry(cert_entry)
+                changed = self._track_order_status(
+                    cert_entry, order_id, cert_data.get('status', ''))
+                self._mark_no_progress(cert_entry, order_id)
+                if self._logger:
+                    log = self._logger.error if changed else self._logger.info
+                    log("服务端 CSR 缺失或无法验证，保留 pending 并停止本轮: order_id=%s",
+                        order_id)
+                return False
+            if ownership is False:
+                self._cleanup_pending_key(cert_entry)
+                self._cleanup_pending_csr(cert_entry)
+                self._clear_csr_metadata(cert_entry, order_id)
+                if status == ISSUE_STATE_PROCESSING:
+                    if failed_retry:
+                        self._rollback_failed_site_retry(cert_entry)
+                    self._persist_meta(order_id, {'last_issue_state': ISSUE_STATE_PROCESSING})
+                    meta['last_issue_state'] = ISSUE_STATE_PROCESSING
+                    self._track_order_status(cert_entry, order_id, cert_data.get('status', ''))
+                    self._mark_no_progress(cert_entry, order_id)
+                    if self._logger:
+                        self._logger.warning(
+                            "服务端在途 CSR 不属于本机，清理本机 pending 后只查询跟随: order_id=%s",
+                            order_id)
+                    return False
+                if status == ISSUE_STATE_ACTIVE:
+                    pending_key = self._find_active_private_key(cert_entry, cert_data)
+                    if not pending_key:
+                        if failed_retry:
+                            self._rollback_failed_site_retry(cert_entry)
+                        self._persist_meta(order_id, {'last_issue_state': ''})
+                        meta['last_issue_state'] = ''
+                        return self._submit_new_csr(cert_entry, api, prequery=cert_data)
+
         if status == ISSUE_STATE_PROCESSING:
+            if failed_retry:
+                self._rollback_failed_site_retry(cert_entry)
             # 检查是否有新的验证文件需要放置
             self._try_place_verify_file(cert_entry, cert_data)
             # 记录原始状态供面板展示：unpaid / cancelling 这类可自愈中间态在这里与正常
@@ -1396,20 +1556,15 @@ class RenewEngine:
                 self._logger.warning("证书内容不完整")
             return False
 
-        pending_key = self._read_pending_key(cert_entry)
         if not pending_key:
-            if self._logger:
-                self._logger.error("pending key 不存在")
-            self._config.update_metadata(order_id, {
-                'last_issue_state': '',
-                'csr_submitted_at': '',
-            })
-            return False
+            pending_key = self._find_active_private_key(cert_entry, cert_data)
+        if not pending_key:
+            self._persist_meta(order_id, {'last_issue_state': ''})
+            meta['last_issue_state'] = ''
+            return self._submit_new_csr(cert_entry, api, prequery=cert_data)
 
         fullchain = cert_utils.build_fullchain(certificate, ca_certificate)
-        site_names = cert_entry.get('site_name', [])
-        if isinstance(site_names, str):
-            site_names = [site_names] if site_names else []
+        site_names = self._deployment_sites(cert_entry)
         domains = cert_entry.get('domains', [])
 
         if not site_names:
@@ -1434,21 +1589,55 @@ class RenewEngine:
         results = self._deploy_and_report(
             cert_entry, api, fullchain, pending_key, site_names, domains, order_id)
 
-        # 清理判据 = 私钥是否已被消费（任一站点部署成功即已写入站点），与
-        # _check_deploy_results 是否抛错解耦：部分成功+站点缺失/删除时仍抛错上报，
-        # 但私钥必须清理不泄漏；全失败（success=0）保留 pending key 供下轮重试（spec §3.8）
+        # 任一绑定成功即已把私钥写入正式站点，清理 pending 副本；后续失败绑定
+        # 从已成功站点读取配对私钥。仅本轮全部失败时保留 pending（spec §3.8）。
         if any(r.get('status') for r in results):
             self._cleanup_pending_key(cert_entry)
             self._cleanup_pending_csr(cert_entry)
         return self._check_deploy_results(results, order_id)
 
-    def _submit_new_csr(self, cert_entry, api):
+    def _submit_new_csr(self, cert_entry, api, prequery=None):
         """生成并提交新的 CSR（一次新的签发逻辑尝试，递增计数）"""
-        order_id = cert_entry['order_id']
+        try:
+            order_id = int(cert_entry.get('order_id', 0))
+        except (TypeError, ValueError):
+            order_id = 0
+        if order_id <= 0:
+            raise RuntimeError("订单 ID 无效，请重新 setup 或人工修复配置")
         domains = cert_entry.get('domains', [])
 
         if not domains:
             raise RuntimeError("未配置域名")
+
+        meta = cert_entry.setdefault('metadata', {})
+        if meta.get('issue_retry_count', 0) >= MAX_ISSUE_RETRY_COUNT:
+            self._enter_capped(cert_entry, CAPPED_PHASE_ISSUE)
+            return False
+        hours = _remaining_hours(meta)
+        if hours is not None and hours < SAFETY_MARGIN_HOURS:
+            if self._logger:
+                self._logger.warning(
+                    "剩余有效期不足安全余量，不建立新 CSR 尝试: order_id=%s", order_id)
+            return False
+
+        # query-first：只有本次预查询明确 active 才允许生成私钥、计数和 POST。
+        cert_data = prequery
+        if cert_data is None:
+            cert_data = self._query_order(cert_entry, api, order_id)
+            self._update_renew_before_days(api)
+            order_id = self._check_order_update(cert_entry, cert_data)
+        raw_status = cert_data.get('status', '') if isinstance(cert_data, dict) else ''
+        if raw_status != ISSUE_STATE_ACTIVE:
+            self._track_order_status(cert_entry, order_id, raw_status)
+            self._mark_no_progress(cert_entry, order_id)
+            if classify_order_status(raw_status) in (ORDER_CLASS_WAITING, ORDER_CLASS_UNKNOWN):
+                self._persist_meta(order_id, {'last_issue_state': ISSUE_STATE_PROCESSING})
+                meta['last_issue_state'] = ISSUE_STATE_PROCESSING
+            if self._logger:
+                self._logger.info(
+                    "CSR 提交预查询未处于 active，本轮停止: order_id=%s, status=%s",
+                    order_id, raw_status or '(缺失)')
+            return False
 
         # 清理可能残留的 pending（无在途 CSR 才走到这里）
         self._cleanup_pending_key(cert_entry)
@@ -1467,7 +1656,6 @@ class RenewEngine:
         # （计数 = 持久化一个新的逻辑尝试意图；下轮恢复重放同一 CSR 不再递增）
         self._save_pending_key(cert_entry, key_pem)
         self._save_pending_csr(cert_entry, csr_pem)
-        meta = cert_entry.setdefault('metadata', {})
         # 回滚快照：认证/限流类失败发生在服务端中间件、请求从未进入业务层，那次"尝试意图"
         # 事实上不存在，须连同计数一起还原（见 _do_submit_csr）
         rollback = {
@@ -1477,13 +1665,20 @@ class RenewEngine:
         }
         retry_count = meta.get('issue_retry_count', 0) + 1
         now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
-        self._config.update_metadata(order_id, {
-            'issue_retry_count': retry_count,
-            'last_csr_hash': csr_hash,
-            'csr_submitted_at': now,
-        })
+        try:
+            self._config.update_metadata(order_id, {
+                'issue_retry_count': retry_count,
+                'last_csr_hash': csr_hash,
+                'csr_submitted_at': now,
+            })
+        except Exception:
+            self._cleanup_pending_key(cert_entry)
+            self._cleanup_pending_csr(cert_entry)
+            meta.update(rollback)
+            raise
         meta['issue_retry_count'] = retry_count
         meta['last_csr_hash'] = csr_hash
+        meta['csr_submitted_at'] = now
 
         return self._do_submit_csr(cert_entry, api, csr_pem, validation_method,
                                    rollback=rollback)
@@ -1517,6 +1712,7 @@ class RenewEngine:
             # 明确业务拒绝：确认未创建新证书，清理 pending
             self._cleanup_pending_key(cert_entry)
             self._cleanup_pending_csr(cert_entry)
+            self._clear_csr_metadata(cert_entry, order_id)
             if e.error_code == ERR_ORDER_IN_PROGRESS:
                 # spec §2.2 里唯一的过渡态：服务端明确告知订单已在途（unpaid/pending，
                 # 签发进行中），完成后自行消失。必须归一到「已在处理」而非按业务拒绝
@@ -1690,6 +1886,13 @@ class RenewEngine:
         csr_path = self._pending_csr_path(cert_entry)
         return (os.path.isfile(key_path) and not os.path.islink(key_path)
                 and os.path.isfile(csr_path) and not os.path.islink(csr_path))
+
+    def _read_pending_csr(self, cert_entry):
+        path = self._pending_csr_path(cert_entry)
+        if not os.path.isfile(path) or os.path.islink(path):
+            return None
+        with open(path, 'r') as f:
+            return f.read()
 
     def _save_pending_csr(self, cert_entry, csr_pem):
         path = self._pending_csr_path(cert_entry)
