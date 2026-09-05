@@ -31,7 +31,7 @@ from lib.config import (  # noqa: E402
 from lib.logger import Logger  # noqa: E402
 from lib.api_client import APIClient, APIError, ORDER_PARAM_PATTERN  # noqa: E402
 from lib.cert_utils import (  # noqa: E402
-    build_fullchain, parse_cert_info, verify_cert_key_match, verify_csr_key_match,
+    build_fullchain, parse_cert_info, verify_cert_key_match,
     validate_key_pem,
 )
 from lib.site_manager import SiteManager  # noqa: E402
@@ -229,9 +229,7 @@ class sslbt_main:
             ok, _ = validate_key_pem(key_pem)
             if not ok:
                 continue
-            if verify_cert_key_match(fullchain_pem, key_pem) \
-                    and (not cert_data.get('csr')
-                         or verify_csr_key_match(cert_data.get('csr', ''), key_pem)):
+            if verify_cert_key_match(fullchain_pem, key_pem):
                 self._logger.info("私钥来源: %s", source)
                 return key_pem
 

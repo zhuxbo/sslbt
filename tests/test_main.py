@@ -1229,6 +1229,40 @@ class TestToggleAutoReissue:
 class TestResolvePrivateKey:
     """_resolve_private_key 私钥回退链测试"""
 
+    @pytest.mark.parametrize('source', ['api', 'path', 'site', 'user'])
+    @pytest.mark.parametrize('cert_matches', [True, False])
+    def test_response_csr_does_not_override_cert_key_match(self, plugin, tmp_path, source, cert_matches):
+        """所有私钥来源均以已签发证书配对为准，响应 CSR 不参与部署判断。"""
+        from lib.cert_utils import generate_csr, verify_cert_key_match, verify_csr_key_match
+
+        cert_path = tmp_path / 'cert.pem'
+        key_path = tmp_path / 'key.pem'
+        subprocess.run(
+            ['openssl', 'req', '-new', '-x509', '-nodes', '-newkey', 'rsa:2048',
+             '-keyout', str(key_path), '-out', str(cert_path), '-days', '1',
+             '-subj', '/CN=example.com'],
+            check=True, capture_output=True,
+        )
+        certificate = cert_path.read_text()
+        cert_key = key_path.read_text()
+        response_csr, other_key, _ = generate_csr(['example.com'])
+        assert verify_csr_key_match(response_csr, cert_key) is False
+        candidate = cert_key if cert_matches else other_key
+        assert verify_cert_key_match(certificate, candidate) is cert_matches
+
+        cert_data = {'csr': response_csr}
+        args = {}
+        if source == 'api':
+            cert_data['private_key'] = candidate
+        elif source == 'path':
+            key_path.write_text(candidate)
+            args['private_key_path'] = str(key_path)
+        elif source == 'user':
+            args['private_key'] = candidate
+        with patch.object(plugin, '_read_site_key', return_value=candidate if source == 'site' else ''):
+            result = plugin._resolve_private_key(cert_data, args, certificate, ['example.com'])
+        assert result == (candidate if cert_matches else '')
+
     def _make_plugin_with_key_match(self, plugin, match_sources):
         """构造 plugin，mock verify_cert_key_match 使指定来源的 key 匹配"""
         # match_sources: set of key_pem values that should "match"

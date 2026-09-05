@@ -204,7 +204,7 @@ SetSSL 部署：写入前 pre-flight 校验既有配置（`check_web_config()`�
 - 恢复纪律（response-loss）：CSR 提交前原子持久化 pending key + `pending-csr.pem` 及 CSR metadata；`submit_csr` 传输不确定（`APIError.transport=True`：超时/断连/HTTP 5xx/响应读取或解析失败）保留 pending 与本次计数，不做传输层重试；下轮 `_recover_pending_submit` 只查询订单、绝不重复 POST，并验证服务端 CSR：与 pending 私钥配对表示本机提交已收敛；active 且不配对时清理旧状态，先尝试 API/正式本地私钥部署当前证书，全部不可用时才按门禁建立新的逻辑尝试并重新计数；在途状态且不配对时清理本机状态、只 GET 跟随服务端当前动作；CSR 缺失或非法时保留 pending 并停止本轮
 - 查询状态归一：服务端提交响应只会是 `pending`/`processing`；查询在 `processing → active` 之间可能出现短暂中间态 `approving`，三者统一归一 `processing` 继续等待；已知终态按终态处理，未知新增值保守归一为等待。服务端状态只持久化到展示字段 `last_order_status`，不写带门禁语义的 `last_issue_state`；终态后续每轮仍查询一次以便自愈，但状态未变化时不重复记 error、不重复落盘
 - 策略派生 `derive_or_validate_renew_policy`（`config`，唯一权威）：SAN 含 IP 强制 `renew_mode=local` + `validation_method=file`；DNS 校验兼容性。add_cert/update_cert_config/batch_set_renew_policy/续签提交统一调用
-- 私钥回退（deploy-spec §5.3）：deploy_cert 中按 API → 参数路径 → 站点已有私钥(GetSSL) → 弹窗粘贴 四级回退，所有来源均需 verify_cert_key_match 校验；服务端 CSR 非空时还须校验 CSR 公钥，历史 active 订单 CSR 为空时首次 setup 可仅凭证书—私钥配对，结果不确定的本机提交恢复不得使用该降级
+- 私钥回退（deploy-spec §5.3）：deploy_cert 中按 API → 参数路径 → 站点已有私钥(GetSSL) → 弹窗粘贴 四级回退，首次/手工部署的所有来源均需 verify_cert_key_match 校验，不使用响应中的 CSR 阻断部署；CSR 归属校验仅保留在具备 pending 私钥和 last_csr_hash 的 local 在途 CSR POST 恢复中
 - 文件验证：CSR 提交返回 file 字段时自动放置，签发成功或明确终态时清理；长期纯查询由公共 `no_progress_since` 边界终止并清理
 - `_check_deploy_results()`：全部失败抛异常；**部分失败同样抛异常**——回调本就报 failure，此前返回 True 造成本地与服务端双口径
 - callback message：仅 failure 携带各站点失败原因摘要（含回滚状态、可能的「已达重试上限」标注）；上限 `CALLBACK_MESSAGE_MAX=256`，**先脱敏后截断**（`sanitize()` 过滤 Bearer/私钥/token 后再截断）；success 不带 message
