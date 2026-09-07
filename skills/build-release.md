@@ -2,6 +2,8 @@
 
 本资源只定义本仓平台构建、完整性和服务器事务；完整发布编排以 `skills/remote-release.md` 为唯一权威实现，统一语义以 `deploy-spec.md` 第 8 节为准。
 
+仅构建 ZIP 时执行构建与产物校验即可；不因读取本资源触发远程发布或补跑发布门禁。修改构建/manifest/事务实现时按 `skills/finish-check.md` 选 full；同一输入的成功 dry-run 不在本轮重复执行。
+
 ## 平台资产与签名
 
 - 规范正式资产集合：仅 `sslbt.zip`，公开文件名固定，不含版本号；版本由目录 `v{version}/` 和 ZIP 内 `info.json.versions` 表达。

@@ -59,8 +59,12 @@ make test
 # 构建 ZIP（需指定版本号）
 make build VERSION=1.0.0
 
-# 完成前自动门禁
+# 完成前按变更选择门禁
 make finish-check
+
+# 已提交变更可指定基线；全量/CI 模拟使用独立入口
+make finish-check ARGS="--base origin/dev"
+make finish-check-full
 
 # 仅准备正式发布 bundle（不会上传）
 make build-release VERSION=1.0.0
@@ -68,6 +72,8 @@ make build-release VERSION=1.0.0
 # 容器集成测试
 make docker-test
 ```
+
+完成检查的范围、定向测试和自进化规则见 [完成检查](skills/finish-check.md)。默认文档修改不跑单测或打包；运行时修改不重复检查发布事务。每轮耗时和结果保存在被 Git 忽略的本地目录，用于基于证据改进规则；正式发布仍需全量和真实宝塔门禁。
 
 ## 续签模式
 

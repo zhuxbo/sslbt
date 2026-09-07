@@ -13,6 +13,7 @@
 适用于 PR head、合并后精确 `main` commit、回同步后精确 `dev` commit 的 GitHub required checks：
 
 - `test (3.9)`、`test (3.12)`
+- `openssl-102-compat`（`build` 的 CI 前置依赖）
 - `lint`
 - `governance`
 - `build`
@@ -21,9 +22,9 @@
 
 正式版额外 release gates：
 
-- 在精确 source commit 运行 `skills/finish-check.md` 全部适用项。
+- 在精确 source commit 运行 `make finish-check-full` 及 `skills/finish-check.md` 全部适用审查；日常变更的精简范围不能代替发布门禁。
 - 在可用的真实宝塔测试镜像中运行 `make docker-test`，覆盖 nginx/apache 的 setup、deploy、renew；若环境不可用，正式发布必须停止，不能把单元测试或 Docker 构建当成替代。
-- `bash build/release.sh --dry-run <预发布测试版本>` 通过，证明确定性构建、manifest 和索引逻辑。
+- 全量入口包含发布 dry-run，证明确定性构建、manifest 和索引逻辑；同一阶段、同一输入不再重复执行。切换到下一发布阶段的精确 commit 后重新验证。
 
 ## dev 测试版
 

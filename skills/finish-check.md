@@ -1,30 +1,53 @@
 # sslbt 完成前检查
 
-本文件是本仓 finish-check 的唯一检查清单。工具入口只转发参数，不复制步骤。先确定工作区 diff 或 `<base>...HEAD` 范围；逐提交确认单一主题、`type: 中文主题` 和无 AI 署名。
+本文件是本仓 finish-check 的唯一工作流；自动选项和命令由 `scripts/finish-check.py` 实现。默认按本次变更验证，显式全量、CI 模拟和正式发布使用全量入口。工具薄入口原样转交参数。
 
-## 自动门禁
+## 确定范围并执行
 
-1. `python3 -m pytest tests/ -v -W error`：全部通过；测试钩子令任何 skip 失败，警告按错误处理。发布脚本测试同时解包核对必要文件、`info.json.versions` 和运行时 `--version`。
-2. `python3 -m flake8 src/ --max-line-length=120 --exclude=__pycache__`。
-3. `python3 -m flake8 tests/ --max-line-length=120 --exclude=__pycache__`。
-4. `python3 scripts/check-agent-config.py`：Codex 原生薄 Skill、固定 `CLAUDE.md`、Claude 薄命令、扁平领域 Skill 路由、旧路径引用及 Make/CI 接线全部通过。
-5. `bash build/release.sh --dry-run 0.0.0-finish-check`：确定性 ZIP、单资产 manifest、候选索引和 SHA256 通过且无网络操作。
-6. `git diff --check`。
+1. 从用户要求和 `git diff` 确定本次改动及直接影响链。默认包含已暂存、未暂存、未跟踪文件；检查已提交改动时传入 `--base <ref>`，取 merge-base 到 HEAD 并包含工作区。干净工作区且未给 base 时保守执行全量，不猜测要检查的提交。
+2. 用下面的最小适用命令执行一次。只有范围不明确时先加 `--plan` 查看选择；无需每次先预演、再逐条执行、最后又跑 Make 汇总。
+3. 只对涉及的契约做下节审查。已执行且命令、输入内容、依赖、解释器/环境均未改变的本轮成功检查可复用，说明证据即可；文件变化后重跑受影响项。不把历史耗时记录当作通过缓存，不因已提交就自动补查全部 Git 历史。
 
-`make finish-check` 汇总以上全部自动门禁；下列按风险审查仍需明确记录。
+```bash
+make finish-check
+make finish-check ARGS="--base origin/dev"
+# 仅当已确认局部改动的直接影响链时选择具体测试（可用 pytest nodeid）
+make finish-check ARGS="--tests tests/test_logger.py"
+make finish-check-full
+```
 
-## 代码与契约审查
+| 自动范围 | 触发 | 自动验证 |
+| --- | --- | --- |
+| docs | 仅文档、AGENTS 或 skill 说明，部署规范除外 | 配置/路由防漂移、diff 格式 |
+| focused | 仅独立测试、治理脚本；或低风险插件修改经调用链审查后提供 `--tests` | 选定测试、Python lint、防漂移、diff 格式 |
+| runtime | 插件 Python/HTML 变更，未指定定向测试 | 除发布脚本/manifest 外的单测、Python lint、防漂移、diff 格式 |
+| full | `--full`；构建/安装/CI/Makefile、共享测试设施、部署规范、未知路径；或无变更范围 | 全部单测、Python lint、防漂移、确定性发布 dry-run、diff 格式 |
 
-8. 标准库依赖：扫描 `src/**/*.py` import，只允许 Python 标准库及宝塔 `panelSite`/`public`；同步任何 mock 调用变化。
-9. 敏感信息：diff 不含真实 token、密码、私钥、域名/IP；日志新增字段经过 `Logger` 脱敏，回调失败信息先脱敏再截断至 256。
-10. 文件安全：涉及写入时保留 `flock`、0600、tmp + `os.replace`、符号链接拒绝和路径组件校验。
-11. 宝塔契约：SetSSL 参数/返回白名单、参数化 SQLite、站点查询失败与零站点区分、两轮解绑确认、前后端方法与 `{status,msg,data}` 同步。
-12. 续签契约：服务端 `renew_before_days`、UTC、重试上限、Local CSR 异步状态、pending 私钥生命周期、订单变更、failure 回调和部署失败顶层状态符合 `deploy-spec.md`。
-13. 发布与治理（若相关）：正式资产仅 `sslbt.zip`；SHA256 与文件名一致；main 不可覆盖/重建，tag 后只能原 bundle 恢复；所有节点先 stage 后 publish；Skill/工具/README 不复制冲突流程。
-14. diff 与文档：无调试残留、误删、被忽略文件或无关改动；`src/info.json` 不手改。只有本次触碰 `deploy-spec.md` 时才检查 `sslctl`、`sslctlw`、`sslbt` 三仓字节一致，本任务未修改则标记不适用。
+混合变更取覆盖范围的并集，full 优先；`--tests` 不能压过 full。参数或 Git 范围错误直接失败。所有 pytest 保持 `-W error` 和现有 skip 失败钩子；失败停止后续命令，修复后重跑受影响项，不能把未执行项算通过。
 
-## 平台验证与风险报告
+`--tests` 是智能体基于代码审查的选择，不是脚本证明的覆盖率。变更涉及锁、私钥/文件安全、网络边界、跨模块状态或外部契约时用 runtime/full，不按文件少强行缩小；共享 fixture/helper 修改不能仅跑使用它的一条测试。纯样式/文案修改可定向检查，HTML/JS 行为仍需浏览器或对应面板验证，Python 单测不覆盖页面交互。
 
-影响宝塔交互、安装、部署、续签或正式发布时，在可用环境运行 `make docker-test`，覆盖 nginx/apache。镜像或真机不可用时必须列为未验证，不能用主机单测代替。
+## 按影响审查
 
-最终按安全、兼容性、运行时、测试覆盖不足四类列出风险；无则写“无”。Python CI 两端为 3.9/3.12，但真实宝塔 pyenv、真实面板版本、SSH 多节点事务和 GitHub Release 只能在对应环境验证。
+- Python 导入/宝塔调用：标准库加宝塔 `panelSite`/`public`，mock 同步；保持 Python 3.9/3.12 与面板边界。
+- 配置、证书、状态写入：`flock`、0600、tmp + `os.replace`、符号链接拒绝、路径校验；敏感信息不进入 diff/日志，回调先脱敏再截断至 256。
+- 部署/续签/前后端接口：只追踪本次直接调用链，按 `deploy-spec.md` 对应章节核对 SetSSL、站点查询、解绑、UTC、重试、pending 私钥与回调状态；不逐条复审无关契约。
+- 构建/发布/治理：核对唯一资产、哈希、版本注入、main 不可变、原 bundle 恢复和全节点事务。仅修改 `deploy-spec.md` 时核对 `sslctl`、`sslctlw`、`sslbt` 三仓字节一致。
+- diff：无调试残留、误删和无关改动，`src/info.json` 不手改；文档只同步受影响用法。用户要求提交或检查提交范围时，再检查对应提交主题、格式和署名。
+
+只有实际改变宝塔交互、安装、部署或续签行为时运行相关平台验证；纯文档和未改变这些行为的维护不启动 Docker。正式发布必须遵守 `skills/remote-release.md`：全量本地检查、精确 commit CI 和真实宝塔 nginx/apache 门禁，不能用 docs/focused/runtime 代替。
+
+缺失环境或出现 skip 属于未验证，不能表述为通过；非发布任务说明实际未验证影响，完成其余可执行检查。仅为模拟 CI 不临时搭建整套基础设施；列出本机未覆盖的 Python 版本、OpenSSL 1.0.2 和真实面板环境。
+
+## 自进化：用运行证据修正规则
+
+执行器每轮自动保存范围、HEAD、文件列表、计划/实际命令、退出码和耗时到已忽略的 `.superpowers/finish-check/`，不保存业务日志或凭证，不影响检查选择。
+
+- 完成后查看本轮最慢步骤和失败原因；遇到重复耗时、误选范围、漏测或用户纠正时，再对照最近相关记录。正常通过且没有新事实就结束，不为积累记录扩大验证或生成复盘文档。
+- 经代码或复现确认后，自主做与当前问题直接相关的最小修正：补遗漏测试映射、移除重复执行、改正过时命令或触发条件。持久规则写回本文件/对应领域 skill；机械选择写执行器，并用命中与不应命中场景验证。原始过程记录留在忽略目录，不复制进 AGENTS。
+- 缩小覆盖范围需要直接调用链和替代验证证据；单纯耗时长、连续绿灯或环境失败都不足以删检查。发现漏测先补回覆盖；不自动放宽 skip/警告失败、安全契约、required checks 或正式发布门禁。
+- 规则修正后只补跑受影响检查；同轮没有新的失败或事实就停止演化。报告一行实际改进；没有改进不凑条目。涉及跨仓契约或新增全局约束时按原有授权边界处理。
+
+## 完成报告
+
+简述范围及理由、实际验证结果/耗时、发现与未验证项。问题分“必须修复 / 建议改进 / 无关事项”，无问题无需空列四类风险。验收满足、适用检查通过且没有阻塞就结束；不自动提交、推送或发布。

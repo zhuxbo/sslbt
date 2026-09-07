@@ -11,6 +11,7 @@ sslbt 是仅使用 Python 标准库和宝塔运行时的证书部署插件。`sr
 - 涉及配置、证书、私钥或状态文件时，保持现有文件锁、原子写、权限和符号链接防护。
 - `main`、`dev` 不自动提交或推送；只有用户明确授权时才执行对应 Git 操作。不得自动执行真实发布。
 - 匹配任务时优先使用工具原生薄入口；无对应入口时先读取 `skills/SKILL.md`，再按路由读取对应叶子资源。
+- 需求明确时自主完成授权范围内的最小充分改动；按影响选择 skill 和验证，验收通过且无阻塞后结束。具体执行边界见 `skills/sslbt-dev.md`，不因模型更换扩大流程。
 
 ## 权威入口
 
@@ -24,10 +25,10 @@ sslbt 是仅使用 Python 标准库和宝塔运行时的证书部署插件。`sr
 ## 核心命令与平台边界
 
 - `make test`：单元测试。
-- `make lint`：`src/` 和 `tests/` 的 flake8（行宽 120）。
+- `make lint`：`src/`、`tests/` 和完成检查执行器的 flake8（行宽 120）。
 - `make build VERSION=x.y.z`：构建 `dist/sslbt.zip`。
 - `make check-agent-config`：检查智能体配置、Skill 和薄工具入口防漂移。
-- `make finish-check`：执行可自动化的完整本地门禁；真实宝塔 Docker 集成仍需可用镜像和容器环境。
+- `make finish-check`：按变更执行本地门禁；`make finish-check-full` 用于显式全量、CI 模拟和正式发布。范围、复用和自进化规则见 `skills/finish-check.md`；真实宝塔验证仍需对应环境。
 
 ## 更新原则
 

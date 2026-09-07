@@ -2,6 +2,16 @@
 
 纯 Python 宝塔面板插件，通过部署 API 获取证书，`panelSite.SetSSL()` 部署。仅用标准库，无第三方依赖。
 
+## 执行边界
+
+- 需求明确的维护：读相关代码，实施最小充分改动，跑定向验证；不默认创建计划/设计文档、worktree、新测试或启动整套 Superpowers。新增重要能力、契约变更或原因不明的故障才按需选择相应流程。
+- 常规可逆操作和已经授权的步骤直接完成；仅在缺少会改变结果的关键输入或授权时询问。只读调查不改代码，提交/推送/发布沿用各自授权边界。
+- 独立读取和检查可并行；有依赖、会写相同产物或共享环境的操作串行。只有独立子任务确实能节省时间且当前任务需要时才委派，不为小修改固定安排多轮审核。
+- 验证深度和停止条件以 `skills/finish-check.md` 为准；通过后只因新改动、失败或具体未解决风险补查。结论用简洁中文说明结果、验证和实际限制。
+
+以下是按需查阅的领域参考。先读相关章节和当前代码，不要求每次通读全部实现细节：
+宝塔调用看“宝塔兼容”；API 看“部署 API 接口”；部署/续签看对应流程；文件写入看配置与安全章节；页面看“前端约定”；命令与环境看文末。
+
 ## 架构
 
 ```
@@ -254,8 +264,8 @@ SetSSL 部署：写入前 pre-flight 校验既有配置（`check_web_config()`�
 - 配置降级（`ConfigManager.is_degraded`）：主配置解析失败即拒绝一切写入并让续签整轮中止。
   真正的覆盖点是 `_update_json`（`_ensure_config` 的写入被 `changed` 门住），仅拦后者挡不住
   cron 的任意一次 `update_metadata`
-- 新增 metadata 字段必须同步 `config.DEPLOY_SUCCESS_RESET_KEYS` 与 `MANUAL_RESET_KEYS`，
-  否则面板会留存已消失的旧原因，而测试不会变红
+- 新增 metadata 字段按生命周期判断是否加入 `config.DEPLOY_SUCCESS_RESET_KEYS`、
+  `MANUAL_RESET_KEYS` 或由所属逻辑清理；核对成功部署与手动恢复两条路径，不机械加入两张表。
 - 非关键上报熔断（`CALLBACK_BREAKER_THRESHOLD=3`，spec §11）：部署结果回调与阻断上报
   **共享**实例级连续失败计数，达阈值即跳过本轮剩余同类上报，成功清零。单次回调最坏
   ≈183s（3 次重试 × 60s POST 超时 + 退避），批量上限 100 张时逐张干等会线性放大到数小时。
@@ -265,7 +275,6 @@ SetSSL 部署：写入前 pre-flight 校验既有配置（`check_web_config()`�
 
 ## 已知局限（无需处理，仅记录）
 
-- 批次截断按添加顺序，不按过期紧急度排序（紧急证书用户自行手动续签）
 - `_update_json` 内部 JSON 损坏的日志/备份路径无单独测试（逻辑与 `_read_json` 相同，风险低）
 - `_calc_spread_delay` 的 `sleep_min` 计算值无精确断言（仅验证上限约束）
 - API 指数退避（1s→2s→4s）无直接测试（API 调用全部 mock，退避逻辑简单）
@@ -281,7 +290,7 @@ SetSSL 部署：写入前 pre-flight 校验既有配置（`check_web_config()`�
 - `validation_method`：证书级验证方式（`delegation` 或 `file`），空值默认服务端决定；受域名类型约束（IP 不可 delegation，通配符不可 file）。派生统一走 `derive_or_validate_renew_policy()`（SAN 含 IP 强制 local/file），add_cert/update_cert_config/batch_set_renew_policy/续签提交均调用
 - `metadata`：`last_issue_state` 取值为 `""`/`processing`/`active`/`CAPPED`/`EXPIRED`/`policy_blocked_needs_setup`；触顶阶段记于 `capped_phase`（见 deploy-spec §1.5）
 - 数据驱动迁移覆盖三层：全局 `_GLOBAL_FIELD_RULES`、证书 `_CERT_FIELD_RULES`、
-  metadata `_METADATA_FIELD_RULES`（后者本轮补齐，此前引擎够不到 `cert['metadata']`）。
+  metadata `_METADATA_FIELD_RULES`。
   metadata 规则要在 `_fill_defaults` **之前**执行：`rename` 的判据是「目标键不存在才搬」，
   先补默认值会让旧值被静默丢弃。现有条目：`cap_stage` → `capped_phase`（v0.3.9 已发布旧名）
 - 站点唯一绑定：一个站点只能绑定一个证书，add_cert / update_cert / update_cert_config 均校验
@@ -322,7 +331,8 @@ SetSSL 部署：写入前 pre-flight 校验既有配置（`check_web_config()`�
 ```bash
 make test          # pytest 单元测试
 make build VERSION=1.2.3  # 构建 ZIP
-make finish-check  # 自动化完成门禁
+make finish-check  # 按变更选择完成门禁；完整流程见 skills/finish-check.md
+make finish-check-full  # 显式全量或 CI 模拟
 make docker-test   # 容器集成测试（nginx/apache 双环境，安装/部署/续签三段）
 ```
 

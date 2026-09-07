@@ -1,4 +1,4 @@
-.PHONY: build test clean lint release build-release check-agent-config finish-check docker-test docker-clean mock-api-test
+.PHONY: build test clean lint release build-release check-agent-config finish-check finish-check-full docker-test docker-clean mock-api-test
 
 build:
 	@if [ -z "$(VERSION)" ]; then echo "用法: make build VERSION=1.0.0"; exit 1; fi
@@ -11,8 +11,7 @@ test-cov:
 	python3 -m pytest tests/ -v --cov=src/lib --cov-report=term-missing
 
 lint:
-	python3 -m flake8 src/ --max-line-length=120 --exclude=__pycache__
-	python3 -m flake8 tests/ --max-line-length=120 --exclude=__pycache__
+	python3 -m flake8 src/ tests/ scripts/finish-check.py --max-line-length=120 --exclude=__pycache__
 
 release:
 	@echo "真实发布必须遵循 skills/remote-release.md；请使用对应薄工具入口。"
@@ -25,9 +24,11 @@ build-release:
 check-agent-config:
 	python3 scripts/check-agent-config.py
 
-finish-check: test lint check-agent-config
-	bash build/release.sh --dry-run 0.0.0-finish-check
-	git diff --check
+finish-check:
+	python3 scripts/finish-check.py $(ARGS)
+
+finish-check-full:
+	python3 scripts/finish-check.py --full $(ARGS)
 
 clean:
 	rm -rf dist/*.zip
